@@ -4,6 +4,7 @@ import requests
 import io
 import os
 import re
+import gc
 import base64
 from datetime import datetime
 from PIL import Image
@@ -20,12 +21,16 @@ st.markdown("""
 MASTER_LOG_FILE = "master_form_reviews.csv"
 FIELD_LOG_FILE = "field_level_reviews.csv"
 
-# ═══════════════════════ 1. CACHING & KOBO METADATA / MEDIA ═══════════════════════
+# ═══════════════════════ 1. CACHING & SAFE MODEL LOADING ═══════════════════════
 @st.cache_resource(show_spinner="Loading DeepForest AI Model into memory...")
-def get_tree_counter():
-    counter = qa.TreeCounter()
-    counter._load()
-    return counter
+def get_tree_counter_safe():
+    """Safely loads DeepForest without crashing the app if RAM or packages are constrained."""
+    try:
+        counter = qa.TreeCounter()
+        counter._load()
+        return counter, None
+    except Exception as e:
+        return None, str(e)
 
 @st.cache_data(ttl=600, show_spinner="Fetching raw submissions & attachments from KoboToolbox...")
 def get_kobo_raw_and_df():
@@ -55,17 +60,23 @@ def get_kobo_labels() -> dict:
         pass
     return labels
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_kobo_media_bytes(url: str) -> bytes | None:
-    """Downloads protected image or video bytes from Kobo using Token."""
+@st.cache_data(ttl=3600, max_entries=60, show_spinner=False)
+def fetch_kobo_media_bytes(url: str, is_image: bool = True) -> bytes | None:
+    """Downloads protected image or video bytes from Kobo using Token, compressing images to save RAM."""
     try:
         headers = {"Authorization": f"Token {qa.KOBO_TOKEN}"}
         r = requests.get(url, headers=headers, timeout=60)
-        if r.ok:
-            return r.content
+        if not r.ok:
+            return None
+        if is_image:
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            img.thumbnail((900, 900))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            return buf.getvalue()
+        return r.content
     except Exception:
-        pass
-    return None
+        return None
 
 def bytes_to_data_uri(img_bytes: bytes) -> str:
     if not img_bytes:
@@ -86,7 +97,6 @@ def is_video_filename(val) -> bool:
     return v.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".m4v"))
 
 def build_attachment_lookup(raw_row: dict) -> dict:
-    """Maps filename -> dict with preview_url, full_url, mimetype."""
     lookup = {}
     atts = raw_row.get("_attachments", [])
     if not isinstance(atts, list):
@@ -189,12 +199,17 @@ with st.sidebar:
     mode = st.selectbox("Select Scope:", ["Specific Farm (Farm ID)", "By Submission Date", "All Farms"])
     
     farm_id_input, date_str = None, None
+    max_Batch = 10
     if mode == "Specific Farm (Farm ID)":
         farm_id_input = st.text_input("Enter Farm ID:")
     elif mode == "By Submission Date":
         date_str = str(st.date_input("Select Submission Date:"))
+    else:
+        max_Batch = st.slider("Max farms to process at once (RAM Protection):", 1, 50, 10)
 
-    use_ai = st.checkbox("Run DeepForest AI & Sentinel-2 NDVI", value=True)
+    use_ai = st.checkbox("Run DeepForest Satellite Tree AI", value=True)
+    use_ndvi = st.checkbox("Run Sentinel-2 NDVI Check (Slower)", value=False)
+    
     if st.button("🔄 Refresh Kobo Server Data"):
         st.cache_data.clear()
         st.rerun()
@@ -207,16 +222,23 @@ if run_btn:
         try:
             raw_rows, raw_df = get_kobo_raw_and_df()
             filtered_df = qa.filter_df(raw_df, mode=mode_key, date=date_str, farm=farm_id_input)
+            if mode_key == "all" and len(filtered_df) > max_Batch:
+                st.info(f"ℹ️ Showing latest {max_Batch} farms to protect server memory. Adjust slider in sidebar for more.")
+                filtered_df = filtered_df.tail(max_Batch)
+
             if filtered_df.empty:
                 st.warning("⚠️ No forms matched your search criteria.")
             else:
                 os.makedirs("debug_imgs", exist_ok=True)
-                counter = get_tree_counter() if use_ai else None
+                counter, ai_load_err = (get_tree_counter_safe() if use_ai else (None, None))
+                if use_ai and ai_load_err:
+                    st.warning(f"⚠️ DeepForest AI skipped due to server constraint ({ai_load_err}). Continuing with GPS & Vegetation audit.")
+                
                 cols = qa.map_all(filtered_df)
                 recs = []
                 prog = st.progress(0, text="Running GeoAI & Form Audit...")
                 for i, (idx, row) in enumerate(filtered_df.iterrows(), 1):
-                    rec = qa.audit_row(row, cols, counter=counter, use_ai=use_ai, debug_dir="debug_imgs")
+                    rec = qa.audit_row(row, cols, counter=counter, use_ai=use_ai, use_ndvi=use_ndvi, debug_dir="debug_imgs")
                     rec["_df_index"] = idx
                     rec["_submission_id"] = row.get("_id", "")
                     recs.append(rec)
@@ -251,6 +273,7 @@ if run_btn:
                 st.session_state["results"] = res_df
                 st.session_state["raw_rows"] = raw_rows
                 st.session_state["flat_df"] = raw_df
+                gc.collect()
         except Exception as e:
             st.error(f"Error loading data: {e}")
 
@@ -308,7 +331,6 @@ if "results" in st.session_state:
         ])
 
         with tab_form:
-            # Top GeoAI & Satellite Banner
             top_left, top_right = st.columns([1.5, 1])
             with top_left:
                 st.info(
@@ -337,7 +359,6 @@ if "results" in st.session_state:
             media_items = []
             matched_filenames = set()
 
-            # 1. GeoAI Check synthetic rows
             qa_items.append({
                 "Field_Key": "_AI_AREA_CHECK",
                 "Question_Title": "🛰️ [GeoAI Check] Farm Area (Entered vs GPS)",
@@ -380,7 +401,7 @@ if "results" in st.session_state:
                         att_info = att_lookup[fname_clean]
                         mime = att_info["mimetype"]
                         if is_image_filename(fname_clean) or "image" in mime:
-                            raw_bytes = fetch_kobo_media_bytes(att_info["preview_url"])
+                            raw_bytes = fetch_kobo_media_bytes(att_info["preview_url"], is_image=True)
                             if raw_bytes:
                                 data_uri = bytes_to_data_uri(raw_bytes)
                                 media_type = "image"
@@ -393,7 +414,7 @@ if "results" in st.session_state:
                                     "Bytes": raw_bytes
                                 })
                         elif is_video_filename(fname_clean) or "video" in mime:
-                            raw_bytes = fetch_kobo_media_bytes(att_info["full_url"])
+                            raw_bytes = fetch_kobo_media_bytes(att_info["full_url"], is_image=False)
                             if raw_bytes:
                                 media_type = "video"
                                 matched_filenames.add(fname_clean)
@@ -420,14 +441,14 @@ if "results" in st.session_state:
                         "Attach_to_Summary": bool(saved_entry.get("Attach_to_Summary", False))
                     })
 
-                # Also check if there are any unlinked videos/photos in _attachments
+                # Unlinked attachments fallback
                 for fname_k, att_info in att_lookup.items():
                     short_n = att_info["filename"]
                     if short_n not in matched_filenames and fname_k == short_n:
                         mime = att_info["mimetype"]
                         fk_unlinked = f"_UNLINKED_{short_n}"
                         if is_video_filename(short_n) or "video" in mime:
-                            raw_bytes = fetch_kobo_media_bytes(att_info["full_url"])
+                            raw_bytes = fetch_kobo_media_bytes(att_info["full_url"], is_image=False)
                             if raw_bytes:
                                 matched_filenames.add(short_n)
                                 media_items.append({
@@ -438,7 +459,7 @@ if "results" in st.session_state:
                                     "Bytes": raw_bytes
                                 })
                         elif is_image_filename(short_n) or "image" in mime:
-                            raw_bytes = fetch_kobo_media_bytes(att_info["preview_url"])
+                            raw_bytes = fetch_kobo_media_bytes(att_info["preview_url"], is_image=True)
                             if raw_bytes:
                                 matched_filenames.add(short_n)
                                 media_items.append({
@@ -450,12 +471,12 @@ if "results" in st.session_state:
                                 })
 
             # ══════════════════════════════════════════════════════════════════════
-            # SECTION A: INTERACTIVE PHOTO & VIDEO AUDIT CARDS (DIRECT REJECT/APPROVE BELOW EACH MEDIA)
+            # SECTION A: INTERACTIVE PHOTO & VIDEO AUDIT CARDS
             # ══════════════════════════════════════════════════════════════════════
             media_decisions_override = {}
             if media_items:
                 st.markdown(f"### 📸🎥 Visual Media Audit Cards ({len(media_items)} Photos & Videos in Form)")
-                st.caption("Inspect every uploaded photo and video below. Under each item, select **Approve / Reject**, write your **rejection reason or comment**, and check **Attach Comment** to include it in the final report.")
+                st.caption("Inspect every uploaded photo and video below. Under each item, select **OK / Reject / Modify**, write your **rejection reason or comment**, and check **Attach Comment** to include it in the final report.")
                 
                 m_cols = st.columns(3)
                 for idx_m, m_item in enumerate(media_items):
@@ -571,137 +592,4 @@ if "results" in st.session_state:
                     ),
                     "Attach_to_Summary": st.column_config.CheckboxColumn(
                         "📎 Attach?",
-                        help="Attach this comment to the final consolidated form report",
-                        default=False,
-                        width="small"
-                    )
-                },
-                key=f"form_editor_{selected_farm}"
-            )
-
-            # ══════════════════════════════════════════════════════════════════════
-            # SECTION C: AUTO-CONSOLIDATE COMMENTS & FINAL FORM DECISION
-            # ══════════════════════════════════════════════════════════════════════
-            if not edited_fields_df.empty:
-                attached_rows = edited_fields_df[
-                    (edited_fields_df["Attach_to_Summary"] == True) |
-                    (edited_fields_df["Item_Decision"].isin(["❌ Reject", "✏️ Modify", "❓ Clarify"]) & (edited_fields_df["Suggested_Correction_or_Comment"].str.strip() != ""))
-                ]
-            else:
-                attached_rows = pd.DataFrame()
-
-            merged_lines = []
-            for _, r in attached_rows.iterrows():
-                if not r["Attach_to_Summary"] and r["Item_Decision"] == "✅ OK":
-                    continue
-                q_short = r["Question_Title"].split("(")[0].strip()
-                ans_short = r["Submitted_Answer"]
-                if len(ans_short) > 50:
-                    ans_short = ans_short[:50] + "..."
-                comm = str(r["Suggested_Correction_or_Comment"]).strip() or "Rejected / Flagged by auditor"
-                merged_lines.append(f"• [{r['Item_Decision']}] {q_short} (Ans: '{ans_short}') ➔ {comm}")
-
-            rejected_count = int((edited_fields_df["Item_Decision"] == "❌ Reject").sum()) if not edited_fields_df.empty else 0
-            modified_count = int((edited_fields_df["Item_Decision"] == "✏️ Modify").sum()) if not edited_fields_df.empty else 0
-
-            st.divider()
-            st.markdown("### 🗂️ Consolidated Audit Summary & Final Form Decision")
-
-            col_summary, col_decision = st.columns([1.4, 1])
-
-            with col_summary:
-                st.markdown(f"**🔗 Auto-Merged Comments from Photos, Videos & Questions ({len(merged_lines)} attached | {rejected_count} rejected | {modified_count} modified):**")
-                default_merged = "\n".join(merged_lines) if merged_lines else str(audit_rec.get("Consolidated_Comments", ""))
-                final_merged_text = st.text_area(
-                    "Merged Item & Media Comments (Editable before saving):",
-                    value=default_merged,
-                    height=180,
-                    key=f"merged_box_{selected_farm}"
-                )
-                general_note = st.text_input(
-                    "📌 General Form-Level Auditor Note / Master Rejection Reason:",
-                    value=str(audit_rec.get("General_Auditor_Note", "")),
-                    placeholder="e.g., Form rejected due to invalid stable logbook photo and GPS mismatch...",
-                    key=f"gen_note_{selected_farm}"
-                )
-
-            with col_decision:
-                st.markdown("**⚖️ Final Form Action (قرار الاستمارة الكلي):**")
-                status_choices = [
-                    "⏳ Pending Review",
-                    "✅ Approved Entire Form",
-                    "⚠️ Conditional (Modifications Required)",
-                    "🚫 REJECTED ENTIRE FORM"
-                ]
-                cur_saved_status = str(audit_rec.get("Form_Status", "⏳ Pending Review"))
-                if cur_saved_status not in status_choices:
-                    cur_saved_status = "⏳ Pending Review"
-                
-                final_form_status = st.radio(
-                    "Select Final Status for this Form:",
-                    status_choices,
-                    index=status_choices.index(cur_saved_status),
-                    key=f"final_radio_{selected_farm}"
-                )
-
-                sync_kobo = st.checkbox("🔗 Sync validation status directly to KoboToolbox server", value=False)
-
-                c_btn1, c_btn2 = st.columns(2)
-                save_all_btn = c_btn1.button("💾 Save Form Decision & Comments", type="primary", use_container_width=True)
-                reject_now_btn = c_btn2.button("🚫 REJECT ENTIRE FORM NOW", use_container_width=True)
-
-                if save_all_btn or reject_now_btn:
-                    chosen_status = "🚫 REJECTED ENTIRE FORM" if reject_now_btn else final_form_status
-                    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    
-                    full_combined_report = final_merged_text
-                    if general_note.strip():
-                        full_combined_report = f"[General Note: {general_note.strip()}]\n" + full_combined_report
-
-                    st.session_state["results"].loc[audit_row_idx, "Form_Status"] = chosen_status
-                    st.session_state["results"].loc[audit_row_idx, "Rejected_Items_Count"] = rejected_count
-                    st.session_state["results"].loc[audit_row_idx, "Consolidated_Comments"] = full_combined_report
-                    st.session_state["results"].loc[audit_row_idx, "General_Auditor_Note"] = general_note
-                    st.session_state["results"].loc[audit_row_idx, "Auditor_Name"] = auditor_name
-                    st.session_state["results"].loc[audit_row_idx, "Reviewed_At"] = now_ts
-
-                    if not edited_fields_df.empty:
-                        save_field_decisions(
-                            selected_farm,
-                            edited_fields_df[["Field_Key", "Question_Title", "Submitted_Answer", "Item_Decision", "Suggested_Correction_or_Comment", "Attach_to_Summary"]]
-                        )
-                    save_master_decision({
-                        "farm_id": selected_farm,
-                        "submission_id": sub_id,
-                        "Form_Status": chosen_status,
-                        "Rejected_Items_Count": rejected_count,
-                        "Consolidated_Comments": full_combined_report,
-                        "General_Auditor_Note": general_note,
-                        "Auditor_Name": auditor_name,
-                        "Reviewed_At": now_ts
-                    })
-
-                    if sync_kobo and sub_id:
-                        kobo_code = (
-                            "validation_status_approved" if "Approved" in chosen_status
-                            else "validation_status_not_approved" if "REJECTED" in chosen_status
-                            else "validation_status_on_hold"
-                        )
-                        if update_kobo_validation_status(sub_id, kobo_code):
-                            st.toast("✅ Synced validation status to KoboToolbox!")
-                        else:
-                            st.toast("⚠️ Saved locally, but Kobo validation sync failed.")
-
-                    st.success(f"✅ Saved! Farm `{selected_farm}` marked as: **{chosen_status}**")
-                    st.rerun()
-
-        with tab_warehouse:
-            st.subheader("📊 Master Audit Data Warehouse (All Loaded Farms)")
-            priority_cols = [
-                "farm_id", "Form_Status", "Rejected_Items_Count", "Consolidated_Comments",
-                "General_Auditor_Note", "Auditor_Name", "Reviewed_At", "verdict", "confidence",
-                "engineer", "area_entered", "area_gps", "area_check", "engineer_count", "ai_count", "forecast"
-            ]
-            rem_cols = [c for c in res.columns if not str(c).startswith("_") and c not in priority_cols]
-            final_cols = [c for c in priority_cols if c in res.columns] + rem_cols
-            st.dataframe(res[final_cols], use_container_width=True)
+                        help="Attach this
