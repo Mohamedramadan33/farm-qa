@@ -41,7 +41,6 @@ NDVI_GREEN = 0.30
 NDVI_BARE = 0.15
 NDVI_OLD_IMG_YEARS = 1.0
 
-# Retains Arabic & English keywords to accurately match Kobo entries
 TREE_DENSITY = {
     "نخيل": 65, "نخل": 65, "palm": 65,
     "مانجو": 100, "مانجا": 100, "mango": 100,
