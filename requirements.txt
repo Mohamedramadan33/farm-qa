@@ -1,21 +1,18 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-streamlit>=1.35.0
-numpy<2.0.0
+streamlit
+numpy
 pandas
 requests
 shapely
 geopandas
 Pillow
-openpyxl
 torch
 torchvision
-opencv-python-headless<4.11.0
-albumentations==1.4.3
-safetensors<0.6.0
-transformers==4.46.3
-tokenizers>=0.20.0,<0.21.0
-deepforest==2.1.0
+transformers>=4.40.0
+tokenizers>=0.20.0
+deepforest
 planetary-computer
 pystac-client
 odc-stac
 rioxarray
+openpyxl
