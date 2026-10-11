@@ -1,0 +1,15 @@
+streamlit
+numpy<2.0.0
+pandas
+requests
+shapely
+geopandas
+Pillow
+deepforest
+torch
+torchvision
+planetary-computer
+pystac-client
+odc-stac
+rioxarray
+openpyxl

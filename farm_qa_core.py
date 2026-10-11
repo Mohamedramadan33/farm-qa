@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import io
+import json
+import logging
+import math
+import os
+import re
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+
+KOBO_SERVER = "https://kf.kobotoolbox.org"
+ASSET_UID = "aX4NJWgge6tooXjfSYXhrq"
+KOBO_TOKEN = os.getenv("KOBO_TOKEN", "")
+ZOOM = 19
+TOL = 0.15
+AREA_TOL = 0.10
+FEDDAN_M2 = 4200.83
+FALLBACK_DENSITY = 120
+
+ABS_TOL = 5
+AI_BAND = (0.50, 0.30, 0.15)
+VEG_EXG = 0.08
+VEG_REVIEW = 25.0
+IMAGERY_MAX_AGE_YEARS = 2.0
+YOUNG_CROWN_M = 2.0
+DUP_IOU = 0.80
+ROUND_BASE = 50
+CALIBRATION_FILE = "ai_calibration.json"
+
+NDVI_DAYS = 120
+NDVI_CLOUD = 20
+NDVI_GREEN = 0.30
+NDVI_BARE = 0.15
+NDVI_OLD_IMG_YEARS = 1.0
+
+TREE_DENSITY = {
+    "نخيل": 65, "نخل": 65, "palm": 65,
+    "مانجو": 100, "مانجا": 100, "mango": 100,
+    "زيتون": 120, "olive": 120,
+    "موالح": 150, "citrus": 150,
+    "كازورينا": 300, "casuarina": 300,
+    "فيكس": 200, "ficus": 200,
+    "موز": 400, "banana": 400,
+    "ماهوجني": 300, "mahogany": 300,
+    "جازورين": 300, "كافور": 300, "توت": 150,
+}
+
+FIELD_HINTS = {
+    "time":       {"exact": ["_submission_time", "start"], "kw": []},
+    "farm_id":    {"exact": ["farm_id"], "kw": ["كود المزرعه", "رقم المزرعه", "farm id", "farm code"]},
+    "farm_name":  {"exact": ["farm_name_auto", "farm_name"], "kw": ["اسم المزرعة", "farm name"]},
+    "engineer":   {"exact": ["engineer_name"], "kw": ["المهندس", "engineer"]},
+    "visit_date": {"exact": ["visit_date"], "kw": ["تاريخ الزيارة"]},
+    "audit_type": {"exact": ["audit_type"], "kw": ["نوع الزيارة"]},
+    "season":     {"exact": ["__010", "agri_season"], "kw": ["الموسم", "season"]},
+    "farm_area":  {"exact": ["farm_area"], "kw": ["مساحه المزرعه", "farm area"]},
+    "plot_area":  {"exact": ["plot_area", "calculated_area", "__015"], "kw": ["مساحه القطعه", "مساحه", "area"]},
+    "gps":        {"exact": ["gps_outline_of_farm"], "kw": ["gps", "حدود", "مضلع", "احداثيات", "polygon", "boundary"]},
+    "tree_count": {"exact": ["tree_number", "العدد", "__091"], "kw": ["عدد الاشجار", "عدد الشجر", "tree count", "العدد", "عدد"]},
+    "tree_type":  {"exact": ["tree_type", "النوع", "__016"], "kw": ["نوع الشجر", "نوع الاشجار", "tree type", "crop", "محصول", "النوع", "نوع"]},
+    "plot_owner": {"exact": ["plot_owner", "__011"], "kw": ["صاحب الحوض", "المالك"]},
+    "owner_phone":{"exact": ["plot_owner_number", "__012"], "kw": ["رقم تليفون", "تليفون", "phone"]},
+    "ownership":  {"exact": ["__009"], "kw": ["ملكية", "مملوكة"]},
+    "soil_type":  {"exact": ["__047", "soil_type"], "kw": ["نوع التربة", "soil"]},
+    "irrig_type": {"exact": ["__048", "irrigation_type"], "kw": ["نوع الري", "طريقة الري"]},
+    "irrig_amnt": {"exact": ["irrigation_amount_feddan_year"], "kw": ["كمية الاستهلاك"]},
+    "crop_type":  {"exact": ["__030", "crop_type_irrigation"], "kw": ["المحصول", "نوع المحصول"]},
+    "animal_type":{"exact": ["_Type", "farm_animals_type"], "kw": ["نوع الحيوان", "حيوانات"]},
+    "animal_count":{"exact": ["__077", "cow_numbers"], "kw": ["عدد الحيوانات"]},
+    "non_compliance": {"exact": ["non_compliance"], "kw": ["عدم المطابقة", "مخالفة"]},
+    "corrective_act": {"exact": ["corrective_measures"], "kw": ["إجراءات تصحيحية", "تصحيح"]},
+    "auditor_recom":  {"exact": ["auditors_recommendations"], "kw": ["توصيات لجنة المراجعة", "توصيات"]}
+}
+
+log = logging.getLogger("farm_qa")
+
+def normalize_digits(s: str) -> str:
+    if not isinstance(s, str):
+        return str(s)
+    _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬", "01234567890123456789.,")
+    return s.translate(_AR_DIGITS)
+
+def norm_ar(text) -> str:
+    s = unicodedata.normalize("NFKC", str(text)).lower()
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = s.replace("ـ", "")
+    for a in "أإآ":
+        s = s.replace(a, "ا")
+    s = s.replace("ة", "ه").replace("ى", "ي")
+    return re.sub(r"\s+", " ", s).strip()
+
+def present(v) -> bool:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return False
+    return str(v).strip() not in ("", "[]", "nan", "None")
+
+def to_number(x) -> float:
+    if not present(x):
+        return float("nan")
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = normalize_digits(str(x)).replace(",", "").replace(" ", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    return float(m.group()) if m else float("nan")
+
+def flatten(obj, parent: str = "", sep: str = "/") -> dict:
+    out: dict = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.update(flatten(v, f"{parent}{sep}{k}" if parent else str(k), sep))
+    elif isinstance(obj, list):
+        if obj and all(isinstance(i, (dict, list)) for i in obj):
+            for i, item in enumerate(obj):
+                out.update(flatten(item, f"{parent}[{i}]", sep))
+        else:
+            out[parent] = ";".join(map(str, obj))
+    else:
+        out[parent] = obj
+    return out
+
+def build_dataframe(rows: list) -> pd.DataFrame:
+    df = pd.DataFrame([flatten(r) for r in rows])
+    conv = lambda v: normalize_digits(v) if isinstance(v, str) else v
+    return df.apply(lambda s: s.map(conv) if s.dtype == object else s)
+
+def fetch_kobo(limit: int = 3000) -> list:
+    import requests
+    headers = {"Authorization": f"Token {KOBO_TOKEN}"}
+    url = f"{KOBO_SERVER}/api/v2/assets/{ASSET_UID}/data.json?limit={limit}"
+    rows = []
+    while url:
+        r = requests.get(url, headers=headers, timeout=60)
+        if r.status_code == 401:
+            raise RuntimeError("التوكن غير صحيح أو منتهي (401)")
+        r.raise_for_status()
+        d = r.json()
+        rows += d.get("results", [])
+        url = d.get("next")
+    return rows
+
+def _leaf(col) -> str:
+    return re.sub(r"\[\d+\]", "", str(col)).split("/")[-1].lower()
+
+def _share(series: pd.Series, pred) -> float:
+    vals = [v for v in series if present(v)]
+    return sum(1 for v in vals if pred(v)) / len(vals) if vals else 0.0
+
+def _kw_score(col, kws) -> int:
+    name = norm_ar(_leaf(col).replace("_", " ").replace("-", " "))
+    return max((len(norm_ar(k)) for k in kws if norm_ar(k) in name), default=0)
+
+def find_cols(df: pd.DataFrame, field: str) -> list:
+    h = FIELD_HINTS[field]
+    exact = [c for c in df.columns if _leaf(c) in h["exact"]]
+    if exact:
+        return exact
+    cols = [c for c in df.columns if not str(c).startswith("_")]
+    is_num = lambda v: not math.isnan(to_number(v))
+    checks = {
+        "gps": lambda s: _share(s, lambda v: parse_points(v) is not None) >= 0.5,
+        "tree_count": lambda s: _share(s, is_num) >= 0.5,
+        "farm_area": lambda s: _share(s, is_num) >= 0.5,
+        "plot_area": lambda s: _share(s, is_num) >= 0.5,
+        "tree_type": lambda s: _share(s, lambda v: not is_num(v)) >= 0.5,
+    }
+    chk = checks.get(field)
+    cand = [c for c in cols if chk is None or chk(df[c])]
+    if field == "gps":
+        cand.sort(key=lambda c: -_kw_score(c, h["kw"]))
+        return cand[:1]
+    scored = [(c, _kw_score(c, h["kw"])) for c in cand]
+    top = max((s for _, s in scored), default=0)
+    return [c for c, s in scored if s == top] if top > 0 else []
+
+def map_all(df: pd.DataFrame) -> dict:
+    return {f: find_cols(df, f) for f in FIELD_HINTS}
+
+def first_value(row, cols):
+    for c in cols:
+        if c in row.index and present(row[c]):
+            return row[c]
+    return None
+
+def engineer_entries(row, count_cols, type_cols) -> list:
+    out = []
+    def get_prefix(col):
+        return str(col).rsplit('/', 1)[0] if '/' in str(col) else 'root_flat'
+
+    types_by_prefix = {get_prefix(c): row[c] for c in type_cols if present(row.get(c))}
+    counts_by_prefix = {get_prefix(c): row[c] for c in count_cols if present(row.get(c))}
+
+    for prefix, t_val in types_by_prefix.items():
+        if prefix in counts_by_prefix:
+            c_val = counts_by_prefix[prefix]
+            n = to_number(c_val)
+            if not math.isnan(n):
+                out.append((str(t_val).strip(), n))
+
+    unmatched_counts = set(counts_by_prefix.keys()) - set(types_by_prefix.keys())
+    for prefix in unmatched_counts:
+        c_val = counts_by_prefix[prefix]
+        n = to_number(c_val)
+        if not math.isnan(n):
+            out.append(("غير محدد", n))
+    return out
+
+_DEC = re.compile(r"-?\d+\.\d+")
+
+def parse_points(raw):
+    if not present(raw):
+        return None
+    s = normalize_digits(str(raw))
+    pts = []
+    for chunk in re.split(r"[;|\n]|P", s):
+        nums = _DEC.findall(chunk)
+        if len(nums) >= 2:
+            a, b = float(nums[0]), float(nums[1])
+            if abs(a) > 90 and abs(b) <= 90:
+                a, b = b, a
+            pts.append((b, a))
+    if len(pts) < 3:
+        nums = [float(x) for x in _DEC.findall(s)]
+        step = 4 if len(nums) % 4 == 0 else 2
+        pts = [(nums[i + 1], nums[i]) for i in range(0, len(nums) - 1, step)]
+    clean = []
+    for p in pts:
+        if -180 <= p[0] <= 180 and -90 <= p[1] <= 90 and (not clean or clean[-1] != p):
+            clean.append(p)
+    return clean if len(clean) >= 3 else None
+
+def points_to_polygon(pts):
+    from shapely.geometry import Polygon
+    from shapely.validation import make_valid
+    if pts[0] != pts[-1]:
+        pts = pts + [pts[0]]
+    poly = Polygon(pts)
+    if not poly.is_valid:
+        poly = make_valid(poly)
+    if poly.geom_type != "Polygon":
+        polys = [g for g in getattr(poly, "geoms", []) if g.geom_type == "Polygon"]
+        if not polys:
+            return None
+        poly = max(polys, key=lambda g: g.area)
+    return None if poly.is_empty or poly.area == 0 else poly
+
+def parse_polygon(raw):
+    pts = parse_points(raw)
+    return points_to_polygon(pts) if pts else None
+
+def area_feddan(poly) -> float:
+    import geopandas as gpd
+    gs = gpd.GeoSeries([poly], crs=4326)
+    return float(gs.to_crs(gs.estimate_utm_crs()).area.iloc[0]) / FEDDAN_M2
+
+def gps_accuracy(raw):
+    accs = []
+    for chunk in re.split(r"[;|\n]|P", normalize_digits(str(raw))):
+        nums = re.findall(r"-?\d+(?:\.\d+)?", chunk)
+        idx = next((i for i, n in enumerate(nums) if "." in n), None)
+        if idx is not None and len(nums) > idx + 3:
+            accs.append(float(nums[idx + 3]))
+    return float(np.mean(accs)) if accs else None
+
+def gps_quality(raw, pts) -> list:
+    from shapely.geometry import Polygon
+    warns = []
+    if len(pts) < 4:
+        warns.append("❌ نقاط قليلة جداً (<4)")
+
+    ring = pts if pts[0] == pts[-1] else pts + [pts[0]]
+    p = Polygon(ring)
+
+    if not p.is_valid:
+        warns.append("❌ مضلع متقاطع ذاتياً (رسم عشوائي/Spaghetti)")
+    elif p.area > 0:
+        compactness = (4 * math.pi * p.area) / (p.length ** 2)
+        if compactness < 0.15:
+            warns.append(f"❌ شكل رفيع جداً (مؤشر التماسك {compactness:.2f}) - الأرجح طريق أو شارع وليس مزرعة")
+        elif compactness < 0.30:
+            warns.append(f"⚠️ شكل غير منتظم (مؤشر التماسك {compactness:.2f})")
+
+    acc = gps_accuracy(raw)
+    if acc is not None and acc > 15:
+        warns.append(f"⚠️ دقة GPS ضعيفة لحظة التسجيل (متوسط {acc:.0f} م)")
+    return warns
+
+ESRI_TILE = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+
+def _px(lon, lat, z):
+    n = 256 * (2 ** z)
+    return (
+        (lon + 180.0) / 360.0 * n,
+        (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n
+    )
+
+def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
+    import requests
+    from PIL import Image, ImageDraw
+    minx, miny, maxx, maxy = poly.bounds
+    for z in range(zoom, 15, -1):
+        x0, y1 = _px(minx, miny, z)
+        x1, y0 = _px(maxx, maxy, z)
+        tx0, tx1, ty0, ty1 = int(x0 // 256), int(x1 // 256), int(y0 // 256), int(y1 // 256)
+        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= max_tiles:
+            break
+    else:
+        raise ValueError("المزرعة أكبر من الحد المسموح لعدد البلاطات")
+
+    sess = requests.Session()
+    sess.headers["User-Agent"] = "FarmQASystem/2.0"
+
+    def get(xy):
+        tx, ty = xy
+        for _ in range(3):
+            r = sess.get(ESRI_TILE.format(z=z, x=tx, y=ty), timeout=30)
+            if r.ok:
+                return xy, Image.open(io.BytesIO(r.content)).convert("RGB")
+        raise RuntimeError(f"فشل جلب البلاطة {z}/{ty}/{tx}")
+
+    coords = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
+    mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
+    with ThreadPoolExecutor(8) as ex:
+        for (tx, ty), tile in ex.map(get, coords):
+            mosaic.paste(tile, ((tx - tx0) * 256, (ty - ty0) * 256))
+
+    ox, oy = tx0 * 256, ty0 * 256
+    box = (int(x0 - ox), int(y0 - oy), math.ceil(x1 - ox), math.ceil(y1 - oy))
+    img = mosaic.crop(box)
+    ring = [(_px(lo, la, z)[0] - ox - box[0], _px(lo, la, z)[1] - oy - box[1]) for lo, la in poly.exterior.coords]
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).polygon(ring, fill=255)
+    return img, mask, z
+
+class TreeCounter:
+    def __init__(self, patch_size: int = 400, upscale: float = 1.0):
+        self.patch_size, self.upscale = patch_size, upscale
+        self._model = None
+
+    def _load(self):
+        from deepforest import main
+        m = main.deepforest()
+        try:
+            m.load_model("weecology/deepforest-tree")
+        except Exception:
+            m.use_release()
+        self._model = m
+
+    def predict(self, img, mask):
+        from PIL import Image
+        if self._model is None:
+            self._load()
+
+        if self.upscale != 1.0:
+            size = (int(img.width * self.upscale), int(img.height * self.upscale))
+            img, mask = img.resize(size, Image.BICUBIC), mask.resize(size, Image.NEAREST)
+
+        arr = np.array(img)
+        m = np.array(mask) > 0
+        arr_masked = arr.copy()
+        arr_masked[~m] = 0
+        arr_masked = arr_masked.astype("float32")
+
+        try:
+            boxes = self._model.predict_tile(image=arr_masked, patch_size=self.patch_size,
+                                             patch_overlap=0.25, iou_threshold=0.15)
+        except Exception:
+            boxes = self._model.predict_image(image=arr_masked)
+
+        if boxes is None or len(boxes) == 0:
+            return {"lo": 0, "mid": 0, "hi": 0}, pd.DataFrame()
+
+        boxes = boxes[boxes["score"] >= min(AI_BAND)].copy()
+        cx = ((boxes.xmin + boxes.xmax) / 2).astype(int).clip(0, m.shape[1] - 1)
+        cy = ((boxes.ymin + boxes.ymax) / 2).astype(int).clip(0, m.shape[0] - 1)
+        boxes = boxes[m[cy.values, cx.values]]
+
+        valid_boxes = []
+        for _, box in boxes.iterrows():
+            x1, y1, x2, y2 = int(box.xmin), int(box.ymin), int(box.xmax), int(box.ymax)
+            box_pixels = arr[y1:y2, x1:x2].astype("float32")
+            if box_pixels.size == 0:
+                continue
+            s = box_pixels.sum(axis=2) + 1e-6
+            exg = (2 * box_pixels[:, :, 1] - box_pixels[:, :, 0] - box_pixels[:, :, 2]) / s
+            green_ratio = (exg > VEG_EXG).mean()
+            if green_ratio > 0.15:
+                valid_boxes.append(box)
+
+        if not valid_boxes:
+            return {"lo": 0, "mid": 0, "hi": 0}, pd.DataFrame()
+
+        boxes_df = pd.DataFrame(valid_boxes)
+        counts = {k: int((boxes_df["score"] >= t).sum()) for k, t in zip(("lo", "mid", "hi"), AI_BAND)}
+        return counts, boxes_df
+
+_CALIB: dict = {}
+_USE_CALIB = True
+_DATE_CACHE: dict = {}
+
+def load_calibration(path: str = CALIBRATION_FILE) -> dict:
+    _CALIB.clear()
+    try:
+        with open(path, encoding="utf-8") as f:
+            _CALIB.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    return _CALIB
+
+def calib_factor(species) -> float:
+    s = norm_ar(species) if present(species) else ""
+    for k, v in _CALIB.get("species", {}).items():
+        if s and norm_ar(k) in s:
+            return float(v)
+    return float(_CALIB.get("default", 1.0))
+
+def vegetation_pct(img, mask) -> float:
+    a = np.asarray(img, dtype="float32")
+    m = np.asarray(mask) > 0
+    if m.sum() == 0:
+        return float("nan")
+    s = a.sum(axis=2) + 1e-6
+    exg = (2 * a[:, :, 1] - a[:, :, 0] - a[:, :, 2]) / s
+    return float(((exg > VEG_EXG) & m).sum() / m.sum() * 100)
+
+def crown_diameter_m(boxes, lat: float, zoom: int, upscale: float = 1.0) -> float:
+    if boxes is None or len(boxes) == 0:
+        return float("nan")
+    b = boxes[boxes["score"] >= AI_BAND[1]]
+    if len(b) == 0:
+        return float("nan")
+    mpp = 156543.03392 * math.cos(math.radians(lat)) / (2 ** zoom)
+    side_px = np.sqrt((b.xmax - b.xmin).values * (b.ymax - b.ymin).values)
+    return float(np.median(side_px) / upscale * mpp)
+
+def imagery_date(lon: float, lat: float):
+    key = (round(lon, 3), round(lat, 3))
+    if key in _DATE_CACHE:
+        return _DATE_CACHE[key]
+    out = None
+    try:
+        import requests
+        r = requests.get(
+            "https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/0/query",
+            params={"geometry": f"{lon},{lat}", "geometryType": "esriGeometryPoint", "inSR": 4326,
+                    "spatialRel": "esriSpatialRelIntersects", "outFields": "SRC_DATE2",
+                    "returnGeometry": "false", "f": "json"}, timeout=20)
+        feats = r.json().get("features", [])
+        dates = [f["attributes"].get("SRC_DATE2") for f in feats if f["attributes"].get("SRC_DATE2")]
+        if dates:
+            out = pd.to_datetime(max(dates), unit="ms", utc=True)
+    except Exception as e:
+        log.debug("imagery_date failed: %s", e)
+    _DATE_CACHE[key] = out
+    return out
+
+def recent_ndvi(poly, days: int = NDVI_DAYS) -> float:
+    try:
+        import planetary_computer as pc
+        from pystac_client import Client
+        from odc.stac import load
+        import rioxarray  # noqa: F401
+        from shapely.geometry import mapping
+
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        cat = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1",
+                          modifier=pc.sign_inplace)
+        items = cat.search(collections=["sentinel-2-l2a"], bbox=poly.bounds,
+                          datetime=f"{start:%Y-%m-%d}/{end:%Y-%m-%d}",
+                          query={"eo:cloud_cover": {"lt": NDVI_CLOUD}}).item_collection()
+        if len(items) == 0:
+            return float("nan")
+
+        ds = load(items, bands=["B04", "B08"], bbox=poly.bounds,
+                  crs="EPSG:4326", resolution=0.0001,
+                  groupby="solar_day").astype("float32")
+        valid = (ds.B04 > 0) & (ds.B08 > 0)
+        red = ((ds.B04 - 1000) / 10000).where(valid)
+        nir = ((ds.B08 - 1000) / 10000).where(valid)
+        ndvi = ((nir - red) / (nir + red)).median("time")
+
+        ndvi = ndvi.rio.write_crs("EPSG:4326").rio.clip(
+            [mapping(poly)], crs="EPSG:4326", drop=True, all_touched=True)
+        v = float(ndvi.mean(skipna=True))
+        return v if not math.isnan(v) else float("nan")
+    except Exception as e:
+        log.warning("recent_ndvi failed: %s", e)
+        return float("nan")
+
+def _close(a, b, tol):
+    return abs(a - b) <= max(tol * max(a, b), ABS_TOL)
+
+def density_for(species):
+    s = norm_ar(species) if present(species) else ""
+    for k, v in TREE_DENSITY.items():
+        if s and norm_ar(k) in s:
+            return float(v), True
+    return float(FALLBACK_DENSITY), False
+
+def verdict(E, A, F, tol: float = TOL, band=None, veg_pct=None, img_age=None, crown_m=None) -> str:
+    if math.isnan(E) or E <= 0:
+        return "⚠️ المهندس لم يسجل أي أشجار صالحة في الاستمارة."
+    if math.isnan(F):
+        return "⚠️ [مراجعة يدوية]: لا يمكن حساب التوقع الزراعي (إحداثيات مفقودة أو خاطئة)."
+    if math.isnan(A):
+        if E > F * (1 + tol) + ABS_TOL:
+            return "❌ [تجاوز السعة]: العدد المدخل يفوق سعة المزرعة (بدون تأكيد فضائي)."
+        return "⚠️ [غير مؤكد فضائياً]: العدد ضمن سعة المزرعة لكن لم يُفحص بالقمر الصناعي."
+
+    lo, hi = band if band else (A, A)
+    in_band = lambda x: lo * (1 - tol) - ABS_TOL <= x <= hi * (1 + tol) + ABS_TOL
+    over_capacity = E > F * (1 + tol) + ABS_TOL
+    ai_misses_E = E > hi * (1 + tol) + ABS_TOL
+    ai_sees_more = lo > E * (1 + tol) + ABS_TOL
+    old = img_age is not None and img_age > IMAGERY_MAX_AGE_YEARS
+
+    if in_band(E) and in_band(F) and _close(E, F, tol):
+        return "✅ [تطابق ممتاز]: الأرقام الثلاثة متقاربة."
+    if over_capacity and ai_misses_E:
+        if old:
+            return f"⚠️ [مراجعة - صورة قديمة]: العدد يفوق سعة الأرض ولا يظهر فضائياً، لكن الصورة قديمة (~{img_age:.1f} سنة)."
+        if veg_pct is not None and veg_pct >= VEG_REVIEW:
+            return f"⚠️ [مراجعة]: العدد يفوق سعة الأرض، لكن المزرعة مغطاة نباتياً ({veg_pct:.0f}%)."
+        return "❌ [تلاعب/خطأ جسيم]: العدد المدخل يفوق السعة الاستيعابية ولا أثر له في القمر الصناعي."
+    if ai_sees_more:
+        return "❌ [إهمال ميداني]: القمر الصناعي رصد أشجاراً أكثر مما حصره المهندس."
+    if not over_capacity and ai_misses_E:
+        why = ""
+        if veg_pct is not None and veg_pct < 5:
+            why = f" الغطاء النباتي ضعيف جداً ({veg_pct:.0f}%)."
+        elif crown_m is not None and not math.isnan(crown_m) and crown_m < YOUNG_CROWN_M:
+            why = f" متوسط قطر التاج ~{crown_m:.1f} م: أشجار صغيرة."
+        return "⚠️ [تطابق نظري]: الأرض تتسع للعدد لكن القمر الصناعي لا يراه (الأرجح: فسائل/شتلات)." + why
+    return "⚠️ [تباين متوسط]: يوجد اختلاف بين الأرقام الثلاثة، يُنصح بمراجعة الصور يدوياً."
+
+def apply_ndvi(verdict_text: str, ndvi, veg, img_age) -> str:
+    if ndvi is None or (isinstance(ndvi, float) and math.isnan(ndvi)):
+        return verdict_text
+    age_ok = img_age is not None and not (isinstance(img_age, float) and math.isnan(img_age))
+    old_img = age_ok and img_age > NDVI_OLD_IMG_YEARS
+    weak_veg = veg is None or (isinstance(veg, float) and math.isnan(veg)) or veg < 5
+    if old_img and weak_veg and ndvi >= NDVI_GREEN:
+        return (f"⚠️ [مراجعة - الأرض اخضرّت بعد تاريخ الصورة]: NDVI الحديث {ndvi:.2f} "
+                f"بينما الصورة القديمة تُظهر غطاءً ضعيفاً. القرار السابق غير موثوق.\n   "
+                + verdict_text)
+    if ndvi < NDVI_BARE:
+        return verdict_text + f"  (NDVI حديث {ndvi:.2f}: لا غطاء نباتي حالياً، يدعم نتيجة الصورة)"
+    return verdict_text
+
+def confidence(rec: dict) -> str:
+    s = 100
+    age = rec.get("img_age")
+    if age is not None and not (isinstance(age, float) and math.isnan(age)) and age > IMAGERY_MAX_AGE_YEARS:
+        s -= 30
+    if rec.get("gps_warnings"):
+        s -= 20
+    if str(rec.get("area_check", "")).startswith("❌"):
+        s -= 20
+    if rec.get("density_note"):
+        s -= 15
+    if rec.get("ai_error"):
+        s -= 40
+    return "🟢 عالية" if s >= 80 else "🟡 متوسطة" if s >= 55 else "🔴 منخفضة"
+
+def cross_checks(recs: list) -> None:
+    for r in recs:
+        r.setdefault("flags", [])
+    items = [r for r in recs if r.get("_poly") is not None]
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            ra, rb = items[i], items[j]
+            if str(ra["farm_id"]) == str(rb["farm_id"]):
+                continue
+            ba, bb = ra["_poly"].bounds, rb["_poly"].bounds
+            if ba[2] < bb[0] or bb[2] < ba[0] or ba[3] < bb[1] or bb[3] < ba[1]:
+                continue
+            try:
+                inter = ra["_poly"].intersection(rb["_poly"]).area
+                uni = ra["_poly"].union(rb["_poly"]).area
+            except Exception:
+                continue
+            if uni > 0 and inter / uni >= DUP_IOU:
+                ra["flags"].append(f"🚩 حدودها تطابق المزرعة {rb['farm_id']} ({inter / uni:.0%})")
+                rb["flags"].append(f"🚩 حدودها تطابق المزرعة {ra['farm_id']} ({inter / uni:.0%})")
+
+def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
+    nan = float("nan")
+    rec = {
+        "farm_id":          first_value(row, cols["farm_id"]) or "غير متوفر",
+        "farm_name":        first_value(row, cols["farm_name"]) or "—",
+        "engineer":         first_value(row, cols["engineer"]) or "غير متوفر",
+        "submission_time":  first_value(row, cols["time"]) or "—",
+        "visit_date":       first_value(row, cols["visit_date"]) or "—",
+        "audit_type":       first_value(row, cols["audit_type"]) or "—",
+        "season":           first_value(row, cols["season"]) or "—",
+        "plot_owner":       first_value(row, cols["plot_owner"]) or "—",
+        "owner_phone":      first_value(row, cols["owner_phone"]) or "—",
+        "ownership_type":   first_value(row, cols["ownership"]) or "—",
+        "soil_type":        first_value(row, cols["soil_type"]) or "—",
+        "irrig_type":       first_value(row, cols["irrig_type"]) or "—",
+        "irrig_amnt":       first_value(row, cols["irrig_amnt"]) or "—",
+        "crop_type":        first_value(row, cols["crop_type"]) or "—",
+        "animal_type":      first_value(row, cols["animal_type"]) or "—",
+        "animal_count":     first_value(row, cols["animal_count"]) or "—",
+        "non_compliance":   first_value(row, cols["non_compliance"]) or "—",
+        "corrective_act":   first_value(row, cols["corrective_act"]) or "—",
+        "auditor_recom":    first_value(row, cols["auditor_recom"]) or "—",
+        "tree_details":     ""
+    }
+
+    gps_raw = first_value(row, cols["gps"])
+    entered = to_number(first_value(row, cols["farm_area"]))
+    if math.isnan(entered) or entered == 0:
+        entered = to_number(first_value(row, cols["plot_area"]))
+
+    missing = []
+    if rec["engineer"] == "غير متوفر": missing.append("اسم المهندس")
+    if math.isnan(entered) or entered == 0: missing.append("المساحة")
+    if gps_raw is None: missing.append("إحداثيات المزرعة (GPS)")
+    rec["missing"] = "، ".join(missing)
+
+    poly = parse_polygon(gps_raw) if gps_raw is not None else None
+    rec["_poly"] = poly
+    rec["gps_warnings"] = ""
+    if poly is not None:
+        try:
+            rec["gps_warnings"] = "؛ ".join(gps_quality(gps_raw, parse_points(gps_raw)))
+        except Exception as e:
+            log.debug("gps_quality failed: %s", e)
+
+    gps_area = round(area_feddan(poly), 3) if poly is not None else nan
+    rec["area_entered"], rec["area_gps"] = entered, gps_area
+    if math.isnan(gps_area) or gps_area <= 0:
+        rec["area_check"] = "❌ لا يمكن الحساب (إحداثيات خاطئة أو مفقودة)"
+    elif math.isnan(entered) or entered <= 0:
+        rec["area_check"] = "⚠ لا توجد مساحة مدخلة للمقارنة"
+    else:
+        ok = abs(entered - gps_area) / gps_area <= AREA_TOL
+        rec["area_check"] = "✅ متطابق" if ok else "❌ تباين كبير"
+
+    entries = engineer_entries(row, cols["tree_count"], cols["tree_type"])
+    E = sum(n for _, n in entries) if entries else nan
+    rec["engineer_count"] = E
+
+    notes, dens_sum = [], 0.0
+    for sp, n in entries:
+        d, known = density_for(sp)
+        dens_sum += d * n
+        if not known:
+            notes.append(f"نوع غير مسجل بالقاموس '{sp}' (افتراضي {FALLBACK_DENSITY})")
+
+    tot = sum(n for _, n in entries)
+    F = gps_area * dens_sum / tot if tot > 0 and not math.isnan(gps_area) else nan
+    rec["forecast"] = round(F) if not math.isnan(F) else nan
+
+    by_type = {}
+    for sp, n in entries:
+        sp_name = str(sp).strip()
+        by_type[sp_name] = by_type.get(sp_name, 0) + n
+
+    rec["species"] = max(by_type, key=by_type.get) if by_type else "غير محدد"
+    rec["tree_details"] = " | ".join([f"{k} ({int(v)})" for k, v in by_type.items()]) if by_type else "لا يوجد"
+    rec["density_note"] = "؛ ".join(sorted(set(notes)))
+
+    A = A_lo = A_hi = veg = crown = img_age = ndvi = nan
+    ai_err = ""
+    if use_ai and poly is not None:
+        try:
+            poly_ai = poly
+            img, mask, z = fetch_farm_image(poly_ai)
+            rec["zoom_used"] = z
+            counts, boxes = (counter or TreeCounter()).predict(img, mask)
+            f = calib_factor(rec["species"]) if _USE_CALIB else 1.0
+            A_lo, A, A_hi = (round(counts[k] * f) for k in ("lo", "mid", "hi"))
+            rec["ai_raw"], rec["ai_factor"] = counts["mid"], f
+            veg = vegetation_pct(img, mask)
+            c = poly.centroid
+            crown = crown_diameter_m(boxes, c.y, z, getattr(counter, "upscale", 1.0))
+            idate = imagery_date(c.x, c.y)
+            if idate is not None:
+                rec["imagery_date"] = idate.strftime("%Y-%m")
+                ref = pd.to_datetime(rec["submission_time"], errors="coerce", utc=True)
+                if pd.isna(ref): ref = pd.Timestamp.now(tz="UTC")
+                img_age = (ref - idate).days / 365.25
+            if debug_dir:
+                from PIL import ImageDraw
+                os.makedirs(debug_dir, exist_ok=True)
+                d = ImageDraw.Draw(img)
+                s = getattr(counter, "upscale", 1.0)
+                for b in boxes.itertuples():
+                    d.rectangle([b.xmin / s, b.ymin / s, b.xmax / s, b.ymax / s], outline="red")
+                img.save(os.path.join(debug_dir, f"{str(rec['farm_id']).replace('/', '_')}.jpg"))
+        except Exception as e:
+            ai_err = str(e)
+            log.warning("AI step failed for %s: %s", rec["farm_id"], e)
+
+    if use_ai and poly is not None:
+        ndvi = recent_ndvi(poly)
+
+    rec.update(ai_count=A, ai_low=A_lo, ai_high=A_hi, veg_pct=veg, crown_m=crown,
+               img_age=img_age, ndvi_recent=ndvi, ai_error=ai_err)
+    band = (A_lo, A_hi) if not math.isnan(A) else None
+    rec["verdict"] = verdict(E, A, F, band=band, veg_pct=veg if not math.isnan(veg) else None,
+                             img_age=img_age if not math.isnan(img_age) else None,
+                             crown_m=crown if not math.isnan(crown) else None)
+    rec["verdict"] = apply_ndvi(rec["verdict"], ndvi if not math.isnan(ndvi) else None,
+                                veg if not math.isnan(veg) else None,
+                                img_age if not math.isnan(img_age) else None)
+    if ai_err:
+        rec["verdict"] += f"  (تعذّر التحليل الفضائي: {ai_err})"
+    rec["confidence"] = confidence(rec)
+    return rec
+
+def audit_df(df: pd.DataFrame, use_ai=True, debug_dir=None, verbose=False, calibrated=True) -> pd.DataFrame:
+    global _USE_CALIB
+    _USE_CALIB = calibrated
+    if calibrated and not _CALIB:
+        load_calibration()
+    cols = map_all(df)
+    counter = TreeCounter() if use_ai else None
+    recs = []
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        try:
+            rec = audit_row(row, cols, counter, use_ai, debug_dir)
+        except Exception as e:
+            rec = {"farm_id": first_value(row, cols["farm_id"]) or i, "engineer": "—",
+                   "verdict": f"❌ خطأ معالجة: {e}"}
+        recs.append(rec)
+    cross_checks(recs)
+    for rec in recs:
+        rec["flags"] = "؛ ".join(rec.get("flags", []))
+    return pd.DataFrame(recs)
+
+def export_report(res: pd.DataFrame, path: str = "farm_qa_report.xlsx") -> str:
+    display_cols = [c for c in res.columns if not str(c).startswith("_")]
+    res[display_cols].to_excel(path, index=False)
+    return path
+
+def filter_df(df, mode="all", date=None, farm=None) -> pd.DataFrame:
+    cols = map_all(df)
+    if mode == "date" and date:
+        tc = cols["time"]
+        if tc: df = df[df[tc[0]].astype(str).str.startswith(date.strip())]
+    elif mode == "farm" and farm:
+        mask = pd.Series(False, index=df.index)
+        for c in cols["farm_id"]: mask |= df[c].astype(str).str.strip().str.lower() == farm.strip().lower()
+        df = df[mask]
+    return df
+
+def load_data(mode="all", date=None, farm=None) -> pd.DataFrame:
+    df = build_dataframe(fetch_kobo())
+    if df.empty: return df
+    return filter_df(df, mode, date, farm)
