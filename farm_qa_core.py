@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import gc
 import io
 import json
 import logging
@@ -301,11 +302,11 @@ def _px(lon, lat, z):
         (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n
     )
 
-def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
+def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 64):
     import requests
     from PIL import Image, ImageDraw
     minx, miny, maxx, maxy = poly.bounds
-    for z in range(zoom, 15, -1):
+    for z in range(zoom, 14, -1):
         x0, y1 = _px(minx, miny, z)
         x1, y0 = _px(maxx, maxy, z)
         tx0, tx1, ty0, ty1 = int(x0 // 256), int(x1 // 256), int(y0 // 256), int(y1 // 256)
@@ -327,7 +328,7 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
 
     coords = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
     mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
-    with ThreadPoolExecutor(8) as ex:
+    with ThreadPoolExecutor(4) as ex:
         for (tx, ty), tile in ex.map(get, coords):
             mosaic.paste(tile, ((tx - tx0) * 256, (ty - ty0) * 256))
 
@@ -345,6 +346,8 @@ class TreeCounter:
         self._model = None
 
     def _load(self):
+        import torch
+        torch.set_num_threads(2)
         from deepforest import main
         m = main.deepforest()
         try:
@@ -373,6 +376,9 @@ class TreeCounter:
                                              patch_overlap=0.25, iou_threshold=0.15)
         except Exception:
             boxes = self._model.predict_image(image=arr_masked)
+        finally:
+            del arr_masked
+            gc.collect()
 
         if boxes is None or len(boxes) == 0:
             return {"lo": 0, "mid": 0, "hi": 0}, pd.DataFrame()
@@ -490,6 +496,8 @@ def recent_ndvi(poly, days: int = NDVI_DAYS) -> float:
         ndvi = ndvi.rio.write_crs("EPSG:4326").rio.clip(
             [mapping(poly)], crs="EPSG:4326", drop=True, all_touched=True)
         v = float(ndvi.mean(skipna=True))
+        del ds, red, nir, ndvi
+        gc.collect()
         return v if not math.isnan(v) else float("nan")
     except Exception as e:
         log.warning("recent_ndvi failed: %s", e)
@@ -591,7 +599,7 @@ def cross_checks(recs: list) -> None:
                 ra["flags"].append(f"🚩 Polygon overlaps with Farm {rb['farm_id']} ({inter / uni:.0%})")
                 rb["flags"].append(f"🚩 Polygon overlaps with Farm {ra['farm_id']} ({inter / uni:.0%})")
 
-def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
+def audit_row(row, cols, counter=None, use_ai=True, use_ndvi=False, debug_dir=None) -> dict:
     nan = float("nan")
     rec = {
         "farm_id":          first_value(row, cols["farm_id"]) or "N/A",
@@ -677,32 +685,39 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
             poly_ai = poly
             img, mask, z = fetch_farm_image(poly_ai)
             rec["zoom_used"] = z
-            counts, boxes = (counter or TreeCounter()).predict(img, mask)
-            f = calib_factor(rec["species"]) if _USE_CALIB else 1.0
-            A_lo, A, A_hi = (round(counts[k] * f) for k in ("lo", "mid", "hi"))
-            rec["ai_raw"], rec["ai_factor"] = counts["mid"], f
             veg = vegetation_pct(img, mask)
             c = poly.centroid
-            crown = crown_diameter_m(boxes, c.y, z, getattr(counter, "upscale", 1.0))
             idate = imagery_date(c.x, c.y)
             if idate is not None:
                 rec["imagery_date"] = idate.strftime("%Y-%m")
                 ref = pd.to_datetime(rec["submission_time"], errors="coerce", utc=True)
                 if pd.isna(ref): ref = pd.Timestamp.now(tz="UTC")
                 img_age = (ref - idate).days / 365.25
+
+            if counter is not None:
+                counts, boxes = counter.predict(img, mask)
+                f = calib_factor(rec["species"]) if _USE_CALIB else 1.0
+                A_lo, A, A_hi = (round(counts[k] * f) for k in ("lo", "mid", "hi"))
+                rec["ai_raw"], rec["ai_factor"] = counts["mid"], f
+                crown = crown_diameter_m(boxes, c.y, z, getattr(counter, "upscale", 1.0))
+            else:
+                boxes = pd.DataFrame()
+
             if debug_dir:
                 from PIL import ImageDraw
                 os.makedirs(debug_dir, exist_ok=True)
                 d = ImageDraw.Draw(img)
-                s = getattr(counter, "upscale", 1.0)
+                s = getattr(counter, "upscale", 1.0) if counter else 1.0
                 for b in boxes.itertuples():
-                    d.rectangle([b.xmin / s, b.ymin / s, b.xmax / s, b.ymax / s], outline="red")
-                img.save(os.path.join(debug_dir, f"{str(rec['farm_id']).replace('/', '_')}.jpg"))
+                    d.rectangle([b.xmin / s, b.ymin / s, b.xmax / s, b.ymax / s], outline="red", width=2)
+                img.save(os.path.join(debug_dir, f"{str(rec['farm_id']).replace('/', '_')}.jpg"), quality=85)
+            del img, mask
+            gc.collect()
         except Exception as e:
             ai_err = str(e)
             log.warning("AI step failed for %s: %s", rec["farm_id"], e)
 
-    if use_ai and poly is not None:
+    if use_ndvi and poly is not None:
         ndvi = recent_ndvi(poly)
 
     rec.update(ai_count=A, ai_low=A_lo, ai_high=A_hi, veg_pct=veg, crown_m=crown,
@@ -715,29 +730,9 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
                                 veg if not math.isnan(veg) else None,
                                 img_age if not math.isnan(img_age) else None)
     if ai_err:
-        rec["verdict"] += f"  (Satellite AI Error: {ai_err})"
+        rec["verdict"] += f"  (Satellite AI Note: {ai_err})"
     rec["confidence"] = confidence(rec)
     return rec
-
-def audit_df(df: pd.DataFrame, use_ai=True, debug_dir=None, verbose=False, calibrated=True) -> pd.DataFrame:
-    global _USE_CALIB
-    _USE_CALIB = calibrated
-    if calibrated and not _CALIB:
-        load_calibration()
-    cols = map_all(df)
-    counter = TreeCounter() if use_ai else None
-    recs = []
-    for i, (_, row) in enumerate(df.iterrows(), 1):
-        try:
-            rec = audit_row(row, cols, counter, use_ai, debug_dir)
-        except Exception as e:
-            rec = {"farm_id": first_value(row, cols["farm_id"]) or i, "engineer": "—",
-                   "verdict": f"❌ Processing Error: {e}"}
-        recs.append(rec)
-    cross_checks(recs)
-    for rec in recs:
-        rec["flags"] = "; ".join(rec.get("flags", []))
-    return pd.DataFrame(recs)
 
 def export_report(res: pd.DataFrame, path: str = "farm_qa_report.xlsx") -> str:
     display_cols = [c for c in res.columns if not str(c).startswith("_")]
