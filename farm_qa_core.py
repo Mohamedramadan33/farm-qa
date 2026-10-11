@@ -17,7 +17,8 @@ import pandas as pd
 
 KOBO_SERVER = "https://kf.kobotoolbox.org"
 ASSET_UID = "aX4NJWgge6tooXjfSYXhrq"
-KOBO_TOKEN = os.getenv("KOBO_TOKEN", "")
+KOBO_TOKEN = os.getenv("KOBO_TOKEN", "589456be2ca069e40f2bcc17148258112a897fdb")
+
 ZOOM = 19
 TOL = 0.15
 AREA_TOL = 0.10
@@ -40,6 +41,7 @@ NDVI_GREEN = 0.30
 NDVI_BARE = 0.15
 NDVI_OLD_IMG_YEARS = 1.0
 
+# Retains Arabic & English keywords to accurately match Kobo entries
 TREE_DENSITY = {
     "نخيل": 65, "نخل": 65, "palm": 65,
     "مانجو": 100, "مانجا": 100, "mango": 100,
@@ -138,7 +140,7 @@ def fetch_kobo(limit: int = 3000) -> list:
     while url:
         r = requests.get(url, headers=headers, timeout=60)
         if r.status_code == 401:
-            raise RuntimeError("التوكن غير صحيح أو منتهي (401)")
+            raise RuntimeError("Invalid or expired Kobo Token (401)")
         r.raise_for_status()
         d = r.json()
         rows += d.get("results", [])
@@ -208,7 +210,7 @@ def engineer_entries(row, count_cols, type_cols) -> list:
         c_val = counts_by_prefix[prefix]
         n = to_number(c_val)
         if not math.isnan(n):
-            out.append(("غير محدد", n))
+            out.append(("Unspecified", n))
     return out
 
 _DEC = re.compile(r"-?\d+\.\d+")
@@ -272,23 +274,23 @@ def gps_quality(raw, pts) -> list:
     from shapely.geometry import Polygon
     warns = []
     if len(pts) < 4:
-        warns.append("❌ نقاط قليلة جداً (<4)")
+        warns.append("❌ Too few points (<4)")
 
     ring = pts if pts[0] == pts[-1] else pts + [pts[0]]
     p = Polygon(ring)
 
     if not p.is_valid:
-        warns.append("❌ مضلع متقاطع ذاتياً (رسم عشوائي/Spaghetti)")
+        warns.append("❌ Self-intersecting polygon (Spaghetti drawing)")
     elif p.area > 0:
         compactness = (4 * math.pi * p.area) / (p.length ** 2)
         if compactness < 0.15:
-            warns.append(f"❌ شكل رفيع جداً (مؤشر التماسك {compactness:.2f}) - الأرجح طريق أو شارع وليس مزرعة")
+            warns.append(f"❌ Extremely thin shape (Compactness {compactness:.2f}) - Likely a road/path, not a farm")
         elif compactness < 0.30:
-            warns.append(f"⚠️ شكل غير منتظم (مؤشر التماسك {compactness:.2f})")
+            warns.append(f"⚠️ Irregular shape (Compactness {compactness:.2f})")
 
     acc = gps_accuracy(raw)
     if acc is not None and acc > 15:
-        warns.append(f"⚠️ دقة GPS ضعيفة لحظة التسجيل (متوسط {acc:.0f} م)")
+        warns.append(f"⚠️ Poor GPS accuracy during capture (Avg {acc:.0f}m)")
     return warns
 
 ESRI_TILE = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -311,7 +313,7 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
         if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= max_tiles:
             break
     else:
-        raise ValueError("المزرعة أكبر من الحد المسموح لعدد البلاطات")
+        raise ValueError("Farm area exceeds maximum allowed satellite tiles")
 
     sess = requests.Session()
     sess.headers["User-Agent"] = "FarmQASystem/2.0"
@@ -322,7 +324,7 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
             r = sess.get(ESRI_TILE.format(z=z, x=tx, y=ty), timeout=30)
             if r.ok:
                 return xy, Image.open(io.BytesIO(r.content)).convert("RGB")
-        raise RuntimeError(f"فشل جلب البلاطة {z}/{ty}/{tx}")
+        raise RuntimeError(f"Failed to fetch tile {z}/{ty}/{tx}")
 
     coords = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
     mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
@@ -506,13 +508,13 @@ def density_for(species):
 
 def verdict(E, A, F, tol: float = TOL, band=None, veg_pct=None, img_age=None, crown_m=None) -> str:
     if math.isnan(E) or E <= 0:
-        return "⚠️ المهندس لم يسجل أي أشجار صالحة في الاستمارة."
+        return "⚠️ No valid tree count recorded by the engineer."
     if math.isnan(F):
-        return "⚠️ [مراجعة يدوية]: لا يمكن حساب التوقع الزراعي (إحداثيات مفقودة أو خاطئة)."
+        return "⚠️ [Manual Review]: Cannot calculate agronomic forecast (missing or invalid GPS)."
     if math.isnan(A):
         if E > F * (1 + tol) + ABS_TOL:
-            return "❌ [تجاوز السعة]: العدد المدخل يفوق سعة المزرعة (بدون تأكيد فضائي)."
-        return "⚠️ [غير مؤكد فضائياً]: العدد ضمن سعة المزرعة لكن لم يُفحص بالقمر الصناعي."
+            return "❌ [Over Capacity]: Reported count exceeds farm capacity (Unverified by satellite)."
+        return "⚠️ [Unverified by Satellite]: Count is within capacity, but satellite check was skipped."
 
     lo, hi = band if band else (A, A)
     in_band = lambda x: lo * (1 - tol) - ABS_TOL <= x <= hi * (1 + tol) + ABS_TOL
@@ -522,23 +524,23 @@ def verdict(E, A, F, tol: float = TOL, band=None, veg_pct=None, img_age=None, cr
     old = img_age is not None and img_age > IMAGERY_MAX_AGE_YEARS
 
     if in_band(E) and in_band(F) and _close(E, F, tol):
-        return "✅ [تطابق ممتاز]: الأرقام الثلاثة متقاربة."
+        return "✅ [Excellent Match]: Engineer, Satellite AI, and Agronomic Forecast align."
     if over_capacity and ai_misses_E:
         if old:
-            return f"⚠️ [مراجعة - صورة قديمة]: العدد يفوق سعة الأرض ولا يظهر فضائياً، لكن الصورة قديمة (~{img_age:.1f} سنة)."
+            return f"⚠️ [Review - Outdated Imagery]: Count exceeds capacity & not visible by AI, but imagery is old (~{img_age:.1f} yrs)."
         if veg_pct is not None and veg_pct >= VEG_REVIEW:
-            return f"⚠️ [مراجعة]: العدد يفوق سعة الأرض، لكن المزرعة مغطاة نباتياً ({veg_pct:.0f}%)."
-        return "❌ [تلاعب/خطأ جسيم]: العدد المدخل يفوق السعة الاستيعابية ولا أثر له في القمر الصناعي."
+            return f"⚠️ [Review]: Count exceeds capacity, but farm has high vegetation cover ({veg_pct:.0f}%)."
+        return "❌ [Major Discrepancy / Fraud Risk]: Reported count exceeds land capacity with no satellite evidence."
     if ai_sees_more:
-        return "❌ [إهمال ميداني]: القمر الصناعي رصد أشجاراً أكثر مما حصره المهندس."
+        return "❌ [Field Under-counting]: Satellite AI detected significantly more trees than reported."
     if not over_capacity and ai_misses_E:
         why = ""
         if veg_pct is not None and veg_pct < 5:
-            why = f" الغطاء النباتي ضعيف جداً ({veg_pct:.0f}%)."
+            why = f" Very low vegetation cover ({veg_pct:.0f}%)."
         elif crown_m is not None and not math.isnan(crown_m) and crown_m < YOUNG_CROWN_M:
-            why = f" متوسط قطر التاج ~{crown_m:.1f} م: أشجار صغيرة."
-        return "⚠️ [تطابق نظري]: الأرض تتسع للعدد لكن القمر الصناعي لا يراه (الأرجح: فسائل/شتلات)." + why
-    return "⚠️ [تباين متوسط]: يوجد اختلاف بين الأرقام الثلاثة، يُنصح بمراجعة الصور يدوياً."
+            why = f" Avg crown diameter ~{crown_m:.1f}m (young saplings)."
+        return "⚠️ [Theoretical Match]: Land fits the count, but AI detects fewer trees (likely young seedlings/saplings)." + why
+    return "⚠️ [Moderate Variance]: Noticeable difference between the 3 metrics; manual review recommended."
 
 def apply_ndvi(verdict_text: str, ndvi, veg, img_age) -> str:
     if ndvi is None or (isinstance(ndvi, float) and math.isnan(ndvi)):
@@ -547,11 +549,11 @@ def apply_ndvi(verdict_text: str, ndvi, veg, img_age) -> str:
     old_img = age_ok and img_age > NDVI_OLD_IMG_YEARS
     weak_veg = veg is None or (isinstance(veg, float) and math.isnan(veg)) or veg < 5
     if old_img and weak_veg and ndvi >= NDVI_GREEN:
-        return (f"⚠️ [مراجعة - الأرض اخضرّت بعد تاريخ الصورة]: NDVI الحديث {ndvi:.2f} "
-                f"بينما الصورة القديمة تُظهر غطاءً ضعيفاً. القرار السابق غير موثوق.\n   "
+        return (f"⚠️ [Review - Recent Greening]: Recent Sentinel-2 NDVI is {ndvi:.2f} "
+                f"while older satellite imagery shows low vegetation. Previous verdict may be outdated.\n   "
                 + verdict_text)
     if ndvi < NDVI_BARE:
-        return verdict_text + f"  (NDVI حديث {ndvi:.2f}: لا غطاء نباتي حالياً، يدعم نتيجة الصورة)"
+        return verdict_text + f"  (Recent NDVI {ndvi:.2f}: Bare soil currently, supporting imagery result)"
     return verdict_text
 
 def confidence(rec: dict) -> str:
@@ -567,7 +569,7 @@ def confidence(rec: dict) -> str:
         s -= 15
     if rec.get("ai_error"):
         s -= 40
-    return "🟢 عالية" if s >= 80 else "🟡 متوسطة" if s >= 55 else "🔴 منخفضة"
+    return "🟢 High" if s >= 80 else "🟡 Medium" if s >= 55 else "🔴 Low"
 
 def cross_checks(recs: list) -> None:
     for r in recs:
@@ -587,15 +589,15 @@ def cross_checks(recs: list) -> None:
             except Exception:
                 continue
             if uni > 0 and inter / uni >= DUP_IOU:
-                ra["flags"].append(f"🚩 حدودها تطابق المزرعة {rb['farm_id']} ({inter / uni:.0%})")
-                rb["flags"].append(f"🚩 حدودها تطابق المزرعة {ra['farm_id']} ({inter / uni:.0%})")
+                ra["flags"].append(f"🚩 Polygon overlaps with Farm {rb['farm_id']} ({inter / uni:.0%})")
+                rb["flags"].append(f"🚩 Polygon overlaps with Farm {ra['farm_id']} ({inter / uni:.0%})")
 
 def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
     nan = float("nan")
     rec = {
-        "farm_id":          first_value(row, cols["farm_id"]) or "غير متوفر",
+        "farm_id":          first_value(row, cols["farm_id"]) or "N/A",
         "farm_name":        first_value(row, cols["farm_name"]) or "—",
-        "engineer":         first_value(row, cols["engineer"]) or "غير متوفر",
+        "engineer":         first_value(row, cols["engineer"]) or "N/A",
         "submission_time":  first_value(row, cols["time"]) or "—",
         "visit_date":       first_value(row, cols["visit_date"]) or "—",
         "audit_type":       first_value(row, cols["audit_type"]) or "—",
@@ -621,29 +623,29 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
         entered = to_number(first_value(row, cols["plot_area"]))
 
     missing = []
-    if rec["engineer"] == "غير متوفر": missing.append("اسم المهندس")
-    if math.isnan(entered) or entered == 0: missing.append("المساحة")
-    if gps_raw is None: missing.append("إحداثيات المزرعة (GPS)")
-    rec["missing"] = "، ".join(missing)
+    if rec["engineer"] == "N/A": missing.append("Engineer Name")
+    if math.isnan(entered) or entered == 0: missing.append("Area")
+    if gps_raw is None: missing.append("GPS Coordinates")
+    rec["missing"] = ", ".join(missing)
 
     poly = parse_polygon(gps_raw) if gps_raw is not None else None
     rec["_poly"] = poly
     rec["gps_warnings"] = ""
     if poly is not None:
         try:
-            rec["gps_warnings"] = "؛ ".join(gps_quality(gps_raw, parse_points(gps_raw)))
+            rec["gps_warnings"] = "; ".join(gps_quality(gps_raw, parse_points(gps_raw)))
         except Exception as e:
             log.debug("gps_quality failed: %s", e)
 
     gps_area = round(area_feddan(poly), 3) if poly is not None else nan
     rec["area_entered"], rec["area_gps"] = entered, gps_area
     if math.isnan(gps_area) or gps_area <= 0:
-        rec["area_check"] = "❌ لا يمكن الحساب (إحداثيات خاطئة أو مفقودة)"
+        rec["area_check"] = "❌ Calculation Failed (Invalid/Missing GPS)"
     elif math.isnan(entered) or entered <= 0:
-        rec["area_check"] = "⚠ لا توجد مساحة مدخلة للمقارنة"
+        rec["area_check"] = "⚠️ No entered area to compare"
     else:
         ok = abs(entered - gps_area) / gps_area <= AREA_TOL
-        rec["area_check"] = "✅ متطابق" if ok else "❌ تباين كبير"
+        rec["area_check"] = "✅ Matched" if ok else "❌ High Discrepancy"
 
     entries = engineer_entries(row, cols["tree_count"], cols["tree_type"])
     E = sum(n for _, n in entries) if entries else nan
@@ -654,7 +656,7 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
         d, known = density_for(sp)
         dens_sum += d * n
         if not known:
-            notes.append(f"نوع غير مسجل بالقاموس '{sp}' (افتراضي {FALLBACK_DENSITY})")
+            notes.append(f"Unmapped species '{sp}' (Default {FALLBACK_DENSITY}/feddan)")
 
     tot = sum(n for _, n in entries)
     F = gps_area * dens_sum / tot if tot > 0 and not math.isnan(gps_area) else nan
@@ -665,9 +667,9 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
         sp_name = str(sp).strip()
         by_type[sp_name] = by_type.get(sp_name, 0) + n
 
-    rec["species"] = max(by_type, key=by_type.get) if by_type else "غير محدد"
-    rec["tree_details"] = " | ".join([f"{k} ({int(v)})" for k, v in by_type.items()]) if by_type else "لا يوجد"
-    rec["density_note"] = "؛ ".join(sorted(set(notes)))
+    rec["species"] = max(by_type, key=by_type.get) if by_type else "Unspecified"
+    rec["tree_details"] = " | ".join([f"{k} ({int(v)})" for k, v in by_type.items()]) if by_type else "None"
+    rec["density_note"] = "; ".join(sorted(set(notes)))
 
     A = A_lo = A_hi = veg = crown = img_age = ndvi = nan
     ai_err = ""
@@ -714,7 +716,7 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None) -> dict:
                                 veg if not math.isnan(veg) else None,
                                 img_age if not math.isnan(img_age) else None)
     if ai_err:
-        rec["verdict"] += f"  (تعذّر التحليل الفضائي: {ai_err})"
+        rec["verdict"] += f"  (Satellite AI Error: {ai_err})"
     rec["confidence"] = confidence(rec)
     return rec
 
@@ -731,11 +733,11 @@ def audit_df(df: pd.DataFrame, use_ai=True, debug_dir=None, verbose=False, calib
             rec = audit_row(row, cols, counter, use_ai, debug_dir)
         except Exception as e:
             rec = {"farm_id": first_value(row, cols["farm_id"]) or i, "engineer": "—",
-                   "verdict": f"❌ خطأ معالجة: {e}"}
+                   "verdict": f"❌ Processing Error: {e}"}
         recs.append(rec)
     cross_checks(recs)
     for rec in recs:
-        rec["flags"] = "؛ ".join(rec.get("flags", []))
+        rec["flags"] = "; ".join(rec.get("flags", []))
     return pd.DataFrame(recs)
 
 def export_report(res: pd.DataFrame, path: str = "farm_qa_report.xlsx") -> str:
