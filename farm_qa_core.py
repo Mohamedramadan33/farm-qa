@@ -8,6 +8,8 @@ import logging
 import math
 import os
 import re
+import sys
+import types
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -15,9 +17,25 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
+# ── RUNTIME PATCH FOR ALBUMENTATIONS COMPATIBILITY ──
+def _force_patch_albumentations():
+    try:
+        import albumentations
+        if not hasattr(albumentations, "functional"):
+            f_mod = None
+            try:
+                from albumentations.augmentations import functional as f_mod
+            except Exception:
+                f_mod = types.ModuleType("albumentations.functional")
+            albumentations.functional = f_mod
+            sys.modules["albumentations.functional"] = f_mod
+    except Exception:
+        pass
+
+_force_patch_albumentations()
+
 KOBO_SERVER = "https://kf.kobotoolbox.org"
 ASSET_UID = "aX4NJWgge6tooXjfSYXhrq"
-# التوكن بيتقرأ من Secrets / environment variable فقط (مفيش قيمة افتراضية)
 KOBO_TOKEN = os.getenv("KOBO_TOKEN", "")
 
 ZOOM = 19
@@ -309,12 +327,17 @@ def _px(lon, lat, z):
     )
 
 def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
+    """Fetches satellite imagery with a 15% contextual margin so the farm boundary is clearly visible."""
     import requests
     from PIL import Image, ImageDraw
     minx, miny, maxx, maxy = poly.bounds
-    for z in range(zoom, 15, -1):
-        x0, y1 = _px(minx, miny, z)
-        x1, y0 = _px(maxx, maxy, z)
+    dx = max((maxx - minx) * 0.15, 0.00015)
+    dy = max((maxy - miny) * 0.15, 0.00015)
+    b_minx, b_miny, b_maxx, b_maxy = minx - dx, miny - dy, maxx + dx, maxy + dy
+
+    for z in range(zoom, 14, -1):
+        x0, y1 = _px(b_minx, b_miny, z)
+        x1, y0 = _px(b_maxx, b_maxy, z)
         tx0, tx1, ty0, ty1 = int(x0 // 256), int(x1 // 256), int(y0 // 256), int(y1 // 256)
         if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= max_tiles:
             break
@@ -344,7 +367,61 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
     ring = [(_px(lo, la, z)[0] - ox - box[0], _px(lo, la, z)[1] - oy - box[1]) for lo, la in poly.exterior.coords]
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).polygon(ring, fill=255)
+    img.info["ring"] = ring
     return img, mask, z
+
+def render_annotated_satellite(img, mask, boxes=None, upscale: float = 1.0, ring=None):
+    """Draws dimmed outside area, bright yellow/cyan farm boundary polygon, and tree detection boxes."""
+    from PIL import Image, ImageDraw
+    base = img.convert("RGBA")
+    w, h = base.size
+
+    # 1. Slightly dim the area outside the farm boundary so the farm stands out
+    arr = np.array(base)
+    m = np.array(mask) > 0
+    if m.shape == arr.shape[:2]:
+        arr[~m, :3] = (arr[~m, :3] * 0.55).astype(np.uint8)
+    annotated = Image.fromarray(arr).convert("RGBA")
+
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # 2. Draw Farm Boundary Polygon (Thick Yellow + Cyan dual-outline for maximum contrast)
+    poly_ring = ring or img.info.get("ring")
+    if poly_ring and len(poly_ring) >= 3:
+        pts = [(float(x), float(y)) for x, y in poly_ring]
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])
+        line_w = max(3, int(min(w, h) / 140))
+        draw.line(pts, fill=(0, 255, 255, 255), width=line_w + 2, joint="curve")
+        draw.line(pts, fill=(255, 230, 0, 255), width=line_w, joint="curve")
+        # Draw corner vertices
+        r_pt = max(3, line_w)
+        for px, py in pts:
+            draw.ellipse([px - r_pt, py - r_pt, px + r_pt, py + r_pt], fill=(255, 255, 255, 255), outline=(0, 0, 0, 255))
+
+    # 3. Draw Tree Detection Boxes
+    tree_count_drawn = 0
+    if boxes is not None and not boxes.empty:
+        for b in boxes.itertuples():
+            x1, y1, x2, y2 = float(b.xmin) / upscale, float(b.ymin) / upscale, float(b.xmax) / upscale, float(b.ymax) / upscale
+            score = getattr(b, "score", 0.5)
+            # High confidence (>=0.30): Bright Red box with lime center dot; Low confidence: Orange
+            if score >= AI_BAND[1]:
+                tree_count_drawn += 1
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 40, 40, 240), width=2)
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=(0, 255, 0, 255))
+            else:
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 165, 0, 160), width=1)
+
+    # 4. Draw Top Legend Banner
+    banner_h = 28
+    draw.rectangle([0, 0, w, banner_h], fill=(15, 20, 30, 210))
+    legend_txt = f"Farm Boundary (Yellow)  |  Detected Trees (Red Boxes): {tree_count_drawn}"
+    draw.text((10, 7), legend_txt, fill=(255, 255, 255, 255))
+
+    return Image.alpha_composite(annotated, overlay).convert("RGB")
 
 class TreeCounter:
     def __init__(self, patch_size: int = 400, upscale: float = 1.0):
@@ -352,6 +429,7 @@ class TreeCounter:
         self._model = None
 
     def _load(self):
+        _force_patch_albumentations()
         from deepforest import main
         m = main.deepforest()
         try:
@@ -680,34 +758,37 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
     A = A_lo = A_hi = veg = crown = img_age = ndvi = nan
     ai_err = ""
     if use_ai and poly is not None:
+        img = mask = None
+        boxes = pd.DataFrame()
         try:
-            poly_ai = poly
-            img, mask, z = fetch_farm_image(poly_ai)
+            img, mask, z = fetch_farm_image(poly)
             rec["zoom_used"] = z
-            counts, boxes = (counter or TreeCounter()).predict(img, mask)
-            f = calib_factor(rec["species"]) if _USE_CALIB else 1.0
-            A_lo, A, A_hi = (round(counts[k] * f) for k in ("lo", "mid", "hi"))
-            rec["ai_raw"], rec["ai_factor"] = counts["mid"], f
-            veg = vegetation_pct(img, mask)
+            veg = round(vegetation_pct(img, mask), 1)
             c = poly.centroid
-            crown = crown_diameter_m(boxes, c.y, z, getattr(counter, "upscale", 1.0))
             idate = imagery_date(c.x, c.y)
             if idate is not None:
                 rec["imagery_date"] = idate.strftime("%Y-%m")
                 ref = pd.to_datetime(rec["submission_time"], errors="coerce", utc=True)
                 if pd.isna(ref): ref = pd.Timestamp.now(tz="UTC")
                 img_age = (ref - idate).days / 365.25
-            if debug_dir:
-                from PIL import ImageDraw
-                os.makedirs(debug_dir, exist_ok=True)
-                d = ImageDraw.Draw(img)
-                s = getattr(counter, "upscale", 1.0)
-                for b in boxes.itertuples():
-                    d.rectangle([b.xmin / s, b.ymin / s, b.xmax / s, b.ymax / s], outline="red")
-                img.save(os.path.join(debug_dir, f"{str(rec['farm_id']).replace('/', '_')}.jpg"))
+
+            counts, boxes = (counter or TreeCounter()).predict(img, mask)
+            f = calib_factor(rec["species"]) if _USE_CALIB else 1.0
+            A_lo, A, A_hi = (round(counts[k] * f) for k in ("lo", "mid", "hi"))
+            rec["ai_raw"], rec["ai_factor"] = counts["mid"], f
+            crown = crown_diameter_m(boxes, c.y, z, getattr(counter, "upscale", 1.0))
         except Exception as e:
             ai_err = str(e)
             log.warning("AI step failed for %s: %s", rec["farm_id"], e)
+        finally:
+            if debug_dir and img is not None and mask is not None:
+                try:
+                    os.makedirs(debug_dir, exist_ok=True)
+                    s = getattr(counter, "upscale", 1.0) if counter else 1.0
+                    vis_img = render_annotated_satellite(img, mask, boxes=boxes, upscale=s, ring=img.info.get("ring"))
+                    vis_img.save(os.path.join(debug_dir, f"{str(rec['farm_id']).replace('/', '_')}.jpg"), quality=90)
+                except Exception as save_err:
+                    log.warning("Failed saving annotated satellite image: %s", save_err)
 
     if use_ai and use_ndvi and poly is not None:
         ndvi = recent_ndvi(poly)
