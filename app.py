@@ -269,15 +269,23 @@ if run_btn:
             st.warning("⚠️ No forms matched your search criteria.")
         else:
             os.makedirs(DEBUG_DIR, exist_ok=True)
-            counter = get_tree_counter() if use_ai else None
+            run_ai = use_ai
+            counter = None
+            if use_ai:
+                try:
+                    counter = get_tree_counter()
+                except Exception as e:
+                    run_ai = False
+                    st.error(f"❌ تعذر تحميل موديل DeepForest — التدقيق هيكمل من غير AI: {e}")
+                    st.exception(e)
             cols = qa.map_all(filtered_df)
             recs = []
             total = len(filtered_df)
             prog = st.progress(0, text="Running GeoAI & Form Audit...")
             for i, (idx, row) in enumerate(filtered_df.iterrows(), 1):
                 try:
-                    rec = qa.audit_row(row, cols, counter=counter, use_ai=use_ai,
-                                       debug_dir=DEBUG_DIR, use_ndvi=use_ndvi)
+                    rec = qa.audit_row(row, cols, counter=counter, use_ai=run_ai,
+                                       debug_dir=DEBUG_DIR, use_ndvi=(use_ndvi and run_ai))
                 except Exception as e:
                     rec = blank_record(qa.first_value(row, cols["farm_id"]) or f"row{i}", e)
                 rec["_df_index"] = idx
@@ -313,6 +321,7 @@ if run_btn:
             st.session_state["flat_df"] = raw_df
     except Exception as e:
         st.error(f"Error loading data: {e}")
+        st.exception(e)
 
 # ═══════════════════════ 4. MAIN WORKSPACE ═══════════════════════
 if "results" in st.session_state:
