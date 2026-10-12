@@ -130,7 +130,11 @@ def flatten(obj, parent: str = "", sep: str = "/") -> dict:
 def build_dataframe(rows: list) -> pd.DataFrame:
     df = pd.DataFrame([flatten(r) for r in rows])
     conv = lambda v: normalize_digits(v) if isinstance(v, str) else v
-    return df.apply(lambda s: s.map(conv) if s.dtype == object else s)
+    def _fix(s):
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            return s.map(conv)
+        return s
+    return df.apply(_fix)
 
 def fetch_kobo(limit: int = 3000) -> list:
     import requests
