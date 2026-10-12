@@ -39,20 +39,34 @@ ASSET_UID = "aX4NJWgge6tooXjfSYXhrq"
 KOBO_TOKEN = os.getenv("KOBO_TOKEN", "")
 
 ZOOM = 19
-TOL = 0.15
+TOL = 0.20
 AREA_TOL = 0.10
 FEDDAN_M2 = 4200.83
-FALLBACK_DENSITY = 120
+
+# ── PERIMETER / BOUNDARY AUDIT PARAMETERS ──
+# Width of the boundary corridor (in meters) around the polygon edge to count boundary trees
+BOUNDARY_BUFFER_M = 8.0
+DEFAULT_BOUNDARY_SPACING_M = 3.0  # Default: 1 tree every 3 meters along the farm perimeter
+
+# Standard spacing (in meters) between trees when planted along the farm boundary/perimeter
+BOUNDARY_SPACING_M = {
+    "جازورين": 2.5, "كازورينا": 2.5, "casuarina": 2.5,
+    "كافور": 2.5, "ماهوجني": 3.0, "mahogany": 3.0,
+    "فيكس": 3.0, "ficus": 3.0, "توت": 3.5,
+    "نخيل": 6.0, "نخل": 6.0, "palm": 6.0,
+    "زيتون": 5.0, "olive": 5.0,
+    "مانجو": 5.0, "مانجا": 5.0, "mango": 5.0,
+    "موالح": 4.0, "citrus": 4.0,
+    "موز": 3.0, "banana": 3.0,
+}
 
 ABS_TOL = 5
-# Lowered thresholds slightly so desert/dusty trees (Casuarina/Olive/Palm) are detected accurately
-AI_BAND = (0.40, 0.22, 0.12)
+AI_BAND = (0.38, 0.20, 0.12)
 VEG_EXG = 0.04
 VEG_REVIEW = 25.0
 IMAGERY_MAX_AGE_YEARS = 2.0
 YOUNG_CROWN_M = 2.0
 DUP_IOU = 0.80
-ROUND_BASE = 50
 CALIBRATION_FILE = "ai_calibration.json"
 
 NDVI_DAYS = 120
@@ -60,18 +74,6 @@ NDVI_CLOUD = 20
 NDVI_GREEN = 0.30
 NDVI_BARE = 0.15
 NDVI_OLD_IMG_YEARS = 1.0
-
-TREE_DENSITY = {
-    "نخيل": 65, "نخل": 65, "palm": 65,
-    "مانجو": 100, "مانجا": 100, "mango": 100,
-    "زيتون": 120, "olive": 120,
-    "موالح": 150, "citrus": 150,
-    "كازورينا": 300, "casuarina": 300,
-    "فيكس": 200, "ficus": 200,
-    "موز": 400, "banana": 400,
-    "ماهوجني": 300, "mahogany": 300,
-    "جازورين": 300, "كافور": 300, "توت": 150,
-}
 
 FIELD_HINTS = {
     "time":       {"exact": ["_submission_time", "start"], "kw": []},
@@ -263,12 +265,21 @@ def parse_points(raw):
     return clean if len(clean) >= 3 else None
 
 def points_to_polygon(pts):
+    """Automatically untangles self-intersecting ('bowtie/X-shaped') point orders to recover full farm rectangle."""
     from shapely.geometry import Polygon
     from shapely.validation import make_valid
     if pts[0] != pts[-1]:
         pts = pts + [pts[0]]
     poly = Polygon(pts)
     if not poly.is_valid:
+        unique_pts = list(dict.fromkeys(pts[:-1]))
+        if 3 <= len(unique_pts) <= 12:
+            cx = sum(p[0] for p in unique_pts) / len(unique_pts)
+            cy = sum(p[1] for p in unique_pts) / len(unique_pts)
+            sorted_pts = sorted(unique_pts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+            poly_fixed = Polygon(sorted_pts + [sorted_pts[0]])
+            if poly_fixed.is_valid and poly_fixed.area > 0:
+                return poly_fixed
         poly = make_valid(poly)
     if poly.geom_type != "Polygon":
         polys = [g for g in getattr(poly, "geoms", []) if g.geom_type == "Polygon"]
@@ -281,10 +292,20 @@ def parse_polygon(raw):
     pts = parse_points(raw)
     return points_to_polygon(pts) if pts else None
 
-def area_feddan(poly) -> float:
+def geom_metrics_utm(poly) -> tuple[float, float]:
+    """Returns (area_in_feddan, perimeter_in_meters) using accurate UTM projection."""
     import geopandas as gpd
     gs = gpd.GeoSeries([poly], crs=4326)
-    return float(gs.to_crs(gs.estimate_utm_crs()).area.iloc[0]) / FEDDAN_M2
+    utm_geom = gs.to_crs(gs.estimate_utm_crs()).iloc[0]
+    area_fed = float(utm_geom.area) / FEDDAN_M2
+    perim_m = float(utm_geom.length)
+    return area_fed, perim_m
+
+def area_feddan(poly) -> float:
+    return geom_metrics_utm(poly)[0]
+
+def perimeter_meters(poly) -> float:
+    return geom_metrics_utm(poly)[1]
 
 def gps_accuracy(raw):
     accs = []
@@ -305,7 +326,7 @@ def gps_quality(raw, pts) -> list:
     p = Polygon(ring)
 
     if not p.is_valid:
-        warns.append("❌ Self-intersecting polygon (Spaghetti drawing)")
+        warns.append("⚠️ Points were recorded in crossed order (Auto-corrected to full boundary)")
     elif p.area > 0:
         compactness = (4 * math.pi * p.area) / (p.length ** 2)
         if compactness < 0.15:
@@ -318,7 +339,6 @@ def gps_quality(raw, pts) -> list:
         warns.append(f"⚠️ Poor GPS accuracy during capture (Avg {acc:.0f}m)")
     return warns
 
-# Multi-provider satellite tile sources: Google Satellite first (best coverage in Egypt), then ESRI
 TILE_PROVIDERS = [
     ("Google Earth", "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"),
     ("ESRI World Imagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
@@ -332,35 +352,44 @@ def _px(lon, lat, z):
     )
 
 def _is_valid_satellite_image(img) -> bool:
-    """Detects grey 'Map data not yet available' placeholder tiles by checking color saturation & variance."""
     arr = np.asarray(img, dtype="float32")
     if arr.size == 0:
         return False
-    # Placeholder tiles are almost purely grayscale (R == G == B) and have low standard deviation
     rg_diff = np.abs(arr[:, :, 0] - arr[:, :, 1]).mean()
     gb_diff = np.abs(arr[:, :, 1] - arr[:, :, 2]).mean()
     color_spread = rg_diff + gb_diff
     std_val = arr.std()
-    # If the image is nearly monochrome grey (color_spread < 3.0) and flat (std_val < 22), it's a "no data" tile
     if color_spread < 3.0 and std_val < 25.0:
         return False
     return True
 
+def _build_boundary_ring_mask(size: tuple[int, int], ring: list, lat: float, zoom: int, buffer_m: float = BOUNDARY_BUFFER_M):
+    """Creates a binary mask covering ONLY the farm boundary corridor (e.g. +-8m around the perimeter line)."""
+    from PIL import Image, ImageDraw
+    mpp = 156543.03392 * math.cos(math.radians(lat)) / (2 ** zoom)
+    stroke_px = max(8, int(round((buffer_m * 2.0) / max(mpp, 0.05))))
+    b_mask = Image.new("L", size, 0)
+    pts = [(float(x), float(y)) for x, y in ring]
+    if pts and pts[0] != pts[-1]:
+        pts.append(pts[0])
+    ImageDraw.Draw(b_mask).line(pts, fill=255, width=stroke_px, joint="curve")
+    return b_mask, stroke_px
+
 def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
-    """Fetches real satellite imagery from Google Earth / ESRI with automatic zoom fallback to avoid grey tiles."""
+    """Fetches full farm satellite image + creates both full-farm mask and boundary-corridor mask."""
     import requests
     from PIL import Image, ImageDraw
     minx, miny, maxx, maxy = poly.bounds
-    dx = max((maxx - minx) * 0.18, 0.00020)
-    dy = max((maxy - miny) * 0.18, 0.00020)
+    dx = max((maxx - minx) * 0.20, 0.00022)
+    dy = max((maxy - miny) * 0.20, 0.00022)
     b_minx, b_miny, b_maxx, b_maxy = minx - dx, miny - dy, maxx + dx, maxy + dy
 
     sess = requests.Session()
     sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
     last_img, last_mask, last_z = None, None, 17
+    c_lat = poly.centroid.y
 
-    # Try zoom levels from 19 down to 16 across providers until we get a real non-grey satellite image
     for z in range(min(zoom, 19), 15, -1):
         x0, y1 = _px(b_minx, b_miny, z)
         x1, y0 = _px(b_maxx, b_maxy, z)
@@ -400,8 +429,12 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
             ring = [(_px(lo, la, z)[0] - ox - box[0], _px(lo, la, z)[1] - oy - box[1]) for lo, la in poly.exterior.coords]
             mask = Image.new("L", img.size, 0)
             ImageDraw.Draw(mask).polygon(ring, fill=255)
+            b_mask, stroke_px = _build_boundary_ring_mask(img.size, ring, c_lat, z, BOUNDARY_BUFFER_M)
+
             img.info["ring"] = ring
             img.info["provider"] = prov_name
+            img.info["boundary_mask"] = b_mask
+            img.info["boundary_stroke_px"] = stroke_px
             last_img, last_mask, last_z = img, mask, z
 
             if _is_valid_satellite_image(img):
@@ -412,13 +445,12 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
     raise RuntimeError("Could not fetch satellite imagery from Google Earth or ESRI")
 
 def render_annotated_satellite(img, mask, boxes=None, upscale: float = 1.0, ring=None):
-    """Draws dimmed outside area, bright yellow/cyan farm boundary polygon, and tree detection boxes."""
+    """Shows the WHOLE farm clearly in satellite view, highlights the boundary belt, and marks boundary trees."""
     from PIL import Image, ImageDraw
-    # Ensure minimum visual display size so small farms (e.g. 0.22 feddan) look crisp and clear
     orig_w, orig_h = img.size
     vis_scale = 1.0
-    if min(orig_w, orig_h) < 450:
-        vis_scale = 450.0 / max(1, min(orig_w, orig_h))
+    if min(orig_w, orig_h) < 480:
+        vis_scale = 480.0 / max(1, min(orig_w, orig_h))
         new_sz = (int(orig_w * vis_scale), int(orig_h * vis_scale))
         base_rgb = img.resize(new_sz, Image.LANCZOS)
         mask_resized = mask.resize(new_sz, Image.NEAREST)
@@ -429,45 +461,56 @@ def render_annotated_satellite(img, mask, boxes=None, upscale: float = 1.0, ring
     base = base_rgb.convert("RGBA")
     w, h = base.size
 
+    # Keep the whole farm 100% bright and clear; slightly dim outside background
     arr = np.array(base)
     m = np.array(mask_resized) > 0
     if m.shape == arr.shape[:2]:
-        arr[~m, :3] = (arr[~m, :3] * 0.55).astype(np.uint8)
+        arr[~m, :3] = (arr[~m, :3] * 0.60).astype(np.uint8)
     annotated = Image.fromarray(arr).convert("RGBA")
 
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
     poly_ring = ring or img.info.get("ring")
+    stroke_px = int(img.info.get("boundary_stroke_px", 16) * vis_scale)
     if poly_ring and len(poly_ring) >= 3:
         pts = [(float(x) * vis_scale, float(y) * vis_scale) for x, y in poly_ring]
         if pts[0] != pts[-1]:
             pts.append(pts[0])
-        line_w = max(3, int(min(w, h) / 140))
+        # Subtle translucent yellow buffer zone showing the boundary tree corridor
+        draw.line(pts, fill=(255, 235, 0, 45), width=max(12, stroke_px), joint="curve")
+        # Crisp farm perimeter line
+        line_w = max(3, int(min(w, h) / 150))
         draw.line(pts, fill=(0, 255, 255, 255), width=line_w + 2, joint="curve")
         draw.line(pts, fill=(255, 230, 0, 255), width=line_w, joint="curve")
         r_pt = max(3, line_w)
         for px, py in pts:
             draw.ellipse([px - r_pt, py - r_pt, px + r_pt, py + r_pt], fill=(255, 255, 255, 255), outline=(0, 0, 0, 255))
 
-    tree_count_drawn = 0
+    boundary_trees_drawn = 0
+    interior_trees_drawn = 0
     if boxes is not None and not boxes.empty:
         factor = vis_scale / upscale
         for b in boxes.itertuples():
             x1, y1, x2, y2 = float(b.xmin) * factor, float(b.ymin) * factor, float(b.xmax) * factor, float(b.ymax) * factor
             score = getattr(b, "score", 0.5)
+            on_b = getattr(b, "on_boundary", True)
             if score >= AI_BAND[1]:
-                tree_count_drawn += 1
-                draw.rectangle([x1, y1, x2, y2], outline=(255, 35, 35, 245), width=2)
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                draw.ellipse([cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5], fill=(0, 255, 0, 255))
-            else:
-                draw.rectangle([x1, y1, x2, y2], outline=(255, 165, 0, 180), width=1)
+                if on_b:
+                    boundary_trees_drawn += 1
+                    draw.rectangle([x1, y1, x2, y2], outline=(255, 30, 30, 255), width=2)
+                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                    draw.ellipse([cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5], fill=(0, 255, 0, 255))
+                else:
+                    interior_trees_drawn += 1
+                    draw.rectangle([x1, y1, x2, y2], outline=(0, 200, 255, 150), width=1)
 
-    prov = img.info.get("provider", "Satellite")
+    prov = img.info.get("provider", "Google Earth")
     banner_h = 28
-    draw.rectangle([0, 0, w, banner_h], fill=(15, 20, 30, 215))
-    legend_txt = f"{prov} | Boundary (Yellow) | Detected Trees (Red): {tree_count_drawn}"
+    draw.rectangle([0, 0, w, banner_h], fill=(15, 20, 30, 220))
+    legend_txt = f"{prov} | Boundary Trees (Red): {boundary_trees_drawn}"
+    if interior_trees_drawn > 0:
+        legend_txt += f" | Interior (Cyan): {interior_trees_drawn}"
     draw.text((10, 7), legend_txt, fill=(255, 255, 255, 255))
 
     return Image.alpha_composite(annotated, overlay).convert("RGB")
@@ -487,24 +530,24 @@ class TreeCounter:
             m.use_release()
         self._model = m
 
-    def predict(self, img, mask):
-        from PIL import Image, ImageEnhance
+    def predict(self, img, mask, boundary_only: bool = True):
+        """Detects trees across the farm image, focusing counts on the farm boundary corridor."""
+        from PIL import Image, ImageEnhance, ImageFilter
         if self._model is None:
             self._load()
 
-        # Upscale & slightly sharpen satellite image so small/desert tree crowns are detected
+        b_mask_orig = img.info.get("boundary_mask")
+
         if self.upscale != 1.0:
             size = (int(img.width * self.upscale), int(img.height * self.upscale))
             img_work = img.resize(size, Image.LANCZOS)
             mask_work = mask.resize(size, Image.NEAREST)
+            b_mask_work = b_mask_orig.resize(size, Image.NEAREST) if b_mask_orig is not None else None
         else:
-            img_work, mask_work = img, mask
+            img_work, mask_work, b_mask_work = img, mask, b_mask_orig
 
         img_work = ImageEnhance.Contrast(img_work).enhance(1.15)
         arr = np.array(img_work)
-        m = np.array(mask_work) > 0
-
-        # Usefull full unmasked context for detection so boundary trees (like Casuarina windbreaks) aren't cut off!
         arr_input = arr.astype("float32")
 
         try:
@@ -514,15 +557,28 @@ class TreeCounter:
             boxes = self._model.predict_image(image=arr_input)
 
         if boxes is None or len(boxes) == 0:
-            return {"lo": 0, "mid": 0, "hi": 0}, pd.DataFrame()
+            return {"lo": 0, "mid": 0, "hi": 0, "interior_mid": 0}, pd.DataFrame()
 
         boxes = boxes[boxes["score"] >= min(AI_BAND)].copy()
-        # Dilate mask slightly by 6 pixels so border windbreak trees (أشجار الجازورين على الحدود) are included
-        from PIL import ImageFilter
-        mask_dilated = np.array(mask_work.filter(ImageFilter.MaxFilter(11))) > 0
-        cx = ((boxes.xmin + boxes.xmax) / 2).astype(int).clip(0, mask_dilated.shape[1] - 1)
-        cy = ((boxes.ymin + boxes.ymax) / 2).astype(int).clip(0, mask_dilated.shape[0] - 1)
-        boxes = boxes[mask_dilated[cy.values, cx.values]]
+
+        # Dilate farm mask so boundary trees slightly outside the GPS line are captured
+        farm_dilated = np.array(mask_work.filter(ImageFilter.MaxFilter(15))) > 0
+        if b_mask_work is not None:
+            b_zone = np.array(b_mask_work) > 0
+        else:
+            b_zone = farm_dilated
+
+        cx = ((boxes.xmin + boxes.xmax) / 2).astype(int).clip(0, farm_dilated.shape[1] - 1)
+        cy = ((boxes.ymin + boxes.ymax) / 2).astype(int).clip(0, farm_dilated.shape[0] - 1)
+
+        in_farm_or_edge = farm_dilated[cy.values, cx.values] | b_zone[cy.values, cx.values]
+        boxes = boxes[in_farm_or_edge].copy()
+        if boxes.empty:
+            return {"lo": 0, "mid": 0, "hi": 0, "interior_mid": 0}, pd.DataFrame()
+
+        cx = ((boxes.xmin + boxes.xmax) / 2).astype(int).clip(0, b_zone.shape[1] - 1)
+        cy = ((boxes.ymin + boxes.ymax) / 2).astype(int).clip(0, b_zone.shape[0] - 1)
+        boxes["on_boundary"] = b_zone[cy.values, cx.values]
 
         valid_boxes = []
         for _, box in boxes.iterrows():
@@ -530,19 +586,22 @@ class TreeCounter:
             box_pixels = arr[y1:y2, x1:x2].astype("float32")
             if box_pixels.size == 0:
                 continue
-            # Filter out bright desert sand or white roofs, keep green/dark tree canopies
             brightness = box_pixels.mean()
             s = box_pixels.sum(axis=2) + 1e-6
             exg = (2 * box_pixels[:, :, 1] - box_pixels[:, :, 0] - box_pixels[:, :, 2]) / s
             green_ratio = (exg > VEG_EXG).mean()
-            if green_ratio > 0.06 or (brightness < 140 and box.score >= 0.28):
+            if green_ratio > 0.05 or (brightness < 145 and box.score >= 0.25):
                 valid_boxes.append(box)
 
         if not valid_boxes:
-            return {"lo": 0, "mid": 0, "hi": 0}, pd.DataFrame()
+            return {"lo": 0, "mid": 0, "hi": 0, "interior_mid": 0}, pd.DataFrame()
 
         boxes_df = pd.DataFrame(valid_boxes)
-        counts = {k: int((boxes_df["score"] >= t).sum()) for k, t in zip(("lo", "mid", "hi"), AI_BAND)}
+        target_df = boxes_df[boxes_df["on_boundary"]] if boundary_only else boxes_df
+        interior_df = boxes_df[~boxes_df["on_boundary"]]
+
+        counts = {k: int((target_df["score"] >= t).sum()) for k, t in zip(("lo", "mid", "hi"), AI_BAND)}
+        counts["interior_mid"] = int((interior_df["score"] >= AI_BAND[1]).sum())
         return counts, boxes_df
 
 _CALIB: dict = {}
@@ -642,22 +701,23 @@ def recent_ndvi(poly, days: int = NDVI_DAYS) -> float:
 def _close(a, b, tol):
     return abs(a - b) <= max(tol * max(a, b), ABS_TOL)
 
-def density_for(species):
+def spacing_for_boundary(species) -> tuple[float, bool]:
+    """Returns standard tree-to-tree spacing (in meters) along the farm perimeter."""
     s = norm_ar(species) if present(species) else ""
-    for k, v in TREE_DENSITY.items():
+    for k, v in BOUNDARY_SPACING_M.items():
         if s and norm_ar(k) in s:
             return float(v), True
-    return float(FALLBACK_DENSITY), False
+    return float(DEFAULT_BOUNDARY_SPACING_M), False
 
 def verdict(E, A, F, tol: float = TOL, band=None, veg_pct=None, img_age=None, crown_m=None) -> str:
     if math.isnan(E) or E <= 0:
-        return "⚠️ No valid tree count recorded by the engineer."
+        return "⚠️ No valid boundary tree count recorded by the engineer."
     if math.isnan(F):
-        return "⚠️ [Manual Review]: Cannot calculate agronomic forecast (missing or invalid GPS)."
+        return "⚠️ [Manual Review]: Cannot calculate perimeter tree forecast (missing or invalid GPS)."
     if math.isnan(A):
         if E > F * (1 + tol) + ABS_TOL:
-            return "❌ [Over Capacity]: Reported count exceeds farm capacity (Unverified by satellite)."
-        return "⚠️ [Unverified by Satellite]: Count is within capacity, but satellite check was skipped."
+            return "❌ [Over Perimeter Capacity]: Reported count exceeds boundary capacity (Unverified by satellite)."
+        return "⚠️ [Unverified by Satellite]: Count fits farm perimeter, click 'Run satellite AI' to verify."
 
     lo, hi = band if band else (A, A)
     in_band = lambda x: lo * (1 - tol) - ABS_TOL <= x <= hi * (1 + tol) + ABS_TOL
@@ -666,24 +726,22 @@ def verdict(E, A, F, tol: float = TOL, band=None, veg_pct=None, img_age=None, cr
     ai_sees_more = lo > E * (1 + tol) + ABS_TOL
     old = img_age is not None and img_age > IMAGERY_MAX_AGE_YEARS
 
-    if in_band(E) and in_band(F) and _close(E, F, tol):
-        return "✅ [Excellent Match]: Engineer, Satellite AI, and Agronomic Forecast align."
+    if in_band(E) and (in_band(F) or _close(E, F, tol) or E <= F * (1 + tol) + ABS_TOL):
+        return "✅ [Excellent Boundary Match]: Engineer count aligns with Satellite AI on the farm perimeter."
     if over_capacity and ai_misses_E:
         if old:
-            return f"⚠️ [Review - Outdated Imagery]: Count exceeds capacity & not visible by AI, but imagery is old (~{img_age:.1f} yrs)."
+            return f"⚠️ [Review - Outdated Imagery]: Count exceeds perimeter capacity & not seen by AI, but imagery is old (~{img_age:.1f} yrs)."
         if veg_pct is not None and veg_pct >= VEG_REVIEW:
-            return f"⚠️ [Review]: Count exceeds capacity, but farm has high vegetation cover ({veg_pct:.0f}%)."
-        return "❌ [Major Discrepancy / Fraud Risk]: Reported count exceeds land capacity with no satellite evidence."
+            return f"⚠️ [Review]: Count exceeds perimeter capacity, but boundary has dense vegetation ({veg_pct:.0f}%)."
+        return "❌ [Major Boundary Discrepancy]: Reported count exceeds perimeter capacity with no satellite evidence."
     if ai_sees_more:
-        return "❌ [Field Under-counting]: Satellite AI detected significantly more trees than reported."
+        return "❌ [Boundary Under-counting]: Satellite AI detected more trees along the farm boundary than reported."
     if not over_capacity and ai_misses_E:
         why = ""
-        if veg_pct is not None and veg_pct < 5:
-            why = f" Very low vegetation cover ({veg_pct:.0f}%)."
-        elif crown_m is not None and not math.isnan(crown_m) and crown_m < YOUNG_CROWN_M:
+        if crown_m is not None and not math.isnan(crown_m) and crown_m < YOUNG_CROWN_M:
             why = f" Avg crown diameter ~{crown_m:.1f}m (young saplings)."
-        return "⚠️ [Theoretical Match]: Land fits the count, but AI detects fewer trees (likely young seedlings/saplings)." + why
-    return "⚠️ [Moderate Variance]: Noticeable difference between the 3 metrics; manual review recommended."
+        return "⚠️ [Perimeter Capacity Match]: Farm perimeter fits the reported count, but AI detects fewer mature crowns (likely young saplings or partial border planting)." + why
+    return "⚠️ [Moderate Variance]: Noticeable difference between Engineer, Perimeter Forecast, and AI; manual review recommended."
 
 def apply_ndvi(verdict_text: str, ndvi, veg, img_age) -> str:
     if ndvi is None or (isinstance(ndvi, float) and math.isnan(ndvi)):
@@ -705,11 +763,11 @@ def confidence(rec: dict) -> str:
     if age is not None and not (isinstance(age, float) and math.isnan(age)) and age > IMAGERY_MAX_AGE_YEARS:
         s -= 30
     if rec.get("gps_warnings"):
-        s -= 20
+        s -= 15
     if str(rec.get("area_check", "")).startswith("❌"):
         s -= 20
     if rec.get("density_note"):
-        s -= 15
+        s -= 10
     if rec.get("ai_error"):
         s -= 40
     return "🟢 High" if s >= 80 else "🟡 Medium" if s >= 55 else "🔴 Low"
@@ -780,8 +838,14 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
         except Exception as e:
             log.debug("gps_quality failed: %s", e)
 
-    gps_area = round(area_feddan(poly), 3) if poly is not None else nan
-    rec["area_entered"], rec["area_gps"] = entered, gps_area
+    if poly is not None:
+        raw_area, raw_perim = geom_metrics_utm(poly)
+        gps_area = round(raw_area, 3)
+        perim_m = round(raw_perim, 1)
+    else:
+        gps_area, perim_m = nan, nan
+
+    rec["area_entered"], rec["area_gps"], rec["perimeter_m"] = entered, gps_area, perim_m
     if math.isnan(gps_area) or gps_area <= 0:
         rec["area_check"] = "❌ Calculation Failed (Invalid/Missing GPS)"
     elif math.isnan(entered) or entered <= 0:
@@ -794,16 +858,19 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
     E = sum(n for _, n in entries) if entries else nan
     rec["engineer_count"] = E
 
-    notes, dens_sum = [], 0.0
+    # ── PERIMETER-BASED TREE FORECAST CALCULATION ──
+    notes, weighted_spacing = [], 0.0
     for sp, n in entries:
-        d, known = density_for(sp)
-        dens_sum += d * n
+        sp_m, known = spacing_for_boundary(sp)
+        weighted_spacing += sp_m * n
         if not known:
-            notes.append(f"Unmapped species '{sp}' (Default {FALLBACK_DENSITY}/feddan)")
+            notes.append(f"Default boundary spacing {DEFAULT_BOUNDARY_SPACING_M}m used for '{sp}'")
 
     tot = sum(n for _, n in entries)
-    F = gps_area * dens_sum / tot if tot > 0 and not math.isnan(gps_area) else nan
+    avg_spacing_m = (weighted_spacing / tot) if tot > 0 else DEFAULT_BOUNDARY_SPACING_M
+    F = (perim_m / avg_spacing_m) if (not math.isnan(perim_m) and perim_m > 0 and avg_spacing_m > 0) else nan
     rec["forecast"] = round(F) if not math.isnan(F) else nan
+    rec["boundary_spacing_m"] = round(avg_spacing_m, 2)
 
     by_type = {}
     for sp, n in entries:
@@ -823,7 +890,9 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
         try:
             img, mask, z = fetch_farm_image(poly)
             rec["zoom_used"] = z
-            veg = round(vegetation_pct(img, mask), 1)
+            b_mask = img.info.get("boundary_mask", mask)
+            # Calculate vegetation cover along the boundary corridor
+            veg = round(vegetation_pct(img, b_mask), 1)
             c = poly.centroid
             idate = imagery_date(c.x, c.y)
             if idate is not None:
@@ -832,11 +901,13 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
                 if pd.isna(ref): ref = pd.Timestamp.now(tz="UTC")
                 img_age = (ref - idate).days / 365.25
 
-            counts, boxes = active_counter.predict(img, mask)
+            counts, boxes = active_counter.predict(img, mask, boundary_only=True)
             f = calib_factor(rec["species"]) if _USE_CALIB else 1.0
             A_lo, A, A_hi = (round(counts[k] * f) for k in ("lo", "mid", "hi"))
             rec["ai_raw"], rec["ai_factor"] = counts["mid"], f
-            crown = crown_diameter_m(boxes, c.y, z, getattr(active_counter, "upscale", 1.5))
+            rec["ai_interior_trees"] = counts.get("interior_mid", 0)
+            crown = crown_diameter_m(boxes[boxes["on_boundary"]] if not boxes.empty and "on_boundary" in boxes else boxes,
+                                     c.y, z, getattr(active_counter, "upscale", 1.5))
         except Exception as e:
             ai_err = str(e)
             log.warning("AI step failed for %s: %s", rec["farm_id"], e)
