@@ -27,7 +27,7 @@ import requests
 import streamlit as st
 from PIL import Image
 
-st.set_page_config(page_title="Farm QA Auditor", layout="wide", page_icon="🛰️")
+st.set_page_config(page_title="EBDA & Kobo", layout="wide", page_icon="🛰️")
 
 try:
     if "KOBO_TOKEN" in st.secrets:
@@ -42,7 +42,14 @@ if not qa.KOBO_TOKEN:
     st.stop()
 
 
-# ═══════════════════════ LOGIN ═══════════════════════
+def stretch(fn, *args, **kwargs):
+    try:
+        return fn(*args, width="stretch", **kwargs)
+    except TypeError:
+        return fn(*args, use_container_width=True, **kwargs)
+
+
+# ═══════════════════════ LOGIN (CENTERED & WITHOUT LOCK) ═══════════════════════
 def load_users() -> dict:
     try:
         if "users" in st.secrets:
@@ -54,23 +61,28 @@ def load_users() -> dict:
 
 if not st.session_state.get("user"):
     users = load_users()
-    st.title("🔐 Farm QA — Login")
-    if not users:
-        st.error("مفيش مستخدمين متسجلين. افتح Manage app ← Settings ← Secrets وضيف السطرين دول (الباسورد بين علامتي تنصيص):")
-        st.code('[users]\nmohamed = "000000"', language="toml")
-        st.stop()
-    with st.form("login"):
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        ok = st.form_submit_button("Login")
-    if ok:
-        pw = users.get(u.strip())
-        if pw is not None and hmac.compare_digest(pw.encode(), p.encode()):
-            st.session_state["user"] = u.strip()
-            st.rerun()
-        else:
-            time.sleep(1)
-            st.error("Username أو Password غلط")
+    st.write("")
+    st.write("")
+    _, center_col, _ = st.columns([1, 1.2, 1])
+    with center_col:
+        st.markdown("<h2 style='text-align: center;'>EBDA & Kobo — Login</h2>", unsafe_allow_html=True)
+        if not users:
+            st.error("مفيش مستخدمين متسجلين. افتح Manage app ← Settings ← Secrets وضيف السطرين دول (الباسورد بين علامتي تنصيص):")
+            st.code('[users]\nmohamed = "000000"', language="toml")
+            st.stop()
+        with st.container(border=True):
+            with st.form("login"):
+                u = st.text_input("Username")
+                p = st.text_input("Password", type="password")
+                ok = stretch(st.form_submit_button, "Login", type="primary")
+            if ok:
+                pw = users.get(u.strip())
+                if pw is not None and hmac.compare_digest(pw.encode(), p.encode()):
+                    st.session_state["user"] = u.strip()
+                    st.rerun()
+                else:
+                    time.sleep(1)
+                    st.error("Username أو Password غلط")
     st.stop()
 
 USER = st.session_state["user"]
@@ -83,17 +95,10 @@ MASTER_COLS = ["farm_id", "submission_id", "Form_Status", "Rejected_Items_Count"
                "Consolidated_Comments", "General_Auditor_Note", "Auditor_Name", "Reviewed_At"]
 FIELD_COLS = ["farm_id", "Field_Key", "Question_Title", "Submitted_Answer",
               "Item_Decision", "Suggested_Correction_or_Comment", "Attach_to_Summary"]
-AI_KEYS = ["ai_count", "ai_low", "ai_high", "veg_pct", "crown_m", "img_age", "ndvi_recent",
-           "ai_error", "imagery_date", "zoom_used", "ai_raw", "ai_factor", "verdict", "confidence"]
+AI_KEYS = ["ai_count", "ai_low", "ai_high", "ai_interior_trees", "veg_pct", "crown_m", "img_age", "ndvi_recent",
+           "ai_error", "imagery_date", "zoom_used", "ai_raw", "ai_factor", "verdict", "confidence", "perimeter_m", "boundary_spacing_m"]
 STATUS_PENDING = "⏳ Pending Review"
 META_PREFIXES = ("_", "meta/", "formhub/", "__version__", "deviceid", "simserial", "phonenumber", "subscriberid")
-
-
-def stretch(fn, *args, **kwargs):
-    try:
-        return fn(*args, width="stretch", **kwargs)
-    except TypeError:
-        return fn(*args, use_container_width=True, **kwargs)
 
 
 def fmt(v):
@@ -327,7 +332,7 @@ def build_reviews_xlsx(res: pd.DataFrame, only_reviewed: bool) -> bytes:
 
 
 # ═══════════════════════ SIDEBAR & LOADING ═══════════════════════
-st.title("🛰️ Farm QA & Form Auditor")
+st.title("EBDA & Kobo")
 
 if "flash" in st.session_state:
     st.success(st.session_state.pop("flash"))
@@ -448,7 +453,6 @@ if "results" in st.session_state:
         att_lookup = build_attachment_lookup(raw_rows[audit_rec["_df_index"]])
         sub_id = str(audit_rec.get("_submission_id", ""))
 
-        # Auto-run Satellite & Tree AI when a farm with valid GPS is selected
         ai_img = st.session_state.get("ai_imgs", {}).get(selected_farm)
         ac = audit_rec.get("ai_count")
         ai_ran = (selected_farm in st.session_state.get("ai_imgs", {})) or bool(audit_rec.get("ai_error")) or not (ac is None or ac != ac)
@@ -474,10 +478,10 @@ if "results" in st.session_state:
 
             with top_left:
                 st.info(
-                    f"**🤖 Verdict ({fmt(audit_rec.get('confidence', ''))}):** {audit_rec['verdict']}\n\n"
-                    f"- **Area:** entered `{fmt(audit_rec.get('area_entered'))}` | GPS `{fmt(audit_rec.get('area_gps'))}` Feddan ({fmt(audit_rec.get('area_check'))})\n"
-                    f"- **Trees:** engineer `{fmt(audit_rec.get('engineer_count'))}` ({fmt(audit_rec.get('tree_details'))}) | AI `{fmt(audit_rec.get('ai_count'))}` | forecast `{fmt(audit_rec.get('forecast'))}`\n"
-                    f"- **NDVI:** `{fmt(audit_rec.get('ndvi_recent'))}` | **Vegetation:** `{fmt(audit_rec.get('veg_pct'))}%`"
+                    f"**🤖 Boundary Verdict ({fmt(audit_rec.get('confidence', ''))}):** {audit_rec['verdict']}\n\n"
+                    f"- **Farm Perimeter (محيط المزرعة):** `{fmt(audit_rec.get('perimeter_m'))} m` | **Area:** entered `{fmt(audit_rec.get('area_entered'))}` vs GPS `{fmt(audit_rec.get('area_gps'))}` Feddan ({fmt(audit_rec.get('area_check'))})\n"
+                    f"- **Boundary Trees (أشجار الحدود):** engineer `{fmt(audit_rec.get('engineer_count'))}` ({fmt(audit_rec.get('tree_details'))}) | **Boundary AI:** `{fmt(audit_rec.get('ai_count'))}` | **Perimeter Forecast:** `{fmt(audit_rec.get('forecast'))}` trees (at `{fmt(audit_rec.get('boundary_spacing_m'))}m` spacing)\n"
+                    f"- **NDVI:** `{fmt(audit_rec.get('ndvi_recent'))}` | **Boundary Vegetation Cover:** `{fmt(audit_rec.get('veg_pct'))}%`"
                 )
                 if audit_rec.get("gps_warnings"):
                     st.warning(f"**Geometry:** {audit_rec['gps_warnings']}")
@@ -501,7 +505,7 @@ if "results" in st.session_state:
                         stretch(
                             st.image,
                             Image.open(io.BytesIO(ai_img)),
-                            caption=f"🛰️ Farm {selected_farm} | Boundary (Yellow) & Detected Trees (Red Boxes: {fmt(audit_rec.get('ai_count'))})"
+                            caption=f"🛰️ Farm {selected_farm} | Boundary (Yellow) & Detected Boundary Trees (Red Boxes: {fmt(audit_rec.get('ai_count'))})"
                         )
                     except Exception:
                         st.caption("Could not display satellite image.")
@@ -518,13 +522,13 @@ if "results" in st.session_state:
             area_bad = str(audit_rec.get("area_check", "")).startswith("❌")
             verdict_bad = "❌" in str(audit_rec.get("verdict", ""))
             qa_items = [
-                {"Field_Key": "_AI_AREA_CHECK", "Question_Title": "🛰️ [Check] Farm Area (Entered vs GPS)",
-                 "Submitted_Answer": f"Entered: {fmt(audit_rec.get('area_entered'))} | GPS: {fmt(audit_rec.get('area_gps'))} ({fmt(audit_rec.get('area_check'))})",
+                {"Field_Key": "_AI_AREA_CHECK", "Question_Title": "🛰️ [Check] Farm Area & Perimeter (Entered vs GPS)",
+                 "Submitted_Answer": f"Perimeter: {fmt(audit_rec.get('perimeter_m'))}m | Entered: {fmt(audit_rec.get('area_entered'))} | GPS: {fmt(audit_rec.get('area_gps'))} ({fmt(audit_rec.get('area_check'))})",
                  "Photo_Preview": "", "Item_Decision": "❌ Reject" if area_bad else "✅ OK",
-                 "Suggested_Correction_or_Comment": f"Area mismatch: GPS shows {audit_rec.get('area_gps')} Feddan" if area_bad else "",
+                 "Suggested_Correction_or_Comment": f"Area mismatch: GPS shows {audit_rec.get('area_gps')} Feddan (Perimeter: {audit_rec.get('perimeter_m')}m)" if area_bad else "",
                  "Attach_to_Summary": bool(area_bad)},
-                {"Field_Key": "_AI_TREE_CHECK", "Question_Title": "🛰️ [Check] Tree Count (Engineer vs AI vs Forecast)",
-                 "Submitted_Answer": f"Eng: {fmt(audit_rec.get('engineer_count'))} | AI: {fmt(audit_rec.get('ai_count'))} | Forecast: {fmt(audit_rec.get('forecast'))}",
+                {"Field_Key": "_AI_TREE_CHECK", "Question_Title": "🛰️ [Check] Boundary Tree Count (Engineer vs AI vs Perimeter Forecast)",
+                 "Submitted_Answer": f"Eng: {fmt(audit_rec.get('engineer_count'))} | Boundary AI: {fmt(audit_rec.get('ai_count'))} | Perimeter Forecast: {fmt(audit_rec.get('forecast'))}",
                  "Photo_Preview": "", "Item_Decision": "❌ Reject" if verdict_bad else "✅ OK",
                  "Suggested_Correction_or_Comment": str(audit_rec.get("verdict", "")) if verdict_bad else "",
                  "Attach_to_Summary": bool(verdict_bad)},
@@ -582,7 +586,7 @@ if "results" in st.session_state:
                         form_qa_df.at[i, "Suggested_Correction_or_Comment"] = "" if pd.isna(cm) else str(cm)
                         form_qa_df.at[i, "Attach_to_Summary"] = to_bool(s.get("Attach_to_Summary", False))
 
-            # ── INTERACTIVE PHOTO & VIDEO AUDIT CARDS (DIRECT REJECT/APPROVE BELOW EACH MEDIA) ──
+            # ── INTERACTIVE PHOTO & VIDEO AUDIT CARDS ──
             media_overrides = {}
             if media_questions:
                 with st.expander(f"📸🎥 Photos & Videos Audit Cards ({len(media_questions)}) — تقدر ترفض أو تقبل وتكتب سبب الرفض تحت كل صورة أو فيديو", expanded=True):
