@@ -44,7 +44,8 @@ if not st.session_state.get("user"):
     users = load_users()
     st.title("🔐 Farm QA — Login")
     if not users:
-        st.error("مفيش مستخدمين متسجلين. ضيف في Secrets:\n\n[users]\nاسمك = \"الباسورد\"")
+        st.error("مفيش مستخدمين متسجلين. افتح Manage app ← Settings ← Secrets وضيف السطرين دول (الباسورد بين علامتي تنصيص):")
+        st.code('[users]\nmohamed = "000000"', language="toml")
         st.stop()
     with st.form("login"):
         u = st.text_input("Username")
