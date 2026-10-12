@@ -1,8 +1,8 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-streamlit>=1.50
-numpy<2
-pandas<3
-pyarrow<25
+streamlit>=1.35.0
+numpy<2.0.0
+pandas<3.0.0
+pyarrow<25.0.0
 requests
 Pillow
 openpyxl
@@ -10,12 +10,12 @@ shapely
 geopandas
 torch
 torchvision
-transformers>=4.40,<5
-huggingface_hub<1.0
-tokenizers>=0.20
-deepforest==1.5.2
-albumentations<2
-opencv-python-headless<4.12
+opencv-python-headless<4.11.0
+albumentations==1.4.3
+safetensors<0.6.0
+transformers>=4.40.0,<5.0.0
+tokenizers>=0.20.0
+deepforest==2.1.0
 planetary-computer
 pystac-client
 odc-stac
