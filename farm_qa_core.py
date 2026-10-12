@@ -45,8 +45,9 @@ FEDDAN_M2 = 4200.83
 FALLBACK_DENSITY = 120
 
 ABS_TOL = 5
-AI_BAND = (0.50, 0.30, 0.15)
-VEG_EXG = 0.08
+# Lowered thresholds slightly so desert/dusty trees (Casuarina/Olive/Palm) are detected accurately
+AI_BAND = (0.40, 0.22, 0.12)
+VEG_EXG = 0.04
 VEG_REVIEW = 25.0
 IMAGERY_MAX_AGE_YEARS = 2.0
 YOUNG_CROWN_M = 2.0
@@ -317,7 +318,11 @@ def gps_quality(raw, pts) -> list:
         warns.append(f"⚠️ Poor GPS accuracy during capture (Avg {acc:.0f}m)")
     return warns
 
-ESRI_TILE = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+# Multi-provider satellite tile sources: Google Satellite first (best coverage in Egypt), then ESRI
+TILE_PROVIDERS = [
+    ("Google Earth", "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"),
+    ("ESRI World Imagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+]
 
 def _px(lon, lat, z):
     n = 256 * (2 ** z)
@@ -326,59 +331,106 @@ def _px(lon, lat, z):
         (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n
     )
 
+def _is_valid_satellite_image(img) -> bool:
+    """Detects grey 'Map data not yet available' placeholder tiles by checking color saturation & variance."""
+    arr = np.asarray(img, dtype="float32")
+    if arr.size == 0:
+        return False
+    # Placeholder tiles are almost purely grayscale (R == G == B) and have low standard deviation
+    rg_diff = np.abs(arr[:, :, 0] - arr[:, :, 1]).mean()
+    gb_diff = np.abs(arr[:, :, 1] - arr[:, :, 2]).mean()
+    color_spread = rg_diff + gb_diff
+    std_val = arr.std()
+    # If the image is nearly monochrome grey (color_spread < 3.0) and flat (std_val < 22), it's a "no data" tile
+    if color_spread < 3.0 and std_val < 25.0:
+        return False
+    return True
+
 def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
-    """Fetches satellite imagery with a 15% contextual margin so the farm boundary is clearly visible."""
+    """Fetches real satellite imagery from Google Earth / ESRI with automatic zoom fallback to avoid grey tiles."""
     import requests
     from PIL import Image, ImageDraw
     minx, miny, maxx, maxy = poly.bounds
-    dx = max((maxx - minx) * 0.15, 0.00015)
-    dy = max((maxy - miny) * 0.15, 0.00015)
+    dx = max((maxx - minx) * 0.18, 0.00020)
+    dy = max((maxy - miny) * 0.18, 0.00020)
     b_minx, b_miny, b_maxx, b_maxy = minx - dx, miny - dy, maxx + dx, maxy + dy
 
-    for z in range(zoom, 14, -1):
+    sess = requests.Session()
+    sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+    last_img, last_mask, last_z = None, None, 17
+
+    # Try zoom levels from 19 down to 16 across providers until we get a real non-grey satellite image
+    for z in range(min(zoom, 19), 15, -1):
         x0, y1 = _px(b_minx, b_miny, z)
         x1, y0 = _px(b_maxx, b_maxy, z)
         tx0, tx1, ty0, ty1 = int(x0 // 256), int(x1 // 256), int(y0 // 256), int(y1 // 256)
-        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= max_tiles:
-            break
-    else:
-        raise ValueError("Farm area exceeds maximum allowed satellite tiles")
+        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) > max_tiles:
+            continue
 
-    sess = requests.Session()
-    sess.headers["User-Agent"] = "FarmQASystem/2.0"
+        coords = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
 
-    def get(xy):
-        tx, ty = xy
-        for _ in range(3):
-            r = sess.get(ESRI_TILE.format(z=z, x=tx, y=ty), timeout=30)
-            if r.ok:
-                return xy, Image.open(io.BytesIO(r.content)).convert("RGB")
-        raise RuntimeError(f"Failed to fetch tile {z}/{ty}/{tx}")
+        for prov_name, url_tpl in TILE_PROVIDERS:
+            def get_tile(xy):
+                tx, ty = xy
+                for _ in range(2):
+                    try:
+                        r = sess.get(url_tpl.format(z=z, x=tx, y=ty), timeout=20)
+                        if r.ok and len(r.content) > 800:
+                            return xy, Image.open(io.BytesIO(r.content)).convert("RGB")
+                    except Exception:
+                        pass
+                return xy, None
 
-    coords = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
-    mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
-    with ThreadPoolExecutor(8) as ex:
-        for (tx, ty), tile in ex.map(get, coords):
-            mosaic.paste(tile, ((tx - tx0) * 256, (ty - ty0) * 256))
+            mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
+            ok_all = True
+            with ThreadPoolExecutor(8) as ex:
+                for (tx, ty), tile in ex.map(get_tile, coords):
+                    if tile is None:
+                        ok_all = False
+                        break
+                    mosaic.paste(tile, ((tx - tx0) * 256, (ty - ty0) * 256))
 
-    ox, oy = tx0 * 256, ty0 * 256
-    box = (int(x0 - ox), int(y0 - oy), math.ceil(x1 - ox), math.ceil(y1 - oy))
-    img = mosaic.crop(box)
-    ring = [(_px(lo, la, z)[0] - ox - box[0], _px(lo, la, z)[1] - oy - box[1]) for lo, la in poly.exterior.coords]
-    mask = Image.new("L", img.size, 0)
-    ImageDraw.Draw(mask).polygon(ring, fill=255)
-    img.info["ring"] = ring
-    return img, mask, z
+            if not ok_all:
+                continue
+
+            ox, oy = tx0 * 256, ty0 * 256
+            box = (int(x0 - ox), int(y0 - oy), math.ceil(x1 - ox), math.ceil(y1 - oy))
+            img = mosaic.crop(box)
+            ring = [(_px(lo, la, z)[0] - ox - box[0], _px(lo, la, z)[1] - oy - box[1]) for lo, la in poly.exterior.coords]
+            mask = Image.new("L", img.size, 0)
+            ImageDraw.Draw(mask).polygon(ring, fill=255)
+            img.info["ring"] = ring
+            img.info["provider"] = prov_name
+            last_img, last_mask, last_z = img, mask, z
+
+            if _is_valid_satellite_image(img):
+                return img, mask, z
+
+    if last_img is not None:
+        return last_img, last_mask, last_z
+    raise RuntimeError("Could not fetch satellite imagery from Google Earth or ESRI")
 
 def render_annotated_satellite(img, mask, boxes=None, upscale: float = 1.0, ring=None):
     """Draws dimmed outside area, bright yellow/cyan farm boundary polygon, and tree detection boxes."""
     from PIL import Image, ImageDraw
-    base = img.convert("RGBA")
+    # Ensure minimum visual display size so small farms (e.g. 0.22 feddan) look crisp and clear
+    orig_w, orig_h = img.size
+    vis_scale = 1.0
+    if min(orig_w, orig_h) < 450:
+        vis_scale = 450.0 / max(1, min(orig_w, orig_h))
+        new_sz = (int(orig_w * vis_scale), int(orig_h * vis_scale))
+        base_rgb = img.resize(new_sz, Image.LANCZOS)
+        mask_resized = mask.resize(new_sz, Image.NEAREST)
+    else:
+        base_rgb = img
+        mask_resized = mask
+
+    base = base_rgb.convert("RGBA")
     w, h = base.size
 
-    # 1. Slightly dim the area outside the farm boundary so the farm stands out
     arr = np.array(base)
-    m = np.array(mask) > 0
+    m = np.array(mask_resized) > 0
     if m.shape == arr.shape[:2]:
         arr[~m, :3] = (arr[~m, :3] * 0.55).astype(np.uint8)
     annotated = Image.fromarray(arr).convert("RGBA")
@@ -386,45 +438,42 @@ def render_annotated_satellite(img, mask, boxes=None, upscale: float = 1.0, ring
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    # 2. Draw Farm Boundary Polygon (Thick Yellow + Cyan dual-outline for maximum contrast)
     poly_ring = ring or img.info.get("ring")
     if poly_ring and len(poly_ring) >= 3:
-        pts = [(float(x), float(y)) for x, y in poly_ring]
+        pts = [(float(x) * vis_scale, float(y) * vis_scale) for x, y in poly_ring]
         if pts[0] != pts[-1]:
             pts.append(pts[0])
         line_w = max(3, int(min(w, h) / 140))
         draw.line(pts, fill=(0, 255, 255, 255), width=line_w + 2, joint="curve")
         draw.line(pts, fill=(255, 230, 0, 255), width=line_w, joint="curve")
-        # Draw corner vertices
         r_pt = max(3, line_w)
         for px, py in pts:
             draw.ellipse([px - r_pt, py - r_pt, px + r_pt, py + r_pt], fill=(255, 255, 255, 255), outline=(0, 0, 0, 255))
 
-    # 3. Draw Tree Detection Boxes
     tree_count_drawn = 0
     if boxes is not None and not boxes.empty:
+        factor = vis_scale / upscale
         for b in boxes.itertuples():
-            x1, y1, x2, y2 = float(b.xmin) / upscale, float(b.ymin) / upscale, float(b.xmax) / upscale, float(b.ymax) / upscale
+            x1, y1, x2, y2 = float(b.xmin) * factor, float(b.ymin) * factor, float(b.xmax) * factor, float(b.ymax) * factor
             score = getattr(b, "score", 0.5)
-            # High confidence (>=0.30): Bright Red box with lime center dot; Low confidence: Orange
             if score >= AI_BAND[1]:
                 tree_count_drawn += 1
-                draw.rectangle([x1, y1, x2, y2], outline=(255, 40, 40, 240), width=2)
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 35, 35, 245), width=2)
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=(0, 255, 0, 255))
+                draw.ellipse([cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5], fill=(0, 255, 0, 255))
             else:
-                draw.rectangle([x1, y1, x2, y2], outline=(255, 165, 0, 160), width=1)
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 165, 0, 180), width=1)
 
-    # 4. Draw Top Legend Banner
+    prov = img.info.get("provider", "Satellite")
     banner_h = 28
-    draw.rectangle([0, 0, w, banner_h], fill=(15, 20, 30, 210))
-    legend_txt = f"Farm Boundary (Yellow)  |  Detected Trees (Red Boxes): {tree_count_drawn}"
+    draw.rectangle([0, 0, w, banner_h], fill=(15, 20, 30, 215))
+    legend_txt = f"{prov} | Boundary (Yellow) | Detected Trees (Red): {tree_count_drawn}"
     draw.text((10, 7), legend_txt, fill=(255, 255, 255, 255))
 
     return Image.alpha_composite(annotated, overlay).convert("RGB")
 
 class TreeCounter:
-    def __init__(self, patch_size: int = 400, upscale: float = 1.0):
+    def __init__(self, patch_size: int = 400, upscale: float = 1.5):
         self.patch_size, self.upscale = patch_size, upscale
         self._model = None
 
@@ -439,33 +488,41 @@ class TreeCounter:
         self._model = m
 
     def predict(self, img, mask):
-        from PIL import Image
+        from PIL import Image, ImageEnhance
         if self._model is None:
             self._load()
 
+        # Upscale & slightly sharpen satellite image so small/desert tree crowns are detected
         if self.upscale != 1.0:
             size = (int(img.width * self.upscale), int(img.height * self.upscale))
-            img, mask = img.resize(size, Image.BICUBIC), mask.resize(size, Image.NEAREST)
+            img_work = img.resize(size, Image.LANCZOS)
+            mask_work = mask.resize(size, Image.NEAREST)
+        else:
+            img_work, mask_work = img, mask
 
-        arr = np.array(img)
-        m = np.array(mask) > 0
-        arr_masked = arr.copy()
-        arr_masked[~m] = 0
-        arr_masked = arr_masked.astype("float32")
+        img_work = ImageEnhance.Contrast(img_work).enhance(1.15)
+        arr = np.array(img_work)
+        m = np.array(mask_work) > 0
+
+        # Usefull full unmasked context for detection so boundary trees (like Casuarina windbreaks) aren't cut off!
+        arr_input = arr.astype("float32")
 
         try:
-            boxes = self._model.predict_tile(image=arr_masked, patch_size=self.patch_size,
-                                             patch_overlap=0.25, iou_threshold=0.15)
+            boxes = self._model.predict_tile(image=arr_input, patch_size=self.patch_size,
+                                             patch_overlap=0.35, iou_threshold=0.15)
         except Exception:
-            boxes = self._model.predict_image(image=arr_masked)
+            boxes = self._model.predict_image(image=arr_input)
 
         if boxes is None or len(boxes) == 0:
             return {"lo": 0, "mid": 0, "hi": 0}, pd.DataFrame()
 
         boxes = boxes[boxes["score"] >= min(AI_BAND)].copy()
-        cx = ((boxes.xmin + boxes.xmax) / 2).astype(int).clip(0, m.shape[1] - 1)
-        cy = ((boxes.ymin + boxes.ymax) / 2).astype(int).clip(0, m.shape[0] - 1)
-        boxes = boxes[m[cy.values, cx.values]]
+        # Dilate mask slightly by 6 pixels so border windbreak trees (أشجار الجازورين على الحدود) are included
+        from PIL import ImageFilter
+        mask_dilated = np.array(mask_work.filter(ImageFilter.MaxFilter(11))) > 0
+        cx = ((boxes.xmin + boxes.xmax) / 2).astype(int).clip(0, mask_dilated.shape[1] - 1)
+        cy = ((boxes.ymin + boxes.ymax) / 2).astype(int).clip(0, mask_dilated.shape[0] - 1)
+        boxes = boxes[mask_dilated[cy.values, cx.values]]
 
         valid_boxes = []
         for _, box in boxes.iterrows():
@@ -473,10 +530,12 @@ class TreeCounter:
             box_pixels = arr[y1:y2, x1:x2].astype("float32")
             if box_pixels.size == 0:
                 continue
+            # Filter out bright desert sand or white roofs, keep green/dark tree canopies
+            brightness = box_pixels.mean()
             s = box_pixels.sum(axis=2) + 1e-6
             exg = (2 * box_pixels[:, :, 1] - box_pixels[:, :, 0] - box_pixels[:, :, 2]) / s
             green_ratio = (exg > VEG_EXG).mean()
-            if green_ratio > 0.15:
+            if green_ratio > 0.06 or (brightness < 140 and box.score >= 0.28):
                 valid_boxes.append(box)
 
         if not valid_boxes:
@@ -760,6 +819,7 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
     if use_ai and poly is not None:
         img = mask = None
         boxes = pd.DataFrame()
+        active_counter = counter or TreeCounter()
         try:
             img, mask, z = fetch_farm_image(poly)
             rec["zoom_used"] = z
@@ -772,11 +832,11 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
                 if pd.isna(ref): ref = pd.Timestamp.now(tz="UTC")
                 img_age = (ref - idate).days / 365.25
 
-            counts, boxes = (counter or TreeCounter()).predict(img, mask)
+            counts, boxes = active_counter.predict(img, mask)
             f = calib_factor(rec["species"]) if _USE_CALIB else 1.0
             A_lo, A, A_hi = (round(counts[k] * f) for k in ("lo", "mid", "hi"))
             rec["ai_raw"], rec["ai_factor"] = counts["mid"], f
-            crown = crown_diameter_m(boxes, c.y, z, getattr(counter, "upscale", 1.0))
+            crown = crown_diameter_m(boxes, c.y, z, getattr(active_counter, "upscale", 1.5))
         except Exception as e:
             ai_err = str(e)
             log.warning("AI step failed for %s: %s", rec["farm_id"], e)
@@ -784,9 +844,9 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
             if debug_dir and img is not None and mask is not None:
                 try:
                     os.makedirs(debug_dir, exist_ok=True)
-                    s = getattr(counter, "upscale", 1.0) if counter else 1.0
+                    s = getattr(active_counter, "upscale", 1.5)
                     vis_img = render_annotated_satellite(img, mask, boxes=boxes, upscale=s, ring=img.info.get("ring"))
-                    vis_img.save(os.path.join(debug_dir, f"{str(rec['farm_id']).replace('/', '_')}.jpg"), quality=90)
+                    vis_img.save(os.path.join(debug_dir, f"{str(rec['farm_id']).replace('/', '_')}.jpg"), quality=92)
                 except Exception as save_err:
                     log.warning("Failed saving annotated satellite image: %s", save_err)
 
