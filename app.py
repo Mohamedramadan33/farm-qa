@@ -44,11 +44,13 @@ if not qa.KOBO_TOKEN:
     st.error("❌ KOBO_TOKEN غير موجود. ضيفه في App settings → Secrets.")
     st.stop()
 
+
 def stretch(fn, *args, **kwargs):
     try:
         return fn(*args, width="stretch", **kwargs)
     except TypeError:
         return fn(*args, use_container_width=True, **kwargs)
+
 
 # ═══════════════════════ LOGIN (CENTERED & WITHOUT LOCK) ═══════════════════════
 def load_users() -> dict:
@@ -58,6 +60,7 @@ def load_users() -> dict:
     except Exception:
         pass
     return {}
+
 
 if not st.session_state.get("user"):
     users = load_users()
@@ -100,14 +103,18 @@ AI_KEYS = ["ai_count", "ai_low", "ai_high", "ai_interior_trees", "veg_pct", "cro
 STATUS_PENDING = "⏳ Pending Review"
 META_PREFIXES = ("_", "meta/", "formhub/", "__version__", "deviceid", "simserial", "phonenumber", "subscriberid")
 
+
 def fmt(v):
     return "—" if v is None or (isinstance(v, float) and v != v) else v
+
 
 def to_bool(x) -> bool:
     return x if isinstance(x, bool) else str(x).strip().lower() in ("true", "1", "yes")
 
+
 def short_hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+
 
 # ═══════════════════════ SHARED RESOURCES ═══════════════════════
 @st.cache_resource(show_spinner="Loading DeepForest AI Model...")
@@ -116,22 +123,27 @@ def get_tree_counter():
     c._load()
     return c
 
+
 @st.cache_resource
 def get_ai_semaphore():
     return threading.Semaphore(1)
 
+
 @st.cache_resource
 def get_lock():
     return threading.Lock()
+
 
 @st.cache_resource(ttl=600, show_spinner="Fetching submissions from KoboToolbox...")
 def get_kobo_raw_and_df():
     raw_rows = qa.fetch_kobo()
     return raw_rows, qa.build_dataframe(raw_rows)
 
+
 @st.cache_resource(ttl=600, show_spinner=False)
 def get_cols_map():
     return qa.map_all(get_kobo_raw_and_df()[1])
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_kobo_labels() -> dict:
@@ -149,6 +161,7 @@ def get_kobo_labels() -> dict:
         pass
     return labels
 
+
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=100)
 def fetch_kobo_media_bytes(url: str) -> bytes | None:
     try:
@@ -156,6 +169,7 @@ def fetch_kobo_media_bytes(url: str) -> bytes | None:
         return r.content if r.ok else None
     except Exception:
         return None
+
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=200)
 def run_ai_for_farm(sub_id: str, use_ndvi: bool):
@@ -181,6 +195,7 @@ def run_ai_for_farm(sub_id: str, use_ndvi: bool):
     rec.pop("_poly", None)
     return rec, img
 
+
 def update_kobo_validation_status(submission_id: str, status_code: str) -> bool:
     try:
         r = requests.patch(
@@ -191,6 +206,7 @@ def update_kobo_validation_status(submission_id: str, status_code: str) -> bool:
         return r.ok
     except Exception:
         return False
+
 
 # ═══════════════════════ HELPERS ═══════════════════════
 def build_attachment_lookup(raw_row: dict) -> dict:
@@ -212,11 +228,14 @@ def build_attachment_lookup(raw_row: dict) -> dict:
             lookup[full] = info
     return lookup
 
+
 def is_image_filename(val) -> bool:
     return isinstance(val, str) and val.strip().lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
 
+
 def is_video_filename(val) -> bool:
     return isinstance(val, str) and val.strip().lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".m4v"))
+
 
 def resolve_label(col_path: str, label_map: dict) -> str:
     leaf = re.sub(r"\[\d+\]", "", str(col_path)).split("/")[-1].lower()
@@ -224,9 +243,11 @@ def resolve_label(col_path: str, label_map: dict) -> str:
     prefix = f"{idx[0]} " if idx else ""
     return f"{prefix}{label_map[leaf]} ({leaf})" if leaf in label_map else str(col_path)
 
+
 def blank_record(farm_id, err) -> dict:
     return {"farm_id": farm_id, "engineer": "—", "verdict": f"❌ Processing Error: {err}",
             "confidence": "🔴 Low", "flags": [], "_poly": None}
+
 
 def apply_ai(idx, rec: dict):
     df = st.session_state["results"]
@@ -235,6 +256,7 @@ def apply_ai(idx, rec: dict):
             if k not in df.columns:
                 df[k] = None
             df.at[idx, k] = rec[k]
+
 
 # ═══════════════════════ STORAGE & DATABASE ═══════════════════════
 
@@ -246,10 +268,12 @@ def _csv_read(path: str, headers: list) -> pd.DataFrame:
             pass
     return pd.DataFrame(columns=headers)
 
+
 def _csv_write(path: str, df: pd.DataFrame):
     tmp = path + ".tmp"
     df.to_csv(tmp, index=False, encoding="utf-8-sig")
     os.replace(tmp, path)
+
 
 def append_to_airtable(rec: dict):
     """
@@ -264,7 +288,7 @@ def append_to_airtable(rec: dict):
             "farm_id": str(rec.get("farm_id", "")),
             "submission_id": str(rec.get("submission_id", "")),
             "Form_Status": str(rec.get("Form_Status", "")),
-            "Rejected_Items_Count": str(rec.get("Rejected_Items_Count", 0)), 
+            "Rejected_Items_Count": str(rec.get("Rejected_Items_Count", "0")), # إرسال كـ String
             "Consolidated_Comments": str(rec.get("Consolidated_Comments", "")),
             "General_Auditor_Note": str(rec.get("General_Auditor_Note", "")),
             "Auditor_Name": str(rec.get("Auditor_Name", "")),
@@ -276,6 +300,7 @@ def append_to_airtable(rec: dict):
     except Exception as e:
         # التقاط الخطأ وإرجاعه للواجهة لكي نعرف السبب الحقيقي
         return False, str(e)
+
 
 def save_master_decision(rec: dict):
     fid = str(rec["farm_id"])
@@ -289,6 +314,7 @@ def save_master_decision(rec: dict):
     
     # 2. إرسال القرار لـ Airtable وإرجاع حالة الإرسال للواجهة
     return append_to_airtable(rec)
+
 
 def save_field_decisions(farm_id: str, field_df: pd.DataFrame):
     fid = str(farm_id)
@@ -306,12 +332,14 @@ def save_field_decisions(farm_id: str, field_df: pd.DataFrame):
             old = old[old["farm_id"].astype(str) != fid]
         _csv_write(FIELD_LOG_FILE, pd.concat([old, f], ignore_index=True))
 
+
 def get_field_decisions(farm_id: str) -> pd.DataFrame:
     key = f"fd_{farm_id}"
     if key not in st.session_state:
         df = _csv_read(FIELD_LOG_FILE, FIELD_COLS)
         st.session_state[key] = df[df["farm_id"].astype(str) == str(farm_id)]
     return st.session_state[key]
+
 
 # ═══════════════════════ EXCEL EXPORT ═══════════════════════
 def build_reviews_xlsx(res: pd.DataFrame, only_reviewed: bool) -> bytes:
@@ -337,6 +365,7 @@ def build_reviews_xlsx(res: pd.DataFrame, only_reviewed: bool) -> bytes:
             for c in row:
                 c.alignment = Alignment(wrap_text=True, vertical="top")
     return buf.getvalue()
+
 
 # ═══════════════════════ SIDEBAR & LOADING ═══════════════════════
 st.title("EBDA & Kobo")
@@ -389,233 +418,4 @@ if run_btn:
                         rec = blank_record(qa.first_value(row, cols["farm_id"]) or f"row{i}", e)
                     rec["_df_index"] = idx
                     rec["_submission_id"] = row.get("_id", "")
-                    recs.append(rec)
-                    if i % 20 == 0 or i == total:
-                        prog.progress(i / total, text=f"Loaded {i}/{total}")
-                prog.empty()
-
-                qa.cross_checks(recs)
-                for r in recs:
-                    r["flags"] = "; ".join(r.get("flags", []))
-
-                res_df = pd.DataFrame(recs)
-                res_df["farm_id"] = res_df["farm_id"].astype(str)
-
-                keep = MASTER_COLS[:1] + MASTER_COLS[2:]
-                ml = _csv_read(MASTER_LOG_FILE, MASTER_COLS)
-                if not ml.empty:
-                    ml = ml[keep].drop_duplicates("farm_id", keep="last")
-                    ml["farm_id"] = ml["farm_id"].astype(str)
-                    res_df = res_df.merge(ml, on="farm_id", how="left")
-                else:
-                    for c in keep[1:]:
-                        res_df[c] = ""
-
-                res_df["Form_Status"] = res_df["Form_Status"].fillna(STATUS_PENDING).replace("", STATUS_PENDING)
-                res_df["Rejected_Items_Count"] = pd.to_numeric(res_df["Rejected_Items_Count"], errors="coerce").fillna(0).astype(int)
-                for c in ("Consolidated_Comments", "General_Auditor_Note", "Auditor_Name", "Reviewed_At"):
-                    res_df[c] = res_df[c].fillna("").astype(str)
-
-                for k in [k for k in st.session_state if k.startswith("fd_")]:
-                    del st.session_state[k]
-                st.session_state.update(results=res_df, raw_rows=raw_rows, flat_df=raw_df, ai_imgs={})
-                st.session_state.pop("xlsx", None)
-        except Exception as e:
-            st.error(f"Error loading data: {e}")
-            st.exception(e)
-
-# ═══════════════════════ MAIN ═══════════════════════
-if "results" in st.session_state:
-    res = st.session_state["results"]
-    raw_rows = st.session_state["raw_rows"]
-    flat_df = st.session_state["flat_df"]
-    label_map = get_kobo_labels()
-
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Loaded", len(res))
-    k2.metric("Pending ⏳", int((res["Form_Status"] == STATUS_PENDING).sum()))
-    k3.metric("Approved 👍", int((res["Form_Status"] == "✅ Approved Entire Form").sum()))
-    k4.metric("Conditional ⚠️", int((res["Form_Status"] == "⚠️ Conditional (Modifications Required)").sum()))
-    k5.metric("Rejected 🚫", int((res["Form_Status"] == "🚫 REJECTED ENTIRE FORM").sum()))
-
-    st.divider()
-
-    sel_info = {r.farm_id: f"Farm {r.farm_id}  |  {r.engineer}  |  {r.Form_Status}" for r in res.itertuples()}
-    col_sel, col_dl = st.columns([2, 1])
-    with col_sel:
-        selected_farm = st.selectbox("🎯 Select Farm:", list(sel_info.keys()), format_func=lambda x: sel_info.get(x, x))
-    with col_dl:
-        only_rev = st.checkbox("Excel: reviewed forms only", value=True)
-        if st.button("📊 Prepare Excel"):
-            st.session_state["xlsx"] = build_reviews_xlsx(res, only_rev)
-        if "xlsx" in st.session_state:
-            stretch(st.download_button, "📥 Download Excel", st.session_state["xlsx"],
-                    file_name=f"farm_reviews_{datetime.now():%Y%m%d_%H%M}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    if selected_farm:
-        audit_row_idx = res.index[res["farm_id"].astype(str) == selected_farm][0]
-        audit_rec = res.loc[audit_row_idx]
-        flat_submission = flat_df.loc[audit_rec["_df_index"]]
-        att_lookup = build_attachment_lookup(raw_rows[audit_rec["_df_index"]])
-        sub_id = str(audit_rec.get("_submission_id", ""))
-
-        ai_img = st.session_state.get("ai_imgs", {}).get(selected_farm)
-        ac = audit_rec.get("ai_count")
-        ai_ran = (selected_farm in st.session_state.get("ai_imgs", {})) or bool(audit_rec.get("ai_error")) or not (ac is None or ac != ac)
-        has_valid_gps = not str(audit_rec.get("area_check", "")).startswith("❌ Calculation Failed")
-
-        if auto_sat and not ai_ran and has_valid_gps and sub_id:
-            with st.spinner(f"🛰️ Fetching satellite imagery, drawing farm boundary & detecting trees for Farm {selected_farm}..."):
-                try:
-                    rec_ai, img_b = run_ai_for_farm(sub_id, use_ndvi)
-                    apply_ai(audit_row_idx, rec_ai)
-                    st.session_state.setdefault("ai_imgs", {})[selected_farm] = img_b or b""
-                    audit_rec = st.session_state["results"].loc[audit_row_idx]
-                    ai_img = img_b
-                    ai_ran = True
-                except Exception as e:
-                    st.session_state.setdefault("ai_imgs", {})[selected_farm] = b""
-                    st.warning(f"Satellite AI warning: {e}")
-
-        tab_form, tab_reviews = st.tabs(["📋 Form & Auditor", "✅ Reviewed Forms"])
-
-        with tab_form:
-            top_left, top_right = st.columns([1.3, 1])
-
-            with top_left:
-                st.info(
-                    f"**🤖 Boundary Verdict ({fmt(audit_rec.get('confidence', ''))}):** {audit_rec['verdict']}\n\n"
-                    f"- **Farm Perimeter (محيط المزرعة):** `{fmt(audit_rec.get('perimeter_m'))} m` | **Area:** entered `{fmt(audit_rec.get('area_entered'))}` vs GPS `{fmt(audit_rec.get('area_gps'))}` Feddan ({fmt(audit_rec.get('area_check'))})\n"
-                    f"- **Boundary Trees (أشجار الحدود):** engineer `{fmt(audit_rec.get('engineer_count'))}` ({fmt(audit_rec.get('tree_details'))}) | **Boundary AI:** `{fmt(audit_rec.get('ai_count'))}` | **Perimeter Forecast:** `{fmt(audit_rec.get('forecast'))}` trees (at `{fmt(audit_rec.get('boundary_spacing_m'))}m` spacing)\n"
-                    f"- **NDVI:** `{fmt(audit_rec.get('ndvi_recent'))}` | **Boundary Vegetation Cover:** `{fmt(audit_rec.get('veg_pct'))}%`"
-                )
-                if audit_rec.get("gps_warnings"):
-                    st.warning(f"**Geometry:** {audit_rec['gps_warnings']}")
-                if audit_rec.get("flags"):
-                    st.error(f"**Flags:** {audit_rec['flags']}")
-
-                if st.button("🔁 Re-run satellite AI" if ai_ran else "🛰️ Run satellite AI check", key=f"ai_{selected_farm}"):
-                    with st.spinner("Running DeepForest & drawing farm boundary..."):
-                        try:
-                            run_ai_for_farm.clear()
-                            rec_ai, img_b = run_ai_for_farm(sub_id, use_ndvi)
-                            apply_ai(audit_row_idx, rec_ai)
-                            st.session_state.setdefault("ai_imgs", {})[selected_farm] = img_b or b""
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"AI check failed: {e}")
-
-            with top_right:
-                if ai_img:
-                    try:
-                        stretch(
-                            st.image,
-                            Image.open(io.BytesIO(ai_img)),
-                            caption=f"🛰️ Farm {selected_farm} | Boundary (Yellow) & Detected Boundary Trees (Red Boxes: {fmt(audit_rec.get('ai_count'))})"
-                        )
-                    except Exception:
-                        st.caption("Could not display satellite image.")
-                elif not has_valid_gps:
-                    st.warning("⚠️ No valid GPS polygon recorded in Kobo for this farm to fetch satellite imagery.")
-                else:
-                    st.caption("Click '🛰️ Run satellite AI check' to load satellite boundary & tree detections.")
-
-            st.divider()
-
-            saved = get_field_decisions(selected_farm)
-            smap = saved.drop_duplicates("Field_Key", keep="last").set_index("Field_Key").to_dict(orient="index") if not saved.empty else {}
-
-            area_bad = str(audit_rec.get("area_check", "")).startswith("❌")
-            verdict_bad = "❌" in str(audit_rec.get("verdict", ""))
-            qa_items = [
-                {"Field_Key": "_AI_AREA_CHECK", "Question_Title": "🛰️ [Check] Farm Area & Perimeter (Entered vs GPS)",
-                 "Submitted_Answer": f"Perimeter: {fmt(audit_rec.get('perimeter_m'))}m | Entered: {fmt(audit_rec.get('area_entered'))} | GPS: {fmt(audit_rec.get('area_gps'))} ({fmt(audit_rec.get('area_check'))})",
-                 "Photo_Preview": "", "Item_Decision": "❌ Reject" if area_bad else "✅ OK",
-                 "Suggested_Correction_or_Comment": f"Area mismatch: GPS shows {audit_rec.get('area_gps')} Feddan (Perimeter: {audit_rec.get('perimeter_m')}m)" if area_bad else "",
-                 "Attach_to_Summary": bool(area_bad)},
-                {"Field_Key": "_AI_TREE_CHECK", "Question_Title": "🛰️ [Check] Boundary Tree Count (Engineer vs AI vs Perimeter Forecast)",
-                 "Submitted_Answer": f"Eng: {fmt(audit_rec.get('engineer_count'))} | Boundary AI: {fmt(audit_rec.get('ai_count'))} | Perimeter Forecast: {fmt(audit_rec.get('forecast'))}",
-                 "Photo_Preview": "", "Item_Decision": "❌ Reject" if verdict_bad else "✅ OK",
-                 "Suggested_Correction_or_Comment": str(audit_rec.get("verdict", "")) if verdict_bad else "",
-                 "Attach_to_Summary": bool(verdict_bad)},
-            ]
-            media_questions = []
-
-            f1, f2, f3 = st.columns(3)
-            show_empty = f1.checkbox("Show empty fields", value=False)
-            only_photos = f2.checkbox("📸🎥 Only photo/video questions", value=False)
-            load_photos = f3.checkbox("🖼️ Load photos & videos", value=True)
-
-            for col_name, val in flat_submission.items():
-                if str(col_name).startswith(META_PREFIXES):
-                    continue
-                present = qa.present(val)
-                if not present and not show_empty:
-                    continue
-                val_str = str(val).strip() if present else "— (Empty)"
-                fname = val_str.split("/")[-1].strip()
-                att_info = att_lookup.get(fname)
-                mime = att_info["mimetype"] if att_info else ""
-                is_photo = att_info is not None and (is_image_filename(fname) or "image" in mime)
-                is_video = att_info is not None and (is_video_filename(fname) or "video" in mime)
-
-                if only_photos and not (is_photo or is_video):
-                    continue
-                q_label = resolve_label(col_name, label_map)
-                data_uri = ""
-                if load_photos and att_info:
-                    if is_photo:
-                        b = fetch_kobo_media_bytes(att_info["preview_url"])
-                        if b:
-                            data_uri = "data:image/jpeg;base64," + base64.b64encode(b).decode()
-                            media_questions.append({"Field_Key": str(col_name), "Question_Title": q_label, "Filename": fname, "Type": "image", "Bytes": b})
-                    elif is_video:
-                        b = fetch_kobo_media_bytes(att_info["full_url"])
-                        if b:
-                            media_questions.append({"Field_Key": str(col_name), "Question_Title": q_label, "Filename": fname, "Type": "video", "Bytes": b})
-
-                icon = "📸 " if is_photo else "🎥 " if is_video else ""
-                qa_items.append({
-                    "Field_Key": str(col_name), "Question_Title": icon + q_label,
-                    "Submitted_Answer": val_str, "Photo_Preview": data_uri, "Item_Decision": "✅ OK",
-                    "Suggested_Correction_or_Comment": "", "Attach_to_Summary": False})
-
-            form_qa_df = pd.DataFrame(qa_items)
-
-            if smap:
-                for i, r in form_qa_df.iterrows():
-                    s = smap.get(r["Field_Key"])
-                    if s:
-                        dec = s.get("Item_Decision", "✅ OK")
-                        form_qa_df.at[i, "Item_Decision"] = dec if isinstance(dec, str) and dec else "✅ OK"
-                        cm = s.get("Suggested_Correction_or_Comment", "")
-                        form_qa_df.at[i, "Suggested_Correction_or_Comment"] = "" if pd.isna(cm) else str(cm)
-                        form_qa_df.at[i, "Attach_to_Summary"] = to_bool(s.get("Attach_to_Summary", False))
-
-            # ── INTERACTIVE PHOTO & VIDEO AUDIT CARDS ──
-            media_overrides = {}
-            if media_questions:
-                with st.expander(f"📸🎥 Photos & Videos Audit Cards ({len(media_questions)}) — تقدر ترفض أو تقبل وتكتب سبب الرفض تحت كل صورة أو فيديو", expanded=True):
-                    mc = st.columns(3)
-                    for i, mq in enumerate(media_questions):
-                        fk = mq["Field_Key"]
-                        sv = smap.get(fk, {})
-                        with mc[i % 3]:
-                            with st.container(border=True):
-                                st.markdown(f"**{'🎥' if mq['Type'] == 'video' else '📸'} {mq['Question_Title']}**")
-                                if mq["Type"] == "image":
-                                    try:
-                                        stretch(st.image, Image.open(io.BytesIO(mq["Bytes"])), caption=mq["Filename"])
-                                    except Exception:
-                                        st.caption(f"Cannot display {mq['Filename']}")
-                                else:
-                                    st.video(mq["Bytes"])
-                                    st.caption(f"Video: {mq['Filename']}")
-
-                                opts = ["✅ OK", "❌ Reject", "✏️ Modify", "❓ Clarify"]
-                                cur_d = sv.get("Item_Decision", "✅ OK")
-                                cur_d = cur_d if cur_d in opts else "✅ OK"
-                                m_dec = st.radio("Decision:", opts, index=opts.index(cur_d), horizontal=True, key=f"mdec_{selected_farm}_{fk}")
-                                m_com = st.text_input("سبب الرفض / تعليق:", value="" if pd.isna(sv.get("Suggested_Correction_or_Comment", "")) else str(sv.get("Suggested_Correction_or_Comment", "")), key=f"mcom_{selected_farm}_{fk}")
-                                m_att = st.checkbox("📎 إرفاق بالتقرير النهائي", value=to_bool(sv.get("Attach_to_Summary", False)) or (m_dec == "❌ Reject"), key=f"matt_{selected_farm}_{fk}")
+                    recs.append(rec
