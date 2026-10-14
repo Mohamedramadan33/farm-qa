@@ -275,45 +275,60 @@ def _csv_write(path: str, df: pd.DataFrame):
     os.replace(tmp, path)
 
 
-def append_to_airtable(rec: dict):
-    """
-    دالة إرسال البيانات التراكمية إلى Airtable
-    تعتمد على وجود إعدادات [airtable] في ملف secrets.toml
-    """
+def append_to_airtable(rec: dict) -> tuple[bool, str]:
+    """يرجع (True/False, رسالة واضحة). بيعمل upsert على farm_id عشان ميكررش الصفوف."""
     try:
-        api = Api(st.secrets["airtable"]["api_key"])
-        table = api.table(st.secrets["airtable"]["base_id"], st.secrets["airtable"]["table_name"])
-        
-        row_data = {
-            "farm_id": str(rec.get("farm_id", "")),
-            "submission_id": str(rec.get("submission_id", "")),
-            "Form_Status": str(rec.get("Form_Status", "")),
-            "Rejected_Items_Count": str(rec.get("Rejected_Items_Count", 0)),
-            "Consolidated_Comments": str(rec.get("Consolidated_Comments", "")),
-            "General_Auditor_Note": str(rec.get("General_Auditor_Note", "")),
-            "Auditor_Name": str(rec.get("Auditor_Name", "")),
-            "Reviewed_At": str(rec.get("Reviewed_At", ""))
-        }
-        
-        table.create(row_data)
-        return True
+        cfg = st.secrets["airtable"]
+        api_key, base_id, table_name = cfg["api_key"], cfg["base_id"], cfg["table_name"]
+    except Exception:
+        return False, "إعدادات [airtable] ناقصة في Secrets (api_key / base_id / table_name)."
+
+    row = {
+        "farm_id": str(rec.get("farm_id", "")),
+        "submission_id": str(rec.get("submission_id", "")),
+        "Form_Status": str(rec.get("Form_Status", "")),
+        "Rejected_Items_Count": int(rec.get("Rejected_Items_Count", 0) or 0),
+        "Consolidated_Comments": str(rec.get("Consolidated_Comments", "")),
+        "General_Auditor_Note": str(rec.get("General_Auditor_Note", "")),
+        "Auditor_Name": str(rec.get("Auditor_Name", "")),
+        "Reviewed_At": str(rec.get("Reviewed_At", "")),
+    }
+    try:
+        table = Api(api_key, timeout=(10, 30)).table(base_id, table_name)
+        result = table.batch_upsert([{"fields": row}], key_fields=["farm_id"], typecast=True)
+        if result.get("createdRecords"):
+            return True, "تم الإرسال — اتضافت المزرعة كسجل جديد."
+        return True, "تم الإرسال — اتحدّث السجل الموجود للمزرعة."
+    except requests.exceptions.HTTPError as e:
+        body = ""
+        try:
+            body = e.response.text[:300]
+        except Exception:
+            pass
+        code = getattr(e.response, "status_code", "?")
+        hint = {
+            401: "الـ API key غلط أو منتهي.",
+            403: "التوكن معندوش صلاحية data.records:write أو مش مدّي وصول للـ Base.",
+            404: "الـ base_id أو table_name غلط.",
+            422: "اسم عمود غلط أو نوع بيانات مش مطابق في الجدول.",
+        }.get(code, "")
+        return False, f"Airtable رفض الطلب ({code}). {hint} {body}"
+    except requests.exceptions.Timeout:
+        return False, "انتهت المهلة — Airtable مردّش. جرّب تاني."
+    except requests.exceptions.ConnectionError:
+        return False, "مشكلة اتصال بالإنترنت أو Airtable مش متاح."
     except Exception as e:
-        print(f"Airtable Append Error: {e}")
-        return False
+        return False, f"خطأ غير متوقع: {e}"
 
 
 def save_master_decision(rec: dict):
+    """حفظ محلي (CSV) فقط — الإرسال لـ Airtable بيتم من الزرار المخصص."""
     fid = str(rec["farm_id"])
-    
-    # 1. تحديث الملف المحلي (CSV) للـ Backup
     with get_lock():
         df = _csv_read(MASTER_LOG_FILE, MASTER_COLS)
         if not df.empty:
             df = df[df["farm_id"].astype(str) != fid]
         _csv_write(MASTER_LOG_FILE, pd.concat([df, pd.DataFrame([rec])], ignore_index=True))
-    
-    # 2. إرسال القرار لـ Airtable ليكون أرشيف سحابي (Cloud DB)
-    append_to_airtable(rec)
 
 
 def save_field_decisions(farm_id: str, field_df: pd.DataFrame):
@@ -721,6 +736,24 @@ if "results" in st.session_state:
                 save_btn = stretch(b1.button, "💾 Save", type="primary")
                 reject_btn = stretch(b2.button, "🚫 REJECT NOW")
 
+                # ── زرار Airtable ──
+                air_btn = stretch(st.button, "☁️ Send to Airtable", key=f"air_{selected_farm}")
+                if air_btn:
+                    if final_status == STATUS_PENDING:
+                        st.warning("⚠️ اختار Final Status غير Pending قبل الإرسال.")
+                    else:
+                        report_air = final_text
+                        if general_note.strip():
+                            report_air = f"[General Note: {general_note.strip()}]\n" + report_air
+                        with st.spinner("جاري الإرسال إلى Airtable..."):
+                            ok, air_msg = append_to_airtable({
+                                "farm_id": selected_farm, "submission_id": sub_id,
+                                "Form_Status": final_status, "Rejected_Items_Count": rejected,
+                                "Consolidated_Comments": report_air,
+                                "General_Auditor_Note": general_note, "Auditor_Name": USER,
+                                "Reviewed_At": datetime.now().strftime("%Y-%m-%d %H:%M")})
+                        (st.success if ok else st.error)(("✅ " if ok else "❌ فشل الإرسال: ") + air_msg)
+
                 if save_btn or reject_btn:
                     chosen = "🚫 REJECTED ENTIRE FORM" if reject_btn else final_status
                     now_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -739,7 +772,7 @@ if "results" in st.session_state:
                             "Suggested_Correction_or_Comment", "Attach_to_Summary"]])
                         st.session_state.pop(f"fd_{selected_farm}", None)
 
-                    # ── استدعاء دالة الحفظ التي ترسل لـ Airtable وتحفظ محلياً ──
+                    # ── حفظ محلي (CSV) ──
                     save_master_decision({
                         "farm_id": selected_farm, "submission_id": sub_id, "Form_Status": chosen,
                         "Rejected_Items_Count": rejected, "Consolidated_Comments": report,
