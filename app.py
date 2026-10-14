@@ -27,6 +27,9 @@ import requests
 import streamlit as st
 from PIL import Image
 
+# ── استدعاء مكتبة Airtable ──
+from pyairtable import Api
+
 st.set_page_config(page_title="EBDA & Kobo", layout="wide", page_icon="🛰️")
 
 try:
@@ -255,7 +258,8 @@ def apply_ai(idx, rec: dict):
             df.at[idx, k] = rec[k]
 
 
-# ═══════════════════════ STORAGE (CSV على السيرفر) ═══════════════════════
+# ═══════════════════════ STORAGE & DATABASE ═══════════════════════
+
 def _csv_read(path: str, headers: list) -> pd.DataFrame:
     if os.path.exists(path):
         try:
@@ -271,13 +275,45 @@ def _csv_write(path: str, df: pd.DataFrame):
     os.replace(tmp, path)
 
 
+def append_to_airtable(rec: dict):
+    """
+    دالة إرسال البيانات التراكمية إلى Airtable
+    تعتمد على وجود إعدادات [airtable] في ملف secrets.toml
+    """
+    try:
+        api = Api(st.secrets["airtable"]["api_key"])
+        table = api.table(st.secrets["airtable"]["base_id"], st.secrets["airtable"]["table_name"])
+        
+        row_data = {
+            "farm_id": str(rec.get("farm_id", "")),
+            "submission_id": str(rec.get("submission_id", "")),
+            "Form_Status": str(rec.get("Form_Status", "")),
+            "Rejected_Items_Count": str(rec.get("Rejected_Items_Count", 0)),
+            "Consolidated_Comments": str(rec.get("Consolidated_Comments", "")),
+            "General_Auditor_Note": str(rec.get("General_Auditor_Note", "")),
+            "Auditor_Name": str(rec.get("Auditor_Name", "")),
+            "Reviewed_At": str(rec.get("Reviewed_At", ""))
+        }
+        
+        table.create(row_data)
+        return True
+    except Exception as e:
+        print(f"Airtable Append Error: {e}")
+        return False
+
+
 def save_master_decision(rec: dict):
     fid = str(rec["farm_id"])
+    
+    # 1. تحديث الملف المحلي (CSV) للـ Backup
     with get_lock():
         df = _csv_read(MASTER_LOG_FILE, MASTER_COLS)
         if not df.empty:
             df = df[df["farm_id"].astype(str) != fid]
         _csv_write(MASTER_LOG_FILE, pd.concat([df, pd.DataFrame([rec])], ignore_index=True))
+    
+    # 2. إرسال القرار لـ Airtable ليكون أرشيف سحابي (Cloud DB)
+    append_to_airtable(rec)
 
 
 def save_field_decisions(farm_id: str, field_df: pd.DataFrame):
@@ -643,7 +679,7 @@ if "results" in st.session_state:
                     "Suggested_Correction_or_Comment": st.column_config.TextColumn("📝 Comment", width="large"),
                     "Attach_to_Summary": st.column_config.CheckboxColumn("📎 Attach?", default=False, width="small"),
                 },
-                key=f"ed_{selected_farm}_{short_hash(search_q)}_{int(show_empty)}{int(only_photos)}{int(load_photos)}",
+                key=f"ed_{selected_farm}_{short_hash(search_q)}_{int(show_empty)}_{int(only_photos)}_{int(load_photos)}",
             )
 
             merged_lines, rejected, modified = [], 0, 0
@@ -703,6 +739,7 @@ if "results" in st.session_state:
                             "Suggested_Correction_or_Comment", "Attach_to_Summary"]])
                         st.session_state.pop(f"fd_{selected_farm}", None)
 
+                    # ── استدعاء دالة الحفظ التي ترسل لـ Airtable وتحفظ محلياً ──
                     save_master_decision({
                         "farm_id": selected_farm, "submission_id": sub_id, "Form_Status": chosen,
                         "Rejected_Items_Count": rejected, "Consolidated_Comments": report,
