@@ -298,7 +298,8 @@ def append_to_airtable(rec: dict):
         table.create(row_data)
         return True
     except Exception as e:
-        print(f"Airtable Append Error: {e}")
+        # هنا التعديل الجديد لإظهار الخطأ على الشاشة لسهولة تتبعه
+        st.error(f"❌ فشل الإرسال إلى Airtable. السبب: {e}")
         return False
 
 
