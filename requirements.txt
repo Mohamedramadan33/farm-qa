@@ -20,3 +20,4 @@ planetary-computer
 pystac-client
 odc-stac
 rioxarray
+pyairtable
