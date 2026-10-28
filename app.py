@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64  # noqa: F401  (kept for compatibility)
 import hashlib
-import hmac
 import io
 import os
 import re
@@ -31,6 +30,7 @@ from PIL import Image
 from pyairtable import Api
 from pgs_rules import check_rules
 from work_divider import run_divide_work_pipeline
+import team_store as ts
 
 st.set_page_config(page_title="EBDA & Kobo", layout="wide", page_icon="🛰️")
 
@@ -56,43 +56,74 @@ def stretch(fn, *args, **kwargs):
         return fn(*args, use_container_width=True, **kwargs)
 
 
-# ═══════════════════════ LOGIN ═══════════════════════
-def load_users() -> dict:
-    try:
-        if "users" in st.secrets:
-            return {str(k).strip().lower(): str(v) for k, v in st.secrets["users"].items()}
-    except Exception:
-        pass
-    return {}
-
-
-if not st.session_state.get("user"):
-    users = load_users()
+# ═══════════════════════ LOGIN (team_store) ═══════════════════════
+def _login_screen():
     st.write("")
     st.write("")
-    _, center_col, _ = st.columns([1, 1.2, 1])
-    with center_col:
+    _, c, _ = st.columns([1, 1.2, 1])
+    with c:
         st.markdown("<h2 style='text-align: center;'>EBDA & Kobo — Login</h2>", unsafe_allow_html=True)
-        if not users:
-            st.error("مفيش مستخدمين متسجلين. افتح Manage app ← Settings ← Secrets وضيف السطرين دول (الباسورد بين علامتي تنصيص):")
-            st.code('[users]\n"mohamed@example.com" = "000000"', language="toml")
-            st.stop()
         with st.container(border=True):
             with st.form("login"):
                 u = st.text_input("Email / Username")
                 p = st.text_input("Password", type="password")
                 ok = stretch(st.form_submit_button, "Login", type="primary")
-            if ok:
-                pw = users.get(u.strip().lower())
-                if pw is not None and hmac.compare_digest(pw.encode(), p.encode()):
-                    st.session_state["user"] = u.strip()
-                    st.rerun()
-                else:
-                    time.sleep(1)
-                    st.error("الإيميل/اليوزر أو الباسورد غلط")
+            if not ok:
+                return
+            key = ts.resolve_user(u)
+            if key is None:
+                time.sleep(1)
+                st.error("المستخدم مش موجود في الفريق")
+                return
+            try:
+                good, changed = ts.login(key, p)
+            except Exception as e:
+                st.error(f"مشكلة في الاتصال بـ Google Sheets: {e}")
+                return
+            if good:
+                st.session_state["user"] = key
+                st.session_state["must_change"] = not changed
+                st.rerun()
+            else:
+                time.sleep(1)
+                st.error("الباسورد غلط")
+
+
+def _change_password_form(key: str, forced: bool):
+    with st.form(f"chg_{forced}"):
+        old = st.text_input("الباسورد الحالي", type="password")
+        new = st.text_input("الباسورد الجديد", type="password")
+        new2 = st.text_input("تأكيد الباسورد الجديد", type="password")
+        go = st.form_submit_button("غيّر الباسورد")
+    if go:
+        if new != new2:
+            st.error("الباسوردين مش متطابقين.")
+            return
+        try:
+            ok, msg = ts.change_password(key, old, new)
+        except Exception as e:
+            st.error(f"خطأ: {e}")
+            return
+        (st.success if ok else st.error)(msg)
+        if ok:
+            st.session_state["must_change"] = False
+            if forced:
+                st.rerun()
+
+
+if not st.session_state.get("user"):
+    _login_screen()
     st.stop()
 
-USER = st.session_state["user"]
+USER = st.session_state["user"]            # key زي "mansy"
+USER_NAME = ts.display_name(USER)          # الاسم المعروض
+
+if st.session_state.get("must_change"):
+    _, _c, _ = st.columns([1, 1.2, 1])
+    with _c:
+        st.subheader("🔐 غيّر الباسورد الافتراضي أول مرة")
+        _change_password_form(USER, forced=True)
+    st.stop()
 
 # ═══════════════════════ CONSTANTS ═══════════════════════
 MASTER_LOG_FILE = "master_form_reviews.csv"
@@ -584,26 +615,60 @@ def go_next():
     st.info("مفيش مزارع تانية في القائمة بعد دي.")
 
 
+def _sync_assignments(wl):
+    """أي مزرعة جديدة ملهاش مسؤول بتتوزّع تلقائياً (مرة لكل تغيير في القائمة)."""
+    sig = hash(tuple(wl["sub_id"]))
+    if st.session_state.get("_sync_sig") == sig:
+        return
+    try:
+        n = ts.sync_new(list(zip(wl["sub_id"], wl["Farm ID"])))
+        st.session_state["_sync_sig"] = sig
+        if n:
+            st.toast(f"اتوزّع {n} مزرعة جديدة على الفريق")
+    except Exception as e:
+        st.warning(f"تعذّر تحديث التوزيع: {e}")
+
+
 def render_worklist():
     st.subheader("📋 قائمة الشغل — استمارات لسه ماتعملهاش Validation")
     wl = get_worklist_df().copy()
     done = st.session_state.get("done_subs", set())
+    wl = wl[~wl["sub_id"].isin(done)].reset_index(drop=True)
+
+    _sync_assignments(wl)
+    try:
+        asg = ts.load_assignments()
+    except Exception:
+        asg = {}
+    wl["_to"] = wl["sub_id"].map(lambda s: asg.get(s, {}).get("to", ""))
+    wl["Assigned"] = wl["_to"].map(ts.display_name)
+
     ml = _csv_read(MASTER_LOG_FILE, MASTER_COLS)
     reviewed_local = set()
     if not ml.empty:
         reviewed_local = set(ml.loc[ml["Form_Status"].astype(str) != STATUS_PENDING, "submission_id"].astype(str))
 
-    c1, c2, c3, c4 = st.columns([2, 1.2, 1.2, 1.2])
+    # عدّاد لكل عضو (قبل الفلاتر)
+    counts = wl["_to"].value_counts()
+    st.caption("  |  ".join(f"{ts.display_name(k)}: {int(counts.get(k, 0))}" for k in ts.TEAM))
+
+    c1, c2, c3, c4, c5 = st.columns([2, 1.2, 1.2, 1.2, 1.2])
     q = c1.text_input("🔎 بحث (مزرعة / مزارع / منطقة)")
+    scope_opts = ["me", "all"] + list(ts.TEAM)
+    sel_scope = c2.selectbox("المسؤول", scope_opts,
+                             format_func=lambda k: {"me": "👤 مزارعي", "all": "الكل"}.get(k, ts.display_name(k)))
     regions = sorted(x for x in wl["Region"].unique() if x != "—")
     engineers = sorted(x for x in wl["Engineer"].unique() if x != "—")
-    sel_region = c2.selectbox("المنطقة", ["الكل"] + regions)
-    sel_eng = c3.selectbox("المهندس", ["الكل"] + engineers)
-    hide_rev = c4.checkbox("إخفاء اللي اتراجع", value=True)
+    sel_region = c3.selectbox("المنطقة", ["الكل"] + regions)
+    sel_eng = c4.selectbox("المهندس", ["الكل"] + engineers)
+    hide_rev = c5.checkbox("إخفاء اللي اتراجع", value=True)
 
-    wl = wl[~wl["sub_id"].isin(done)]
     if hide_rev:
         wl = wl[~wl["sub_id"].isin(reviewed_local)]
+    if sel_scope == "me":
+        wl = wl[wl["_to"] == USER]
+    elif sel_scope != "all":
+        wl = wl[wl["_to"] == sel_scope]
     if sel_region != "الكل":
         wl = wl[wl["Region"] == sel_region]
     if sel_eng != "الكل":
@@ -622,16 +687,36 @@ def render_worklist():
         st.success("🎉 مفيش استمارات متبقية بالفلاتر دي.")
         return
 
-    show_cols = ["Farm ID", "Farm Name", "Farmer", "Region", "Engineer", "Submitted"]
+    show_cols = ["Farm ID", "Farm Name", "Farmer", "Region", "Engineer", "Assigned", "Submitted"]
     event = stretch(st.dataframe, wl[show_cols], hide_index=True, height=420,
-                    on_select="rerun", selection_mode="single-row", key="wl_table")
-    sel_rows = event.selection.rows if event is not None else []
+                    on_select="rerun", selection_mode="multi-row", key="wl_table")
+    sel_rows = list(event.selection.rows) if event is not None else []
 
     b1, b2, _ = st.columns([1, 1, 3])
     if b1.button("🔍 افتح المزرعة المحددة", type="primary", disabled=not sel_rows):
         open_farm(wl.loc[sel_rows[0], "_idx"])
     if b2.button("▶️ ابدأ من أول مزرعة"):
         open_farm(wl.loc[0, "_idx"])
+
+    with st.expander("🔀 إعادة التوزيع"):
+        farm_ids = dict(zip(wl["sub_id"], wl["Farm ID"]))
+        r1, r2, r3 = st.columns([1.2, 1.2, 1.5])
+        target = r1.selectbox("انقل المحدد إلى", list(ts.TEAM), format_func=ts.display_name, key="mv_target")
+        if r2.button(f"نقل ({len(sel_rows)})", disabled=not sel_rows):
+            ids = [wl.loc[i, "sub_id"] for i in sel_rows]
+            try:
+                ts.reassign(ids, target, USER, farm_ids)
+                st.session_state["flash"] = f"✅ اتنقل {len(ids)} مزرعة إلى {ts.display_name(target)}"
+                st.rerun()
+            except Exception as e:
+                st.error(f"فشل النقل: {e}")
+        if r3.button(f"⚖️ قسّم المعروض ({len(wl)}) بالتساوي"):
+            try:
+                out = ts.redistribute(list(wl["sub_id"]), USER, farm_ids)
+                st.session_state["flash"] = "✅ " + " | ".join(f"{ts.display_name(k)}: {v}" for k, v in out.items())
+                st.rerun()
+            except Exception as e:
+                st.error(f"فشل التقسيم: {e}")
 
 
 # ═══════════════════════ SIDEBAR & LOADING ═══════════════════════
@@ -643,7 +728,9 @@ if "flash_warn" in st.session_state:
     st.warning(st.session_state.pop("flash_warn"))
 
 with st.sidebar:
-    st.success(f"👤 {USER}")
+    st.success(f"👤 {USER_NAME}")
+    with st.expander("🔐 تغيير الباسورد"):
+        _change_password_form(USER, forced=False)
     if st.button("Logout"):
         st.session_state.clear()
         st.rerun()
@@ -683,6 +770,7 @@ with st.sidebar:
         get_kobo_raw_and_df.clear()
         get_cols_map.clear()
         get_worklist_df.clear()
+        st.session_state.pop("_sync_sig", None)
         st.rerun()
     run_btn = stretch(st.button, "🚀 Load Forms", type="primary")
 
@@ -1050,7 +1138,7 @@ if view == "review" and "results" in st.session_state:
                                 "farm_id": selected_farm, "submission_id": sub_id,
                                 "Form_Status": final_status, "Rejected_Items_Count": rejected,
                                 "Consolidated_Comments": with_general_note(final_text, general_note),
-                                "General_Auditor_Note": general_note, "Auditor_Name": USER,
+                                "General_Auditor_Note": general_note, "Auditor_Name": USER_NAME,
                                 "Reviewed_At": datetime.now().strftime("%Y-%m-%d %H:%M")})
                         (st.success if ok else st.error)(("✅ " if ok else "❌ فشل الإرسال: ") + air_msg)
 
@@ -1061,7 +1149,7 @@ if view == "review" and "results" in st.session_state:
 
                     for col, v in (("Form_Status", chosen), ("Rejected_Items_Count", rejected),
                                    ("Consolidated_Comments", report), ("General_Auditor_Note", general_note),
-                                   ("Auditor_Name", USER), ("Reviewed_At", now_ts)):
+                                   ("Auditor_Name", USER_NAME), ("Reviewed_At", now_ts)):
                         st.session_state["results"].loc[audit_row_idx, col] = v
 
                     if not final_df.empty:
@@ -1074,7 +1162,7 @@ if view == "review" and "results" in st.session_state:
                     save_master_decision({
                         "farm_id": selected_farm, "submission_id": sub_id, "Form_Status": chosen,
                         "Rejected_Items_Count": rejected, "Consolidated_Comments": report,
-                        "General_Auditor_Note": general_note, "Auditor_Name": USER, "Reviewed_At": now_ts})
+                        "General_Auditor_Note": general_note, "Auditor_Name": USER_NAME, "Reviewed_At": now_ts})
                     st.session_state.pop("xlsx", None)
 
                     msg = f"✅ Saved! Farm `{selected_farm}` → **{chosen}**"
