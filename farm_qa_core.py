@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
+
 # ── RUNTIME PATCH FOR ALBUMENTATIONS COMPATIBILITY ──
 def _force_patch_albumentations():
     try:
@@ -31,6 +32,7 @@ def _force_patch_albumentations():
             sys.modules["albumentations.functional"] = f_mod
     except Exception:
         pass
+
 
 _force_patch_albumentations()
 
@@ -89,26 +91,28 @@ FIELD_HINTS = {
     "tree_count": {"exact": ["tree_number", "العدد", "__091"], "kw": ["عدد الاشجار", "عدد الشجر", "tree count", "العدد", "عدد"]},
     "tree_type":  {"exact": ["tree_type", "النوع", "__016"], "kw": ["نوع الشجر", "نوع الاشجار", "tree type", "crop", "محصول", "النوع", "نوع"]},
     "plot_owner": {"exact": ["plot_owner", "__011"], "kw": ["صاحب الحوض", "المالك"]},
-    "owner_phone":{"exact": ["plot_owner_number", "__012"], "kw": ["رقم تليفون", "تليفون", "phone"]},
+    "owner_phone": {"exact": ["plot_owner_number", "__012"], "kw": ["رقم تليفون", "تليفون", "phone"]},
     "ownership":  {"exact": ["__009"], "kw": ["ملكية", "مملوكة"]},
     "soil_type":  {"exact": ["__047", "soil_type"], "kw": ["نوع التربة", "soil"]},
     "irrig_type": {"exact": ["__048", "irrigation_type"], "kw": ["نوع الري", "طريقة الري"]},
     "irrig_amnt": {"exact": ["irrigation_amount_feddan_year"], "kw": ["كمية الاستهلاك"]},
     "crop_type":  {"exact": ["__030", "crop_type_irrigation"], "kw": ["المحصول", "نوع المحصول"]},
-    "animal_type":{"exact": ["_Type", "farm_animals_type"], "kw": ["نوع الحيوان", "حيوانات"]},
-    "animal_count":{"exact": ["__077", "cow_numbers"], "kw": ["عدد الحيوانات"]},
+    "animal_type": {"exact": ["_Type", "farm_animals_type"], "kw": ["نوع الحيوان", "حيوانات"]},
+    "animal_count": {"exact": ["__077", "cow_numbers"], "kw": ["عدد الحيوانات"]},
     "non_compliance": {"exact": ["non_compliance"], "kw": ["عدم المطابقة", "مخالفة"]},
     "corrective_act": {"exact": ["corrective_measures"], "kw": ["إجراءات تصحيحية", "تصحيح"]},
-    "auditor_recom":  {"exact": ["auditors_recommendations"], "kw": ["توصيات لجنة المراجعة", "توصيات"]}
+    "auditor_recom":  {"exact": ["auditors_recommendations"], "kw": ["توصيات لجنة المراجعة", "توصيات"]},
 }
 
 log = logging.getLogger("farm_qa")
+
 
 def normalize_digits(s: str) -> str:
     if not isinstance(s, str):
         return str(s)
     _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬", "01234567890123456789.,")
     return s.translate(_AR_DIGITS)
+
 
 def norm_ar(text) -> str:
     s = unicodedata.normalize("NFKC", str(text)).lower()
@@ -119,10 +123,12 @@ def norm_ar(text) -> str:
     s = s.replace("ة", "ه").replace("ى", "ي")
     return re.sub(r"\s+", " ", s).strip()
 
+
 def present(v) -> bool:
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return False
     return str(v).strip() not in ("", "[]", "nan", "None")
+
 
 def to_number(x) -> float:
     if not present(x):
@@ -132,6 +138,7 @@ def to_number(x) -> float:
     s = normalize_digits(str(x)).replace(",", "").replace(" ", "")
     m = re.search(r"-?\d+(?:\.\d+)?", s)
     return float(m.group()) if m else float("nan")
+
 
 def flatten(obj, parent: str = "", sep: str = "/") -> dict:
     out: dict = {}
@@ -148,14 +155,17 @@ def flatten(obj, parent: str = "", sep: str = "/") -> dict:
         out[parent] = obj
     return out
 
+
 def build_dataframe(rows: list) -> pd.DataFrame:
     df = pd.DataFrame([flatten(r) for r in rows])
     conv = lambda v: normalize_digits(v) if isinstance(v, str) else v
+
     def _fix(s):
         if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
             return s.map(conv)
         return s
     return df.apply(_fix)
+
 
 def fetch_kobo(limit: int = 3000) -> list:
     import requests
@@ -174,20 +184,26 @@ def fetch_kobo(limit: int = 3000) -> list:
         url = d.get("next")
     return rows
 
+
 def _leaf(col) -> str:
     return re.sub(r"\[\d+\]", "", str(col)).split("/")[-1].lower()
+
 
 def _share(series: pd.Series, pred) -> float:
     vals = [v for v in series if present(v)]
     return sum(1 for v in vals if pred(v)) / len(vals) if vals else 0.0
 
+
 def _kw_score(col, kws) -> int:
     name = norm_ar(_leaf(col).replace("_", " ").replace("-", " "))
     return max((len(norm_ar(k)) for k in kws if norm_ar(k) in name), default=0)
 
+
 def find_cols(df: pd.DataFrame, field: str) -> list:
     h = FIELD_HINTS[field]
-    exact = [c for c in df.columns if _leaf(c) in h["exact"]]
+    # FIX: _leaf() بترجع lowercase، فلازم الـ exact يتقارن lowercase برضو (كان "_Type" عمره ما بيطابق)
+    exact_names = {x.lower() for x in h["exact"]}
+    exact = [c for c in df.columns if _leaf(c) in exact_names]
     if exact:
         return exact
     cols = [c for c in df.columns if not str(c).startswith("_")]
@@ -208,8 +224,10 @@ def find_cols(df: pd.DataFrame, field: str) -> list:
     top = max((s for _, s in scored), default=0)
     return [c for c, s in scored if s == top] if top > 0 else []
 
+
 def map_all(df: pd.DataFrame) -> dict:
     return {f: find_cols(df, f) for f in FIELD_HINTS}
+
 
 def first_value(row, cols):
     for c in cols:
@@ -217,8 +235,10 @@ def first_value(row, cols):
             return row[c]
     return None
 
+
 def engineer_entries(row, count_cols, type_cols) -> list:
     out = []
+
     def get_prefix(col):
         return str(col).rsplit('/', 1)[0] if '/' in str(col) else 'root_flat'
 
@@ -240,9 +260,12 @@ def engineer_entries(row, count_cols, type_cols) -> list:
             out.append(("Unspecified", n))
     return out
 
+
 _DEC = re.compile(r"-?\d+\.\d+")
 
+
 def parse_points(raw):
+    """Returns list of (lon, lat)."""
     if not present(raw):
         return None
     s = normalize_digits(str(raw))
@@ -263,6 +286,7 @@ def parse_points(raw):
         if -180 <= p[0] <= 180 and -90 <= p[1] <= 90 and (not clean or clean[-1] != p):
             clean.append(p)
     return clean if len(clean) >= 3 else None
+
 
 def points_to_polygon(pts):
     """Automatically untangles self-intersecting ('bowtie/X-shaped') point orders to recover full farm rectangle."""
@@ -288,9 +312,11 @@ def points_to_polygon(pts):
         poly = max(polys, key=lambda g: g.area)
     return None if poly.is_empty or poly.area == 0 else poly
 
+
 def parse_polygon(raw):
     pts = parse_points(raw)
     return points_to_polygon(pts) if pts else None
+
 
 def geom_metrics_utm(poly) -> tuple[float, float]:
     """Returns (area_in_feddan, perimeter_in_meters) using accurate UTM projection."""
@@ -301,11 +327,14 @@ def geom_metrics_utm(poly) -> tuple[float, float]:
     perim_m = float(utm_geom.length)
     return area_fed, perim_m
 
+
 def area_feddan(poly) -> float:
     return geom_metrics_utm(poly)[0]
 
+
 def perimeter_meters(poly) -> float:
     return geom_metrics_utm(poly)[1]
+
 
 def gps_accuracy(raw):
     accs = []
@@ -315,6 +344,7 @@ def gps_accuracy(raw):
         if idx is not None and len(nums) > idx + 3:
             accs.append(float(nums[idx + 3]))
     return float(np.mean(accs)) if accs else None
+
 
 def gps_quality(raw, pts) -> list:
     from shapely.geometry import Polygon
@@ -339,10 +369,12 @@ def gps_quality(raw, pts) -> list:
         warns.append(f"⚠️ Poor GPS accuracy during capture (Avg {acc:.0f}m)")
     return warns
 
+
 TILE_PROVIDERS = [
     ("Google Earth", "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"),
     ("ESRI World Imagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
 ]
+
 
 def _px(lon, lat, z):
     n = 256 * (2 ** z)
@@ -350,6 +382,7 @@ def _px(lon, lat, z):
         (lon + 180.0) / 360.0 * n,
         (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n
     )
+
 
 def _is_valid_satellite_image(img) -> bool:
     arr = np.asarray(img, dtype="float32")
@@ -363,6 +396,7 @@ def _is_valid_satellite_image(img) -> bool:
         return False
     return True
 
+
 def _build_boundary_ring_mask(size: tuple[int, int], ring: list, lat: float, zoom: int, buffer_m: float = BOUNDARY_BUFFER_M):
     """Creates a binary mask covering ONLY the farm boundary corridor (e.g. +-8m around the perimeter line)."""
     from PIL import Image, ImageDraw
@@ -374,6 +408,7 @@ def _build_boundary_ring_mask(size: tuple[int, int], ring: list, lat: float, zoo
         pts.append(pts[0])
     ImageDraw.Draw(b_mask).line(pts, fill=255, width=stroke_px, joint="curve")
     return b_mask, stroke_px
+
 
 def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
     """Fetches full farm satellite image + creates both full-farm mask and boundary-corridor mask."""
@@ -400,7 +435,7 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
         coords = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
 
         for prov_name, url_tpl in TILE_PROVIDERS:
-            def get_tile(xy):
+            def get_tile(xy, url_tpl=url_tpl, z=z):
                 tx, ty = xy
                 for _ in range(2):
                     try:
@@ -443,6 +478,7 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
     if last_img is not None:
         return last_img, last_mask, last_z
     raise RuntimeError("Could not fetch satellite imagery from Google Earth or ESRI")
+
 
 def render_annotated_satellite(img, mask, boxes=None, upscale: float = 1.0, ring=None):
     """Shows the WHOLE farm clearly in satellite view, highlights the boundary belt, and marks boundary trees."""
@@ -515,6 +551,10 @@ def render_annotated_satellite(img, mask, boxes=None, upscale: float = 1.0, ring
 
     return Image.alpha_composite(annotated, overlay).convert("RGB")
 
+
+_EMPTY_COUNTS = {"lo": 0, "mid": 0, "hi": 0, "interior_mid": 0}
+
+
 class TreeCounter:
     def __init__(self, patch_size: int = 400, upscale: float = 1.5):
         self.patch_size, self.upscale = patch_size, upscale
@@ -557,9 +597,11 @@ class TreeCounter:
             boxes = self._model.predict_image(image=arr_input)
 
         if boxes is None or len(boxes) == 0:
-            return {"lo": 0, "mid": 0, "hi": 0, "interior_mid": 0}, pd.DataFrame()
+            return dict(_EMPTY_COUNTS), pd.DataFrame()
 
         boxes = boxes[boxes["score"] >= min(AI_BAND)].copy()
+        if boxes.empty:
+            return dict(_EMPTY_COUNTS), pd.DataFrame()
 
         # Dilate farm mask so boundary trees slightly outside the GPS line are captured
         farm_dilated = np.array(mask_work.filter(ImageFilter.MaxFilter(15))) > 0
@@ -574,29 +616,33 @@ class TreeCounter:
         in_farm_or_edge = farm_dilated[cy.values, cx.values] | b_zone[cy.values, cx.values]
         boxes = boxes[in_farm_or_edge].copy()
         if boxes.empty:
-            return {"lo": 0, "mid": 0, "hi": 0, "interior_mid": 0}, pd.DataFrame()
+            return dict(_EMPTY_COUNTS), pd.DataFrame()
 
         cx = ((boxes.xmin + boxes.xmax) / 2).astype(int).clip(0, b_zone.shape[1] - 1)
         cy = ((boxes.ymin + boxes.ymax) / 2).astype(int).clip(0, b_zone.shape[0] - 1)
-        boxes["on_boundary"] = b_zone[cy.values, cx.values]
+        boxes["on_boundary"] = b_zone[cy.values, cx.values].astype(bool)
 
-        valid_boxes = []
-        for _, box in boxes.iterrows():
-            x1, y1, x2, y2 = int(box.xmin), int(box.ymin), int(box.xmax), int(box.ymax)
+        # FIX: بنبني mask boolean بدل ما نعمل DataFrame من list of Series (كان بيبوّظ الـ dtypes)
+        # وبنعمل clip للإحداثيات عشان القيم السالبة متعملش slicing غلط.
+        H, W = arr.shape[:2]
+        keep = []
+        for box in boxes.itertuples():
+            x1, y1 = max(0, int(box.xmin)), max(0, int(box.ymin))
+            x2, y2 = min(W, int(box.xmax)), min(H, int(box.ymax))
             box_pixels = arr[y1:y2, x1:x2].astype("float32")
             if box_pixels.size == 0:
+                keep.append(False)
                 continue
             brightness = box_pixels.mean()
             s = box_pixels.sum(axis=2) + 1e-6
             exg = (2 * box_pixels[:, :, 1] - box_pixels[:, :, 0] - box_pixels[:, :, 2]) / s
-            green_ratio = (exg > VEG_EXG).mean()
-            if green_ratio > 0.05 or (brightness < 145 and box.score >= 0.25):
-                valid_boxes.append(box)
+            green_ratio = float((exg > VEG_EXG).mean())
+            keep.append(bool(green_ratio > 0.05 or (brightness < 145 and box.score >= 0.25)))
 
-        if not valid_boxes:
-            return {"lo": 0, "mid": 0, "hi": 0, "interior_mid": 0}, pd.DataFrame()
+        boxes_df = boxes[np.array(keep, dtype=bool)].copy()
+        if boxes_df.empty:
+            return dict(_EMPTY_COUNTS), pd.DataFrame()
 
-        boxes_df = pd.DataFrame(valid_boxes)
         target_df = boxes_df[boxes_df["on_boundary"]] if boundary_only else boxes_df
         interior_df = boxes_df[~boxes_df["on_boundary"]]
 
@@ -604,9 +650,11 @@ class TreeCounter:
         counts["interior_mid"] = int((interior_df["score"] >= AI_BAND[1]).sum())
         return counts, boxes_df
 
+
 _CALIB: dict = {}
 _USE_CALIB = True
 _DATE_CACHE: dict = {}
+
 
 def load_calibration(path: str = CALIBRATION_FILE) -> dict:
     _CALIB.clear()
@@ -615,7 +663,10 @@ def load_calibration(path: str = CALIBRATION_FILE) -> dict:
             _CALIB.update(json.load(f))
     except FileNotFoundError:
         pass
+    except Exception as e:
+        log.warning("Could not read calibration file: %s", e)
     return _CALIB
+
 
 def calib_factor(species) -> float:
     s = norm_ar(species) if present(species) else ""
@@ -623,6 +674,7 @@ def calib_factor(species) -> float:
         if s and norm_ar(k) in s:
             return float(v)
     return float(_CALIB.get("default", 1.0))
+
 
 def vegetation_pct(img, mask) -> float:
     a = np.asarray(img, dtype="float32")
@@ -633,6 +685,7 @@ def vegetation_pct(img, mask) -> float:
     exg = (2 * a[:, :, 1] - a[:, :, 0] - a[:, :, 2]) / s
     return float(((exg > VEG_EXG) & m).sum() / m.sum() * 100)
 
+
 def crown_diameter_m(boxes, lat: float, zoom: int, upscale: float = 1.0) -> float:
     if boxes is None or len(boxes) == 0:
         return float("nan")
@@ -642,6 +695,7 @@ def crown_diameter_m(boxes, lat: float, zoom: int, upscale: float = 1.0) -> floa
     mpp = 156543.03392 * math.cos(math.radians(lat)) / (2 ** zoom)
     side_px = np.sqrt((b.xmax - b.xmin).values * (b.ymax - b.ymin).values)
     return float(np.median(side_px) / upscale * mpp)
+
 
 def imagery_date(lon: float, lat: float):
     key = (round(lon, 3), round(lat, 3))
@@ -664,6 +718,7 @@ def imagery_date(lon: float, lat: float):
     _DATE_CACHE[key] = out
     return out
 
+
 def recent_ndvi(poly, days: int = NDVI_DAYS) -> float:
     try:
         import planetary_computer as pc
@@ -677,8 +732,8 @@ def recent_ndvi(poly, days: int = NDVI_DAYS) -> float:
         cat = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1",
                           modifier=pc.sign_inplace)
         items = cat.search(collections=["sentinel-2-l2a"], bbox=poly.bounds,
-                          datetime=f"{start:%Y-%m-%d}/{end:%Y-%m-%d}",
-                          query={"eo:cloud_cover": {"lt": NDVI_CLOUD}}).item_collection()
+                           datetime=f"{start:%Y-%m-%d}/{end:%Y-%m-%d}",
+                           query={"eo:cloud_cover": {"lt": NDVI_CLOUD}}).item_collection()
         if len(items) == 0:
             return float("nan")
 
@@ -698,8 +753,10 @@ def recent_ndvi(poly, days: int = NDVI_DAYS) -> float:
         log.warning("recent_ndvi failed: %s", e)
         return float("nan")
 
+
 def _close(a, b, tol):
     return abs(a - b) <= max(tol * max(a, b), ABS_TOL)
+
 
 def spacing_for_boundary(species) -> tuple[float, bool]:
     """Returns standard tree-to-tree spacing (in meters) along the farm perimeter."""
@@ -708,6 +765,7 @@ def spacing_for_boundary(species) -> tuple[float, bool]:
         if s and norm_ar(k) in s:
             return float(v), True
     return float(DEFAULT_BOUNDARY_SPACING_M), False
+
 
 def verdict(E, A, F, tol: float = TOL, band=None, veg_pct=None, img_age=None, crown_m=None) -> str:
     if math.isnan(E) or E <= 0:
@@ -743,6 +801,7 @@ def verdict(E, A, F, tol: float = TOL, band=None, veg_pct=None, img_age=None, cr
         return "⚠️ [Perimeter Capacity Match]: Farm perimeter fits the reported count, but AI detects fewer mature crowns (likely young saplings or partial border planting)." + why
     return "⚠️ [Moderate Variance]: Noticeable difference between Engineer, Perimeter Forecast, and AI; manual review recommended."
 
+
 def apply_ndvi(verdict_text: str, ndvi, veg, img_age) -> str:
     if ndvi is None or (isinstance(ndvi, float) and math.isnan(ndvi)):
         return verdict_text
@@ -756,6 +815,7 @@ def apply_ndvi(verdict_text: str, ndvi, veg, img_age) -> str:
     if ndvi < NDVI_BARE:
         return verdict_text + f"  (Recent NDVI {ndvi:.2f}: Bare soil currently, supporting imagery result)"
     return verdict_text
+
 
 def confidence(rec: dict) -> str:
     s = 100
@@ -772,26 +832,48 @@ def confidence(rec: dict) -> str:
         s -= 40
     return "🟢 High" if s >= 80 else "🟡 Medium" if s >= 55 else "🔴 Low"
 
+
+def _shapely_major() -> int:
+    try:
+        import shapely
+        return int(str(shapely.__version__).split(".")[0])
+    except Exception:
+        return 1
+
+
 def cross_checks(recs: list) -> None:
+    """Flags near-duplicate polygons. Uses an STRtree (fast) instead of an O(n²) loop."""
     for r in recs:
         r.setdefault("flags", [])
     items = [r for r in recs if r.get("_poly") is not None]
+    if len(items) < 2:
+        return
+    polys = [r["_poly"] for r in items]
+
+    if _shapely_major() >= 2:
+        from shapely.strtree import STRtree
+        tree = STRtree(polys)
+
+        def candidates(i):
+            return sorted(int(j) for j in tree.query(polys[i]) if int(j) > i)
+    else:
+        def candidates(i):
+            return range(i + 1, len(items))
+
     for i in range(len(items)):
-        for j in range(i + 1, len(items)):
+        for j in candidates(i):
             ra, rb = items[i], items[j]
             if str(ra["farm_id"]) == str(rb["farm_id"]):
                 continue
-            ba, bb = ra["_poly"].bounds, rb["_poly"].bounds
-            if ba[2] < bb[0] or bb[2] < ba[0] or ba[3] < bb[1] or bb[3] < ba[1]:
-                continue
             try:
-                inter = ra["_poly"].intersection(rb["_poly"]).area
-                uni = ra["_poly"].union(rb["_poly"]).area
+                inter = polys[i].intersection(polys[j]).area
+                uni = polys[i].union(polys[j]).area
             except Exception:
                 continue
             if uni > 0 and inter / uni >= DUP_IOU:
                 ra["flags"].append(f"🚩 Polygon overlaps with Farm {rb['farm_id']} ({inter / uni:.0%})")
                 rb["flags"].append(f"🚩 Polygon overlaps with Farm {ra['farm_id']} ({inter / uni:.0%})")
+
 
 def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=True) -> dict:
     nan = float("nan")
@@ -824,9 +906,12 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
         entered = to_number(first_value(row, cols["plot_area"]))
 
     missing = []
-    if rec["engineer"] == "N/A": missing.append("Engineer Name")
-    if math.isnan(entered) or entered == 0: missing.append("Area")
-    if gps_raw is None: missing.append("GPS Coordinates")
+    if rec["engineer"] == "N/A":
+        missing.append("Engineer Name")
+    if math.isnan(entered) or entered == 0:
+        missing.append("Area")
+    if gps_raw is None:
+        missing.append("GPS Coordinates")
     rec["missing"] = ", ".join(missing)
 
     poly = parse_polygon(gps_raw) if gps_raw is not None else None
@@ -838,12 +923,14 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
         except Exception as e:
             log.debug("gps_quality failed: %s", e)
 
+    gps_area, perim_m = nan, nan
     if poly is not None:
-        raw_area, raw_perim = geom_metrics_utm(poly)
-        gps_area = round(raw_area, 3)
-        perim_m = round(raw_perim, 1)
-    else:
-        gps_area, perim_m = nan, nan
+        try:
+            raw_area, raw_perim = geom_metrics_utm(poly)
+            gps_area = round(raw_area, 3)
+            perim_m = round(raw_perim, 1)
+        except Exception as e:
+            log.warning("geom_metrics_utm failed for %s: %s", rec["farm_id"], e)
 
     rec["area_entered"], rec["area_gps"], rec["perimeter_m"] = entered, gps_area, perim_m
     if math.isnan(gps_area) or gps_area <= 0:
@@ -898,7 +985,8 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
             if idate is not None:
                 rec["imagery_date"] = idate.strftime("%Y-%m")
                 ref = pd.to_datetime(rec["submission_time"], errors="coerce", utc=True)
-                if pd.isna(ref): ref = pd.Timestamp.now(tz="UTC")
+                if pd.isna(ref):
+                    ref = pd.Timestamp.now(tz="UTC")
                 img_age = (ref - idate).days / 365.25
 
             counts, boxes = active_counter.predict(img, mask, boundary_only=True)
@@ -938,6 +1026,7 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
     rec["confidence"] = confidence(rec)
     return rec
 
+
 def audit_df(df: pd.DataFrame, use_ai=True, debug_dir=None, verbose=False, calibrated=True, use_ndvi=True) -> pd.DataFrame:
     global _USE_CALIB
     _USE_CALIB = calibrated
@@ -958,23 +1047,32 @@ def audit_df(df: pd.DataFrame, use_ai=True, debug_dir=None, verbose=False, calib
         rec["flags"] = "; ".join(rec.get("flags", []))
     return pd.DataFrame(recs)
 
+
 def export_report(res: pd.DataFrame, path: str = "farm_qa_report.xlsx") -> str:
     display_cols = [c for c in res.columns if not str(c).startswith("_")]
     res[display_cols].to_excel(path, index=False)
     return path
 
-def filter_df(df, mode="all", date=None, farm=None) -> pd.DataFrame:
-    cols = map_all(df)
+
+def filter_df(df, mode="all", date=None, farm=None, cols=None) -> pd.DataFrame:
+    """`cols` اختياري: لو اتبعت (من الكاش) مش بنعمل map_all تاني (غالي على آلاف الصفوف)."""
+    if df is None or df.empty:
+        return df
+    cols = cols or map_all(df)
     if mode == "date" and date:
-        tc = cols["time"]
-        if tc: df = df[df[tc[0]].astype(str).str.startswith(date.strip())]
+        tc = [c for c in cols["time"] if _leaf(c) == "_submission_time"] or cols["time"]
+        if tc:
+            df = df[df[tc[0]].astype(str).str.startswith(date.strip())]
     elif mode == "farm" and farm:
         mask = pd.Series(False, index=df.index)
-        for c in cols["farm_id"]: mask |= df[c].astype(str).str.strip().str.lower() == farm.strip().lower()
+        for c in cols["farm_id"]:
+            mask |= df[c].astype(str).str.strip().str.lower() == farm.strip().lower()
         df = df[mask]
     return df
 
+
 def load_data(mode="all", date=None, farm=None) -> pd.DataFrame:
     df = build_dataframe(fetch_kobo())
-    if df.empty: return df
+    if df.empty:
+        return df
     return filter_df(df, mode, date, farm)
