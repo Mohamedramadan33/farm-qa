@@ -59,7 +59,7 @@ def stretch(fn, *args, **kwargs):
 def load_users() -> dict:
     try:
         if "users" in st.secrets:
-            return {str(k): str(v) for k, v in st.secrets["users"].items()}
+            return {str(k).strip().lower(): str(v) for k, v in st.secrets["users"].items()}
     except Exception:
         pass
     return {}
@@ -74,21 +74,21 @@ if not st.session_state.get("user"):
         st.markdown("<h2 style='text-align: center;'>EBDA & Kobo — Login</h2>", unsafe_allow_html=True)
         if not users:
             st.error("مفيش مستخدمين متسجلين. افتح Manage app ← Settings ← Secrets وضيف السطرين دول (الباسورد بين علامتي تنصيص):")
-            st.code('[users]\nmohamed = "000000"', language="toml")
+            st.code('[users]\n"mohamed@example.com" = "000000"', language="toml")
             st.stop()
         with st.container(border=True):
             with st.form("login"):
-                u = st.text_input("Username")
+                u = st.text_input("Email / Username")
                 p = st.text_input("Password", type="password")
                 ok = stretch(st.form_submit_button, "Login", type="primary")
             if ok:
-                pw = users.get(u.strip())
+                pw = users.get(u.strip().lower())
                 if pw is not None and hmac.compare_digest(pw.encode(), p.encode()):
                     st.session_state["user"] = u.strip()
                     st.rerun()
                 else:
                     time.sleep(1)
-                    st.error("Username أو Password غلط")
+                    st.error("الإيميل/اليوزر أو الباسورد غلط")
     st.stop()
 
 USER = st.session_state["user"]
@@ -310,7 +310,7 @@ def with_general_note(text: str, note: str) -> str:
 def _csv_read(path: str, headers: list) -> pd.DataFrame:
     if os.path.exists(path):
         try:
-            return pd.read_csv(path, dtype={"farm_id": str})
+            return pd.read_csv(path, dtype={"farm_id": str, "submission_id": str})
         except Exception:
             pass
     return pd.DataFrame(columns=headers)
@@ -429,6 +429,176 @@ def build_reviews_xlsx(res: pd.DataFrame, only_reviewed: bool) -> bytes:
     return buf.getvalue()
 
 
+# ═══════════════════════ LOAD / WORK LIST ═══════════════════════
+REGION_KW = ["المنطقة", "المحافظة", "المركز", "القرية", "الجمعية", "region", "governorate", "village"]
+FARMER_KW = ["اسم المزارع", "اسم الفلاح", "اسم صاحب المزرعة", "اسم صاحب", "farmer"]
+
+
+def find_cols_by_label(columns, label_map, keywords) -> list:
+    """بيدوّر على الأعمدة بنص السؤال (Label) مش باسم الحقل، لأن أسماء الحقول في Kobo غالباً أرقام (__010)."""
+    out = []
+    for kw in keywords:
+        k = qa.norm_ar(kw)
+        for c in columns:
+            if str(c).startswith(META_PREFIXES) or c in out:
+                continue
+            first, _ = resolve_label(c, label_map)
+            if k in qa.norm_ar(first):
+                out.append(c)
+    return out
+
+
+def load_forms(filtered_df, raw_rows, raw_df, cols) -> bool:
+    try:
+        if filtered_df.empty:
+            st.warning("⚠️ No forms matched.")
+            return False
+        recs, total = [], len(filtered_df)
+        prog = st.progress(0, text="Loading forms...")
+        for i, (idx, row) in enumerate(filtered_df.iterrows(), 1):
+            try:
+                rec = qa.audit_row(row, cols, counter=None, use_ai=False)
+            except Exception as e:
+                rec = blank_record(qa.first_value(row, cols["farm_id"]) or f"row{i}", e)
+            rec["_df_index"] = idx
+            rec["_submission_id"] = row.get("_id", "")
+            recs.append(rec)
+            if i % 20 == 0 or i == total:
+                prog.progress(i / total, text=f"Loaded {i}/{total}")
+        prog.empty()
+
+        qa.cross_checks(recs)
+        for r in recs:
+            r["flags"] = "; ".join(r.get("flags", []))
+
+        res_df = pd.DataFrame(recs)
+        res_df["farm_id"] = res_df["farm_id"].astype(str)
+
+        keep = MASTER_COLS[:1] + MASTER_COLS[2:]
+        ml = _csv_read(MASTER_LOG_FILE, MASTER_COLS)
+        if not ml.empty:
+            ml = ml[keep].drop_duplicates("farm_id", keep="last")
+            ml["farm_id"] = ml["farm_id"].astype(str)
+            res_df = res_df.merge(ml, on="farm_id", how="left")
+        else:
+            for c in keep[1:]:
+                res_df[c] = ""
+
+        res_df["Form_Status"] = res_df["Form_Status"].fillna(STATUS_PENDING).replace("", STATUS_PENDING)
+        res_df["Rejected_Items_Count"] = pd.to_numeric(res_df["Rejected_Items_Count"], errors="coerce").fillna(0).astype(int)
+        for c in ("Consolidated_Comments", "General_Auditor_Note", "Auditor_Name", "Reviewed_At"):
+            res_df[c] = res_df[c].fillna("").astype(str)
+
+        for k in [k for k in st.session_state if k.startswith("fd_")]:
+            del st.session_state[k]
+        st.session_state.update(results=res_df, raw_rows=raw_rows, flat_df=raw_df, ai_imgs={})
+        st.session_state.pop("xlsx", None)
+        return True
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
+        st.exception(e)
+        return False
+
+
+@st.cache_resource(ttl=600, show_spinner="Building work list...")
+def get_worklist_df() -> pd.DataFrame:
+    """كل الاستمارات اللي لسه ماتعملهاش Validation في Kobo."""
+    raw_rows, raw_df = get_kobo_raw_and_df()
+    cols = get_cols_map()
+    label_map = get_kobo_labels()
+    region_cols = find_cols_by_label(raw_df.columns, label_map, REGION_KW)
+    farmer_cols = find_cols_by_label(raw_df.columns, label_map, FARMER_KW) or cols.get("plot_owner", [])
+    rows = []
+    for idx, row in raw_df.iterrows():
+        vs = raw_rows[idx].get("_validation_status")
+        if isinstance(vs, dict) and vs.get("uid"):
+            continue  # اتعمله validation
+        rows.append({
+            "_idx": idx,
+            "sub_id": str(row.get("_id", "")),
+            "Farm ID": str(qa.first_value(row, cols["farm_id"]) or "—"),
+            "Farm Name": str(qa.first_value(row, cols["farm_name"]) or "—"),
+            "Farmer": str(qa.first_value(row, farmer_cols) or "—"),
+            "Region": str(qa.first_value(row, region_cols) or "—"),
+            "Engineer": str(qa.first_value(row, cols["engineer"]) or "—"),
+            "Submitted": str(qa.first_value(row, cols["time"]) or "—")[:10],
+        })
+    df = pd.DataFrame(rows, columns=["_idx", "sub_id", "Farm ID", "Farm Name", "Farmer", "Region", "Engineer", "Submitted"])
+    df.attrs["region_found"] = bool(region_cols)
+    return df.sort_values("Submitted", kind="stable").reset_index(drop=True)
+
+
+def open_farm(idx):
+    raw_rows, raw_df = get_kobo_raw_and_df()
+    if load_forms(raw_df.loc[[idx]], raw_rows, raw_df, get_cols_map()):
+        st.session_state["view"] = "review"
+        st.session_state["current_idx"] = idx
+        st.rerun()
+
+
+def go_next():
+    order = st.session_state.get("wl_order", [])
+    done = st.session_state.get("done_subs", set())
+    cur = st.session_state.get("current_idx")
+    ids = [i for i, _ in order]
+    start = ids.index(cur) + 1 if cur in ids else 0
+    for idx, sub in order[start:]:
+        if sub not in done:
+            open_farm(idx)
+            return
+    st.info("مفيش مزارع تانية في القائمة بعد دي.")
+
+
+def render_worklist():
+    st.subheader("📋 قائمة الشغل — استمارات لسه ماتعملهاش Validation")
+    wl = get_worklist_df().copy()
+    done = st.session_state.get("done_subs", set())
+    ml = _csv_read(MASTER_LOG_FILE, MASTER_COLS)
+    reviewed_local = set()
+    if not ml.empty:
+        reviewed_local = set(ml.loc[ml["Form_Status"].astype(str) != STATUS_PENDING, "submission_id"].astype(str))
+
+    c1, c2, c3, c4 = st.columns([2, 1.2, 1.2, 1.2])
+    q = c1.text_input("🔎 بحث (مزرعة / مزارع / منطقة)")
+    regions = sorted(x for x in wl["Region"].unique() if x != "—")
+    engineers = sorted(x for x in wl["Engineer"].unique() if x != "—")
+    sel_region = c2.selectbox("المنطقة", ["الكل"] + regions)
+    sel_eng = c3.selectbox("المهندس", ["الكل"] + engineers)
+    hide_rev = c4.checkbox("إخفاء اللي اتراجع", value=True)
+
+    wl = wl[~wl["sub_id"].isin(done)]
+    if hide_rev:
+        wl = wl[~wl["sub_id"].isin(reviewed_local)]
+    if sel_region != "الكل":
+        wl = wl[wl["Region"] == sel_region]
+    if sel_eng != "الكل":
+        wl = wl[wl["Engineer"] == sel_eng]
+    if q.strip():
+        blob = (wl["Farm ID"] + " " + wl["Farm Name"] + " " + wl["Farmer"] + " " + wl["Region"]).str.lower()
+        wl = wl[blob.str.contains(q.strip().lower(), regex=False)]
+    wl = wl.reset_index(drop=True)
+
+    st.metric("المزارع المتبقية", len(wl))
+    if not get_worklist_df().attrs.get("region_found", True):
+        st.caption("⚠️ ماعرفتش أحدد عمود المنطقة تلقائياً — قولّي اسم السؤال في الاستمارة وأظبطه.")
+
+    st.session_state["wl_order"] = list(zip(wl["_idx"], wl["sub_id"]))
+    if wl.empty:
+        st.success("🎉 مفيش استمارات متبقية بالفلاتر دي.")
+        return
+
+    show_cols = ["Farm ID", "Farm Name", "Farmer", "Region", "Engineer", "Submitted"]
+    event = stretch(st.dataframe, wl[show_cols], hide_index=True, height=420,
+                    on_select="rerun", selection_mode="single-row", key="wl_table")
+    sel_rows = event.selection.rows if event is not None else []
+
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button("🔍 افتح المزرعة المحددة", type="primary", disabled=not sel_rows):
+        open_farm(wl.loc[sel_rows[0], "_idx"])
+    if b2.button("▶️ ابدأ من أول مزرعة"):
+        open_farm(wl.loc[0, "_idx"])
+
+
 # ═══════════════════════ SIDEBAR & LOADING ═══════════════════════
 st.title("EBDA & Kobo")
 
@@ -441,6 +611,9 @@ with st.sidebar:
     st.success(f"👤 {USER}")
     if st.button("Logout"):
         st.session_state.clear()
+        st.rerun()
+    if st.button("📋 قائمة الشغل"):
+        st.session_state["view"] = "list"
         st.rerun()
 
     st.divider()
@@ -474,6 +647,7 @@ with st.sidebar:
     if st.button("🔄 Refresh Kobo Data"):
         get_kobo_raw_and_df.clear()
         get_cols_map.clear()
+        get_worklist_df.clear()
         st.rerun()
     run_btn = stretch(st.button, "🚀 Load Forms", type="primary")
 
@@ -486,55 +660,24 @@ if run_btn:
             raw_rows, raw_df = get_kobo_raw_and_df()
             cols = get_cols_map()
             filtered_df = qa.filter_df(raw_df, mode=mode_key, date=date_str, farm=farm_id_input, cols=cols)
-            if filtered_df.empty:
-                st.warning("⚠️ No forms matched.")
-            else:
-                recs, total = [], len(filtered_df)
-                prog = st.progress(0, text="Loading forms...")
-                for i, (idx, row) in enumerate(filtered_df.iterrows(), 1):
-                    try:
-                        rec = qa.audit_row(row, cols, counter=None, use_ai=False)
-                    except Exception as e:
-                        rec = blank_record(qa.first_value(row, cols["farm_id"]) or f"row{i}", e)
-                    rec["_df_index"] = idx
-                    rec["_submission_id"] = row.get("_id", "")
-                    recs.append(rec)
-                    if i % 20 == 0 or i == total:
-                        prog.progress(i / total, text=f"Loaded {i}/{total}")
-                prog.empty()
-
-                qa.cross_checks(recs)
-                for r in recs:
-                    r["flags"] = "; ".join(r.get("flags", []))
-
-                res_df = pd.DataFrame(recs)
-                res_df["farm_id"] = res_df["farm_id"].astype(str)
-
-                keep = MASTER_COLS[:1] + MASTER_COLS[2:]
-                ml = _csv_read(MASTER_LOG_FILE, MASTER_COLS)
-                if not ml.empty:
-                    ml = ml[keep].drop_duplicates("farm_id", keep="last")
-                    ml["farm_id"] = ml["farm_id"].astype(str)
-                    res_df = res_df.merge(ml, on="farm_id", how="left")
-                else:
-                    for c in keep[1:]:
-                        res_df[c] = ""
-
-                res_df["Form_Status"] = res_df["Form_Status"].fillna(STATUS_PENDING).replace("", STATUS_PENDING)
-                res_df["Rejected_Items_Count"] = pd.to_numeric(res_df["Rejected_Items_Count"], errors="coerce").fillna(0).astype(int)
-                for c in ("Consolidated_Comments", "General_Auditor_Note", "Auditor_Name", "Reviewed_At"):
-                    res_df[c] = res_df[c].fillna("").astype(str)
-
-                for k in [k for k in st.session_state if k.startswith("fd_")]:
-                    del st.session_state[k]
-                st.session_state.update(results=res_df, raw_rows=raw_rows, flat_df=raw_df, ai_imgs={})
-                st.session_state.pop("xlsx", None)
+            if load_forms(filtered_df, raw_rows, raw_df, cols):
+                st.session_state["view"] = "review"
         except Exception as e:
             st.error(f"Error loading data: {e}")
             st.exception(e)
 
 # ═══════════════════════ MAIN ═══════════════════════
-if "results" in st.session_state:
+view = st.session_state.get("view", "list")
+if view == "list" or "results" not in st.session_state:
+    render_worklist()
+
+if view == "review" and "results" in st.session_state:
+    nb1, nb2, _ = st.columns([1, 1.2, 4])
+    if nb1.button("⬅️ رجوع للقائمة"):
+        st.session_state["view"] = "list"
+        st.rerun()
+    if nb2.button("➡️ المزرعة اللي بعدها"):
+        go_next()
     res = st.session_state["results"]
     raw_rows = st.session_state["raw_rows"]
     flat_df = st.session_state["flat_df"]
@@ -840,7 +983,7 @@ if "results" in st.session_state:
                 cur = str(audit_rec.get("Form_Status", STATUS_PENDING))
                 cur = cur if cur in choices else STATUS_PENDING
                 final_status = st.radio("Final Status:", choices, index=choices.index(cur), key=f"radio_{selected_farm}")
-                sync_kobo = st.checkbox("🔗 Sync status to KoboToolbox", value=False)
+                sync_kobo = st.checkbox("🔗 Sync status to KoboToolbox (بيشيلها من القائمة)", value=True)
                 b1, b2 = st.columns(2)
                 save_btn = stretch(b1.button, "💾 Save", type="primary")
                 reject_btn = stretch(b2.button, "🚫 REJECT NOW")
@@ -884,12 +1027,13 @@ if "results" in st.session_state:
                     st.session_state.pop("xlsx", None)
 
                     msg = f"✅ Saved! Farm `{selected_farm}` → **{chosen}**"
-                    if sync_kobo and sub_id:
+                    if sync_kobo and sub_id and chosen != STATUS_PENDING:
                         code = ("validation_status_approved" if "Approved" in chosen
                                 else "validation_status_not_approved" if "REJECTED" in chosen
                                 else "validation_status_on_hold")
                         if update_kobo_validation_status(sub_id, code):
                             msg += " — synced to Kobo ✔"
+                            st.session_state.setdefault("done_subs", set()).add(sub_id)
                         else:
                             st.session_state["flash_warn"] = "⚠️ Saved, but Kobo sync failed."
                     st.session_state["flash"] = msg
