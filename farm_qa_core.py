@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import functools
 import io
 import json
 import logging
@@ -77,6 +78,9 @@ NDVI_GREEN = 0.30
 NDVI_BARE = 0.15
 NDVI_OLD_IMG_YEARS = 1.0
 
+# Background pool: imagery date + NDVI run in parallel with the AI step
+_BG = ThreadPoolExecutor(4)
+
 FIELD_HINTS = {
     "time":       {"exact": ["_submission_time", "start"], "kw": []},
     "farm_id":    {"exact": ["farm_id"], "kw": ["كود المزرعه", "رقم المزرعه", "farm id", "farm code"]},
@@ -106,12 +110,14 @@ FIELD_HINTS = {
 
 log = logging.getLogger("farm_qa")
 
+# جدول تحويل الأرقام بيتبني مرة واحدة بس
+_DIGITS_TBL = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬", "01234567890123456789.,")
+
 
 def normalize_digits(s: str) -> str:
     if not isinstance(s, str):
         return str(s)
-    _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬", "01234567890123456789.,")
-    return s.translate(_AR_DIGITS)
+    return s.translate(_DIGITS_TBL)
 
 
 def norm_ar(text) -> str:
@@ -318,14 +324,19 @@ def parse_polygon(raw):
     return points_to_polygon(pts) if pts else None
 
 
+@functools.lru_cache(maxsize=64)
+def _utm_transformer(zone: int, south: bool):
+    from pyproj import Transformer
+    return Transformer.from_crs(4326, (32700 if south else 32600) + zone, always_xy=True)
+
+
 def geom_metrics_utm(poly) -> tuple[float, float]:
     """Returns (area_in_feddan, perimeter_in_meters) using accurate UTM projection."""
-    import geopandas as gpd
-    gs = gpd.GeoSeries([poly], crs=4326)
-    utm_geom = gs.to_crs(gs.estimate_utm_crs()).iloc[0]
-    area_fed = float(utm_geom.area) / FEDDAN_M2
-    perim_m = float(utm_geom.length)
-    return area_fed, perim_m
+    from shapely.ops import transform
+    c = poly.centroid
+    zone = min(60, max(1, int((c.x + 180) // 6) + 1))
+    g = transform(_utm_transformer(zone, c.y < 0).transform, poly)
+    return float(g.area) / FEDDAN_M2, float(g.length)
 
 
 def area_feddan(poly) -> float:
@@ -413,6 +424,7 @@ def _build_boundary_ring_mask(size: tuple[int, int], ring: list, lat: float, zoo
 def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
     """Fetches full farm satellite image + creates both full-farm mask and boundary-corridor mask."""
     import requests
+    from requests.adapters import HTTPAdapter
     from PIL import Image, ImageDraw
     minx, miny, maxx, maxy = poly.bounds
     dx = max((maxx - minx) * 0.20, 0.00022)
@@ -421,6 +433,7 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
 
     sess = requests.Session()
     sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    sess.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=16))
 
     last_img, last_mask, last_z = None, None, 17
     c_lat = poly.centroid.y
@@ -439,7 +452,7 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
                 tx, ty = xy
                 for _ in range(2):
                     try:
-                        r = sess.get(url_tpl.format(z=z, x=tx, y=ty), timeout=20)
+                        r = sess.get(url_tpl.format(z=z, x=tx, y=ty), timeout=10)
                         if r.ok and len(r.content) > 800:
                             return xy, Image.open(io.BytesIO(r.content)).convert("RGB")
                     except Exception:
@@ -448,7 +461,7 @@ def fetch_farm_image(poly, zoom: int = ZOOM, max_tiles: int = 100):
 
             mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
             ok_all = True
-            with ThreadPoolExecutor(8) as ex:
+            with ThreadPoolExecutor(16) as ex:
                 for (tx, ty), tile in ex.map(get_tile, coords):
                     if tile is None:
                         ok_all = False
@@ -970,7 +983,14 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
 
     A = A_lo = A_hi = veg = crown = img_age = ndvi = nan
     ai_err = ""
+    ndvi_f = date_f = None
     if use_ai and poly is not None:
+        c = poly.centroid
+        # تاريخ الصورة والـ NDVI بيشتغلوا في الخلفية بالتوازي مع تحميل الصور والـ AI
+        date_f = _BG.submit(imagery_date, c.x, c.y)
+        if use_ndvi:
+            ndvi_f = _BG.submit(recent_ndvi, poly)
+
         img = mask = None
         boxes = pd.DataFrame()
         active_counter = counter or TreeCounter()
@@ -980,8 +1000,7 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
             b_mask = img.info.get("boundary_mask", mask)
             # Calculate vegetation cover along the boundary corridor
             veg = round(vegetation_pct(img, b_mask), 1)
-            c = poly.centroid
-            idate = imagery_date(c.x, c.y)
+            idate = date_f.result()
             if idate is not None:
                 rec["imagery_date"] = idate.strftime("%Y-%m")
                 ref = pd.to_datetime(rec["submission_time"], errors="coerce", utc=True)
@@ -1009,8 +1028,12 @@ def audit_row(row, cols, counter=None, use_ai=True, debug_dir=None, use_ndvi=Tru
                 except Exception as save_err:
                     log.warning("Failed saving annotated satellite image: %s", save_err)
 
-    if use_ai and use_ndvi and poly is not None:
-        ndvi = recent_ndvi(poly)
+    if ndvi_f is not None:
+        try:
+            ndvi = ndvi_f.result()
+        except Exception as e:
+            log.warning("recent_ndvi failed: %s", e)
+            ndvi = nan
 
     rec.update(ai_count=A, ai_low=A_lo, ai_high=A_hi, veg_pct=veg, crown_m=crown,
                img_age=img_age, ndvi_recent=ndvi, ai_error=ai_err)
