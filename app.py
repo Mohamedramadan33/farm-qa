@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 # ── ALBUMENTATIONS PATCH BEFORE ANY OTHER IMPORT ──
@@ -188,8 +189,13 @@ def get_kobo_labels() -> dict:
     return labels
 
 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=100)
-def fetch_kobo_media_bytes(url: str, max_mb: int = MAX_IMG_MB) -> bytes | None:
+# ── تحميل الميديا بالتوازي مع كاش في الذاكرة ──
+@st.cache_resource
+def get_media_cache() -> dict:
+    return {}
+
+
+def _download_media(url: str, max_mb: int):
     try:
         with requests.get(url, headers={"Authorization": f"Token {qa.KOBO_TOKEN}"}, timeout=45, stream=True) as r:
             if not r.ok:
@@ -200,6 +206,26 @@ def fetch_kobo_media_bytes(url: str, max_mb: int = MAX_IMG_MB) -> bytes | None:
             return r.content
     except Exception:
         return None
+
+
+def prefetch_media(jobs):
+    """jobs = list of (url, max_mb). بيحمّلهم كلهم مرة واحدة بالتوازي."""
+    cache = get_media_cache()
+    todo = [j for j in dict.fromkeys(jobs) if j not in cache]
+    if not todo:
+        return
+    with ThreadPoolExecutor(8) as ex:
+        for j, b in zip(todo, ex.map(lambda j: _download_media(*j), todo)):
+            if len(cache) > 300:
+                cache.pop(next(iter(cache)))
+            cache[j] = b
+
+
+def fetch_kobo_media_bytes(url: str, max_mb: int = MAX_IMG_MB):
+    key = (url, max_mb)
+    if key not in get_media_cache():
+        prefetch_media([key])
+    return get_media_cache().get(key)
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=200)
@@ -500,6 +526,16 @@ def load_forms(filtered_df, raw_rows, raw_df, cols) -> bool:
         return False
 
 
+def _first_series(df, cols):
+    """أول قيمة موجودة (present) من الأعمدة لكل صف — نسخة vectorized من first_value."""
+    cols = [c for c in cols if c in df.columns]
+    if not cols:
+        return pd.Series("—", index=df.index)
+    s = df[cols].astype(str).apply(lambda c: c.str.strip())
+    s = s.mask(s.isin(["", "[]", "nan", "None"]))
+    return s.bfill(axis=1).iloc[:, 0].fillna("—")
+
+
 @st.cache_resource(ttl=600, show_spinner="Building work list...")
 def get_worklist_df() -> pd.DataFrame:
     """كل الاستمارات اللي لسه ماتعملهاش Validation في Kobo."""
@@ -508,22 +544,21 @@ def get_worklist_df() -> pd.DataFrame:
     label_map = get_kobo_labels()
     region_cols = find_cols_by_label(raw_df.columns, label_map, REGION_KW)
     farmer_cols = find_cols_by_label(raw_df.columns, label_map, FARMER_KW) or cols.get("plot_owner", [])
-    rows = []
-    for idx, row in raw_df.iterrows():
-        vs = raw_rows[idx].get("_validation_status")
-        if isinstance(vs, dict) and vs.get("uid"):
-            continue  # اتعمله validation
-        rows.append({
-            "_idx": idx,
-            "sub_id": str(row.get("_id", "")),
-            "Farm ID": str(qa.first_value(row, cols["farm_id"]) or "—"),
-            "Farm Name": str(qa.first_value(row, cols["farm_name"]) or "—"),
-            "Farmer": str(qa.first_value(row, farmer_cols) or "—"),
-            "Region": str(qa.first_value(row, region_cols) or "—"),
-            "Engineer": str(qa.first_value(row, cols["engineer"]) or "—"),
-            "Submitted": str(qa.first_value(row, cols["time"]) or "—")[:10],
-        })
-    df = pd.DataFrame(rows, columns=["_idx", "sub_id", "Farm ID", "Farm Name", "Farmer", "Region", "Engineer", "Submitted"])
+
+    pending = pd.Series(
+        [not (isinstance(r.get("_validation_status"), dict) and r["_validation_status"].get("uid"))
+         for r in raw_rows], index=raw_df.index)
+    d = raw_df[pending]
+    df = pd.DataFrame({
+        "_idx": d.index,
+        "sub_id": d["_id"].astype(str) if "_id" in d else "",
+        "Farm ID": _first_series(d, cols["farm_id"]),
+        "Farm Name": _first_series(d, cols["farm_name"]),
+        "Farmer": _first_series(d, farmer_cols),
+        "Region": _first_series(d, region_cols),
+        "Engineer": _first_series(d, cols["engineer"]),
+        "Submitted": _first_series(d, cols["time"]).str[:10],
+    })
     df.attrs["region_found"] = bool(region_cols)
     return df.sort_values("Submitted", kind="stable").reset_index(drop=True)
 
@@ -800,6 +835,22 @@ if view == "review" and "results" in st.session_state:
             only_photos = f2.checkbox("📸🎥 Only photo/video questions", value=False)
             load_photos = f3.checkbox("🖼️ Load photos", value=True)
             load_videos = f4.checkbox("🎥 Load videos (heavy)", value=False)
+
+            # ── تحميل كل الصور/الفيديوهات مرة واحدة بالتوازي ──
+            if load_photos:
+                jobs = []
+                for _cn, _v in flat_submission.items():
+                    if str(_cn).startswith(META_PREFIXES) or not qa.present(_v):
+                        continue
+                    _fn = str(_v).strip().split("/")[-1].strip()
+                    _ai = find_attachment(att_lookup, _fn)
+                    if not _ai:
+                        continue
+                    if is_image_filename(_fn) or "image" in _ai["mimetype"]:
+                        jobs.append((_ai["preview_url"], MAX_IMG_MB))
+                    elif load_videos and (is_video_filename(_fn) or "video" in _ai["mimetype"]):
+                        jobs.append((_ai["full_url"], MAX_VIDEO_MB))
+                prefetch_media(jobs)
 
             for col_name, val in flat_submission.items():
                 if str(col_name).startswith(META_PREFIXES):
