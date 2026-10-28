@@ -27,8 +27,10 @@ import requests
 import streamlit as st
 from PIL import Image
 
-# ── استدعاء مكتبة Airtable ──
+# ── استدعاء مكتبات النظام الجديد ──
 from pyairtable import Api
+from pgs_rules import check_rules
+from work_divider import run_divide_work_pipeline
 
 st.set_page_config(page_title="EBDA & Kobo", layout="wide", page_icon="🛰️")
 
@@ -397,6 +399,23 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    st.markdown("### ⚡ Work Management")
+    if st.button("Divide Work (Google Sheets)", type="primary"):
+        with st.status("Running Distribution Pipeline...", expanded=True) as status:
+            log_container = st.empty()
+            logs = []
+            def ui_logger(msg):
+                logs.append(msg)
+                log_container.code("\n".join(logs))
+            try:
+                run_divide_work_pipeline(ui_logger)
+                status.update(label="Distribution Complete!", state="complete", expanded=False)
+                st.success("✅ تم تحديث المهام على Google Sheets بنجاح")
+            except Exception as e:
+                status.update(label="Error Occurred!", state="error")
+                st.error(f"خطأ أثناء توزيع المهام: {e}")
+
+    st.divider()
     mode = st.selectbox("Scope:", ["Specific Farm (Farm ID)", "By Submission Date", "All Farms"])
     farm_id_input, date_str = None, None
     if mode == "Specific Farm (Farm ID)":
@@ -574,13 +593,15 @@ if "results" in st.session_state:
             verdict_bad = "❌" in str(audit_rec.get("verdict", ""))
             qa_items = [
                 {"Field_Key": "_AI_AREA_CHECK", "Question_Title": "🛰️ [Check] Farm Area & Perimeter (Entered vs GPS)",
+                 "Raw_Label": "[Check] Farm Area & Perimeter",
                  "Submitted_Answer": f"Perimeter: {fmt(audit_rec.get('perimeter_m'))}m | Entered: {fmt(audit_rec.get('area_entered'))} | GPS: {fmt(audit_rec.get('area_gps'))} ({fmt(audit_rec.get('area_check'))})",
-                 "Photo_Preview": "", "Item_Decision": "❌ Reject" if area_bad else "✅ OK",
+                 "Photo_Preview": "", "Attachment_Link": "", "Item_Decision": "❌ Reject" if area_bad else "✅ OK",
                  "Suggested_Correction_or_Comment": f"Area mismatch: GPS shows {audit_rec.get('area_gps')} Feddan (Perimeter: {audit_rec.get('perimeter_m')}m)" if area_bad else "",
                  "Attach_to_Summary": bool(area_bad)},
                 {"Field_Key": "_AI_TREE_CHECK", "Question_Title": "🛰️ [Check] Boundary Tree Count (Engineer vs AI vs Perimeter Forecast)",
+                 "Raw_Label": "[Check] Boundary Tree Count",
                  "Submitted_Answer": f"Eng: {fmt(audit_rec.get('engineer_count'))} | Boundary AI: {fmt(audit_rec.get('ai_count'))} | Perimeter Forecast: {fmt(audit_rec.get('forecast'))}",
-                 "Photo_Preview": "", "Item_Decision": "❌ Reject" if verdict_bad else "✅ OK",
+                 "Photo_Preview": "", "Attachment_Link": "", "Item_Decision": "❌ Reject" if verdict_bad else "✅ OK",
                  "Suggested_Correction_or_Comment": str(audit_rec.get("verdict", "")) if verdict_bad else "",
                  "Attach_to_Summary": bool(verdict_bad)},
             ]
@@ -621,10 +642,36 @@ if "results" in st.session_state:
 
                 icon = "📸 " if is_photo else "🎥 " if is_video else ""
                 qa_items.append({
-                    "Field_Key": str(col_name), "Question_Title": icon + q_label,
-                    "Submitted_Answer": val_str, "Photo_Preview": data_uri, "Item_Decision": "✅ OK",
+                    "Field_Key": str(col_name), 
+                    "Question_Title": icon + q_label,
+                    "Raw_Label": q_label,
+                    "Submitted_Answer": val_str, 
+                    "Attachment_Link": att_info["full_url"] if att_info else "",
+                    "Photo_Preview": data_uri, "Item_Decision": "✅ OK",
                     "Suggested_Correction_or_Comment": "", "Attach_to_Summary": False})
 
+            # ── PGS RULES ENGINE CHECK ──
+            st.divider()
+            st.markdown("### 📋 PGS Business Rules Audit")
+            
+            farm_poly = audit_rec.get("_poly")
+            poly_coords = list(farm_poly.exterior.coords) if farm_poly and farm_poly.geom_type == 'Polygon' else None
+            
+            rule_issues = check_rules(
+                table=qa_items,
+                calc_area=audit_rec.get("area_gps"),
+                farm_polygon=poly_coords
+            )
+            
+            if rule_issues:
+                error_list = "\n".join([f"- {iss}" for iss in rule_issues])
+                st.error(f"⚠️ **تم اكتشاف تناقضات إدارية في الاستمارة:**\n{error_list}")
+            else:
+                st.success("✅ **فحص القواعد:** جميع المرفقات والأرقام الأساسية سليمة ومطابقة للمساحة.")
+            
+            st.divider()
+
+            # ── PREPARE DATAFRAME FOR DATA EDITOR ──
             form_qa_df = pd.DataFrame(qa_items)
 
             if smap:
@@ -681,8 +728,11 @@ if "results" in st.session_state:
             else:
                 display_df = form_qa_df.copy()
 
+            # Drop temporary columns before displaying
+            columns_to_show = [c for c in display_df.columns if c not in ["Raw_Label", "Attachment_Link"]]
+
             edited = stretch(
-                st.data_editor, display_df, hide_index=True, height=520,
+                st.data_editor, display_df[columns_to_show], hide_index=True, height=520,
                 disabled=["Field_Key", "Question_Title", "Submitted_Answer", "Photo_Preview"],
                 column_config={
                     "Field_Key": None,
