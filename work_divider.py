@@ -6,8 +6,6 @@ from datetime import datetime, timezone, timedelta
 from collections import Counter
 import requests
 import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
 
 try:
     from zoneinfo import ZoneInfo
@@ -17,28 +15,16 @@ except Exception:
 
 SERVER_URL = "https://kf.kobotoolbox.org"
 FORM_NAME = "PGS - New"
-SPREADSHEET_KEY = "1GYbkWSJao0S5skCEr3Y0BaiHQV2t24-aaCLMCP8UpJs"
-SHEET_DIST_TAB = "_sys_dist"
 FARM_CODE_KEY = "at_house/farm_id"
 GOV_KEY = "engineer_data/__002"
 GOVERNORATE_HINTS = ["governorate", "gov", "المحافظة", "المحافظه"]
 
 TEAM_MEMBERS = [
+    "mohamed@ebda.earth",
     "mansy.ayman@ebda.earth",
     "haidy.abdelnasser@ebda.earth",
-    "eslam.ashraf@ebda.earth",
-    "roaa.ahmed@ebda.earth"
+    "eslam.ashraf@ebda.earth"
 ]
-
-def get_gspread_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    # قراءة بيانات الاعتماد من secrets في Streamlit مباشرة
-    creds_dict = st.secrets["gcp_service_account"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    return gspread.authorize(creds)
 
 def get_api_token():
     return st.secrets["KOBO_TOKEN"]
@@ -74,31 +60,6 @@ def get_submissions(logger):
     fields = ["_id", "_validation_status", FARM_CODE_KEY, GOV_KEY]
     url = f"{server}/api/v2/assets/{uid}/data/?format=json&limit=3000&fields={quote(json.dumps(fields))}"
     return get_all_pages(url, logger)
-
-def read_team_modes(sh):
-    try:
-        ws = sh.worksheet(SHEET_DIST_TAB)
-        data = ws.get_all_values()
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SHEET_DIST_TAB, rows=100, cols=10)
-        data = []
-    headers = ["Member Email", "Today Mode", "Assigned Governorates", "Total Assigned Farms", "Kobo Validations Today", "Status Updates Today", "Total Effort Score"]
-    modes = {}
-    if len(data) < 2:
-        ws.clear()
-        initial_rows = [headers]
-        for email in TEAM_MEMBERS:
-            initial_rows.append([email, "Kobo", "", 0, 0, 0, 0.0])
-            modes[email] = "Kobo"
-        ws.update("A1", initial_rows)
-    else:
-        for row in data[1:5]:
-            if row:
-                email = row[0].strip()
-                modes[email] = row[1].strip() if len(row) > 1 and row[1].strip() else "Kobo"
-    for email in TEAM_MEMBERS:
-        if email not in modes: modes[email] = "Kobo"
-    return ws, modes
 
 def divide_work_fairly(unvalidated_farms, active_workers, max_gov_ratio=1.4):
     if not active_workers: return {}, {}
@@ -139,15 +100,8 @@ def find_value(sub, hints):
 
 def run_divide_work_pipeline(logger):
     logger("🚀 [START] Divide Work Pipeline")
-    logger("[STEP] Connecting to Google Sheets...")
-    gc = get_gspread_client()
-    sh = gc.open_by_key(SPREADSHEET_KEY)
-
     logger("[STEP] Fetching submissions from KoboToolbox...")
     subs = get_submissions(logger)
-
-    logger("[STEP] Reading team modes from _sys_dist...")
-    dist_ws, modes = read_team_modes(sh)
 
     unvalidated = []
     for s in subs:
@@ -157,25 +111,13 @@ def run_divide_work_pipeline(logger):
             unvalidated.append((code, gov))
 
     logger(f"[INFO] Found {len(unvalidated)} unvalidated farms.")
-    active_kobo_workers = [email for email in TEAM_MEMBERS if modes.get(email) == "Kobo"]
-    
-    worker_farms, worker_govs = divide_work_fairly(unvalidated, active_kobo_workers)
+    worker_farms, worker_govs = divide_work_fairly(unvalidated, TEAM_MEMBERS)
     
     logger("\n[ASSIGNMENT BREAKDOWN]")
-    for w in active_kobo_workers:
+    for w in TEAM_MEMBERS:
         farms = worker_farms.get(w, [])
         w_gov_counts = Counter(gov for _, gov in farms)
         details = ", ".join([f"{gov}: {cnt}" for gov, cnt in w_gov_counts.items()])
         logger(f" ➜ {w.split('@')[0]} (Total: {len(farms)}) -> [{details or 'No farms'}]")
 
-    logger("\n[STEP] Updating _sys_dist assigned farms...")
-    headers = ["Member Email", "Today Mode", "Assigned Governorates", "Total Assigned Farms"]
-    summary_rows = [headers]
-    for email in TEAM_MEMBERS:
-        mode = modes.get(email, "Kobo")
-        govs_str = ", ".join(worker_govs.get(email, [])) if mode == "Kobo" else ""
-        total_assigned = len(worker_farms.get(email, [])) if mode == "Kobo" else 0
-        summary_rows.append([email, mode, govs_str, total_assigned])
-    
-    dist_ws.update("A1:D5", summary_rows)
     logger("✅ [SUCCESS] Divide Work pipeline completed!")
