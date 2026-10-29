@@ -1,17 +1,7 @@
-import os
-import re
 import json
-import time
-from datetime import datetime, timezone, timedelta
 from collections import Counter
 import requests
 import streamlit as st
-
-try:
-    from zoneinfo import ZoneInfo
-    CAIRO = ZoneInfo("Africa/Cairo")
-except Exception:
-    CAIRO = timezone(timedelta(hours=3))
 
 SERVER_URL = "https://kf.kobotoolbox.org"
 FORM_NAME = "PGS - New"
