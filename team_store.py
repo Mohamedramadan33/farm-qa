@@ -1,11 +1,8 @@
 """
-team_store.py — مستخدمين الفريق + توزيع المزارع، متخزنين في Airtable
+team_store.py — مستخدمين الفريق + توزيع المزارع عبر Airtable
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
-import secrets as pysecrets
 from datetime import datetime
 import streamlit as st
 from pyairtable import Api
@@ -17,7 +14,6 @@ TEAM = {
     "islam": {"email": "eslam.ashraf@ebda.earth", "name": "Islam"},
 }
 ALIASES = {"eslam": "islam", "islam.ashraf": "islam"}
-DEFAULT_PASSWORD = "000000"
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -46,7 +42,6 @@ def _get_airtable_table():
     return Api(cfg["api_key"]).table(cfg["base_id"], cfg["table_name"])
 
 def load_assignments() -> dict:
-    """بيرجّع توجيهات المزارع من Airtable"""
     try:
         table = _get_airtable_table()
         records = table.all()
