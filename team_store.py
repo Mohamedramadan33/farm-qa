@@ -1,8 +1,11 @@
 """
-team_store.py — مستخدمين الفريق + توزيع المزارع عبر Airtable
+team_store.py — إدارة المستخدمين وتسجيل الدخول وتوجيه المزارع عبر Airtable
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets as pysecrets
 from datetime import datetime
 import streamlit as st
 from pyairtable import Api
@@ -14,6 +17,7 @@ TEAM = {
     "islam": {"email": "eslam.ashraf@ebda.earth", "name": "Islam"},
 }
 ALIASES = {"eslam": "islam", "islam.ashraf": "islam"}
+DEFAULT_PASSWORD = "000000"
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -36,6 +40,33 @@ def resolve_user(ident: str):
         if i == email or i == email.split("@")[0]:
             return k
     return None
+
+def login(key: str, password: str):
+    """التحقق من تسجيل الدخول (الباسورد الافتراضي 000000)"""
+    if key in TEAM:
+        # السماح بالدخول بالباسورد الافتراضي أو أي باسورد مسجل في الـ Session
+        passwords = st.session_state.setdefault("_passwords", {})
+        saved_pw = passwords.get(key, DEFAULT_PASSWORD)
+        if hmac.compare_digest(saved_pw.encode(), password.encode()):
+            changed = (saved_pw != DEFAULT_PASSWORD)
+            return True, changed
+    return False, False
+
+def change_password(key: str, old_pw: str, new_pw: str):
+    """تغيير الباسورد وحفظه مؤقتاً في الـ Session"""
+    if len(new_pw) < 6:
+        return False, "الباسورد الجديد لازم يكون 6 حروف/أرقام على الأقل."
+    if new_pw == DEFAULT_PASSWORD:
+        return False, "اختار باسورد غير الافتراضي."
+    
+    passwords = st.session_state.setdefault("_passwords", {})
+    saved_pw = passwords.get(key, DEFAULT_PASSWORD)
+    
+    if not hmac.compare_digest(saved_pw.encode(), old_pw.encode()):
+        return False, "الباسورد الحالي غلط."
+    
+    passwords[key] = new_pw
+    return True, "تم تغيير الباسورد ✅"
 
 def _get_airtable_table():
     cfg = st.secrets["airtable"]
