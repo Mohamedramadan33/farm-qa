@@ -2,6 +2,7 @@
 """
 app.py — EBDA & Kobo Farm QA Audit Dashboard
 Streamlit Cloud & Local Deployment Entry Point
+Fully wired to live KoboToolbox API and Airtable via st.secrets with safe fallbacks.
 """
 
 import datetime
@@ -43,18 +44,80 @@ st.markdown(
         border-radius: 10px;
         padding: 12px;
     }
-    .badge-approved { background-color: #10b981; color: white; padding: 3px 10px; border-radius: 6px; font-weight: bold; }
-    .badge-conditional { background-color: #f59e0b; color: white; padding: 3px 10px; border-radius: 6px; font-weight: bold; }
-    .badge-rejected { background-color: #ef4444; color: white; padding: 3px 10px; border-radius: 6px; font-weight: bold; }
-    .badge-pending { background-color: #6b7280; color: white; padding: 3px 10px; border-radius: 6px; font-weight: bold; }
     div.block-container { padding-top: 1.8rem; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+
+def safe_image(img_or_url: Any, caption: Optional[str] = None):
+    """
+    Safely renders image in Streamlit across all versions (supports both
+    use_container_width and use_column_width without throwing TypeError).
+    """
+    if img_or_url is None:
+        return
+    try:
+        st.image(img_or_url, caption=caption, use_column_width=True)
+    except TypeError:
+        try:
+            st.image(img_or_url, caption=caption, use_container_width=True)
+        except Exception:
+            st.image(img_or_url, caption=caption)
+    except Exception as e:
+        st.caption(f"صورة مضلع القمر الصناعي: {e}")
+
+
+def get_secret(key: str, default: str = "") -> str:
+    """
+    Safely extracts credentials from st.secrets across all possible nesting patterns
+    without throwing KeyError or AttributeError.
+    """
+    try:
+        if not hasattr(st, "secrets"):
+            return default
+        # 1. Direct top-level uppercase or lowercase
+        if key in st.secrets:
+            return str(st.secrets[key]).strip()
+        low_key = key.lower()
+        if low_key in st.secrets:
+            return str(st.secrets[low_key]).strip()
+
+        # 2. Nested sections e.g. [kobo] token = "..." or [airtable] api_key = "..."
+        for section in st.secrets:
+            sec_val = st.secrets[section]
+            if isinstance(sec_val, dict):
+                if key in sec_val:
+                    return str(sec_val[key]).strip()
+                if low_key in sec_val:
+                    return str(sec_val[low_key]).strip()
+                if "kobo" in section.lower() and "token" in sec_val:
+                    if "TOKEN" in key:
+                        return str(sec_val["token"]).strip()
+                if "airtable" in section.lower():
+                    if "KEY" in key and "api_key" in sec_val:
+                        return str(sec_val["api_key"]).strip()
+                    if "BASE" in key and "base_id" in sec_val:
+                        return str(sec_val["base_id"]).strip()
+                    if "TABLE" in key and "table_name" in sec_val:
+                        return str(sec_val["table_name"]).strip()
+    except Exception:
+        pass
+    return default
+
+
+# Read Secrets
+SECRET_KOBO_TOKEN = get_secret("KOBO_TOKEN")
+SECRET_KOBO_SERVER = get_secret("KOBO_SERVER", "https://kf.kobotoolbox.org")
+SECRET_KOBO_ASSET = get_secret("KOBO_ASSET_UID", "aX4NJWgge6tooXjfSYXhrq")
+SECRET_AIRTABLE_KEY = get_secret("AIRTABLE_API_KEY") or get_secret("AIRTABLE_TOKEN")
+SECRET_AIRTABLE_BASE = get_secret("AIRTABLE_BASE_ID")
+SECRET_AIRTABLE_TABLE = get_secret("AIRTABLE_TABLE_NAME")
+
+
 # -------------------------------------------------------------------
-# Demo Fallback Seed Submissions (Guarantees zero-crash execution)
+# Demo Fallback Seed Submissions (Used only if no token or offline)
 # -------------------------------------------------------------------
 DEMO_FARMS = [
     {
@@ -76,10 +139,8 @@ DEMO_FARMS = [
         "tree_number": 420,
         "gps_polygon": "30.0125 31.1820 18 3; 30.0145 31.1855 18 3; 30.0110 31.1870 18 3; 30.0090 31.1830 18 3; 30.0125 31.1820 18 3",
         "soil_points": "30.0120 31.1835; 30.0135 31.1850; 30.0115 31.1860; 30.0100 31.1835",
-        "tenure_photo": "https://example.com/doc1.pdf",
-        "biodiversity_doc": "https://example.com/bio1.pdf",
-        "gmo_doc": "https://example.com/gmo1.pdf",
-        "ledger_doc": "https://example.com/ledger1.pdf",
+        "attachments": [],
+        "flat": {},
     },
     {
         "_id": 1002,
@@ -100,10 +161,8 @@ DEMO_FARMS = [
         "tree_number": 190,
         "gps_polygon": "30.6520 30.1210 22 2; 30.6550 30.1245 22 2; 30.6530 30.1280 22 2; 30.6495 30.1240 22 2; 30.6520 30.1210 22 2",
         "soil_points": "30.6525 30.1230; 30.6540 30.1250; 30.6520 30.1265; 30.6505 30.1235",
-        "tenure_photo": "https://example.com/tenure2.jpg",
-        "biodiversity_doc": "https://example.com/bio2.jpg",
-        "gmo_doc": "",
-        "ledger_doc": "https://example.com/ledger2.pdf",
+        "attachments": [],
+        "flat": {},
     },
     {
         "_id": 1003,
@@ -124,10 +183,8 @@ DEMO_FARMS = [
         "tree_number": 310,
         "gps_polygon": "28.1150 30.7420 40 4; 28.1180 30.7460 40 4; 28.1140 30.7490 40 4; 28.1110 30.7440 40 4; 28.1150 30.7420 40 4",
         "soil_points": "28.1155 30.7435; 28.1170 30.7455; 28.1135 30.7470",
-        "tenure_photo": "https://example.com/tenure3.pdf",
-        "biodiversity_doc": "https://example.com/bio3.pdf",
-        "gmo_doc": "https://example.com/gmo3.pdf",
-        "ledger_doc": "",
+        "attachments": [],
+        "flat": {},
     },
     {
         "_id": 1004,
@@ -148,39 +205,47 @@ DEMO_FARMS = [
         "tree_number": 180,
         "gps_polygon": "29.3120 30.8250 12 3; 29.3150 30.8280 12 3; 29.3130 30.8310 12 3; 29.3100 30.8270 12 3; 29.3120 30.8250 12 3",
         "soil_points": "29.3125 30.8260; 29.3140 30.8285; 29.3128 30.8295; 29.3110 30.8265",
-        "tenure_photo": "https://example.com/tenure4.pdf",
-        "biodiversity_doc": "https://example.com/bio4.pdf",
-        "gmo_doc": "https://example.com/gmo4.pdf",
-        "ledger_doc": "https://example.com/ledger4.pdf",
+        "attachments": [],
+        "flat": {},
     },
 ]
 
+
+@st.cache_data(ttl=300)
+def load_kobo_data(token: str, server_url: str, asset_uid: str) -> List[Dict[str, Any]]:
+    if not token:
+        return []
+    raw_list = store.fetch_kobo_submissions(server_url, asset_uid, token)
+    if not raw_list:
+        return []
+    return [core.extract_farm_record(r, idx) for idx, r in enumerate(raw_list)]
+
+
 # -------------------------------------------------------------------
-# Session State Initialization
+# Session State & Cache Initialization
 # -------------------------------------------------------------------
 if "current_user" not in st.session_state:
     st.session_state.current_user = "mohamed"
 
 if "all_reviews" not in st.session_state:
-    st.session_state.all_reviews = store.get_all_reviews()
+    # Hydrate reviews from local store and Airtable
+    local_reviews = store.get_all_reviews()
+    if SECRET_AIRTABLE_KEY and SECRET_AIRTABLE_BASE and SECRET_AIRTABLE_TABLE:
+        try:
+            airtable_master = store.fetch_airtable_reviews(
+                SECRET_AIRTABLE_KEY, SECRET_AIRTABLE_BASE, SECRET_AIRTABLE_TABLE
+            )
+            for fid, rec in airtable_master.items():
+                local_reviews["master"][fid] = rec
+        except Exception:
+            pass
+    st.session_state.all_reviews = local_reviews
 
 if "assignments" not in st.session_state:
-    saved_assigns = store.get_assignments()
-    if not saved_assigns:
-        # Default distribution of demo farms
-        for idx, f in enumerate(DEMO_FARMS):
-            worker = wd.TEAM_KEYS[idx % len(wd.TEAM_KEYS)]
-            saved_assigns[str(f["_id"])] = {
-                "to": worker,
-                "by": "auto",
-                "at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "farm_id": f["farm_id"],
-            }
-        store.save_assignments(saved_assigns)
-    st.session_state.assignments = saved_assigns
+    st.session_state.assignments = store.get_assignments()
 
 # -------------------------------------------------------------------
-# Sidebar: User Authentication & Settings
+# Sidebar: User Authentication & Data Connection
 # -------------------------------------------------------------------
 with st.sidebar:
     st.title("🌾 نظام تدقيق المزارع")
@@ -199,27 +264,40 @@ with st.sidebar:
     st.session_state.current_user = current_key
 
     st.markdown("---")
-    st.subheader("🔑 مفاتيح الربط السحابي")
-    # Safe check for Streamlit secrets without crashing if missing
-    default_token = ""
-    try:
-        default_token = st.secrets.get("KOBO_TOKEN", "")
-    except Exception:
-        pass
+    st.subheader("🔌 حالة الربط السحابي (API)")
 
-    kobo_token_input = st.text_input(
-        "توكن KoboToolbox (اختياري للبيانات الحية):",
-        value=default_token,
-        type="password",
-        help="اتركه فارغاً للعمل في الوضع التجريبي دون اتصال.",
-    )
+    token_to_use = SECRET_KOBO_TOKEN
+    server_to_use = SECRET_KOBO_SERVER
+    asset_to_use = SECRET_KOBO_ASSET
 
-    data_source_mode = "تجريبي (محلي)"
-    raw_farms = DEMO_FARMS
-    if kobo_token_input.strip():
-        data_source_mode = "حي من Kobo API"
+    if not token_to_use:
+        token_to_use = st.text_input(
+            "أدخل Kobo Token:",
+            type="password",
+            help="إذا كان مسجلاً في st.secrets فلن تحتاج لإدخاله هنا.",
+        )
 
-    st.info(f"مصدر البيانات الحالي: **{data_source_mode}**")
+    # Fetch live data
+    live_farms = []
+    if token_to_use:
+        with st.spinner("جاري الاتصال بـ KoboToolbox..."):
+            live_farms = load_kobo_data(token_to_use, server_to_use, asset_to_use)
+
+    if live_farms:
+        raw_farms = live_farms
+        st.success(f"🟢 متصل بـ Kobo API: {len(live_farms)} استمارة")
+    else:
+        raw_farms = DEMO_FARMS
+        st.info(f"⚪ الوضع الحالي: بيانات تجريبية ({len(DEMO_FARMS)} مزارع)")
+
+    if SECRET_AIRTABLE_KEY:
+        st.success("🟢 متصل بـ Airtable")
+    else:
+        st.caption("⚪ Airtable: محلي (أضف المفاتيح في secrets للمزامنة)")
+
+    if st.button("🔄 تحديث البيانات الحية (Refresh)", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
     st.markdown("---")
     nav_choice = st.radio(
@@ -241,7 +319,6 @@ if nav_choice == "📋 قائمة المهام والمزارع":
         f"مرحباً **{wd.display_name(st.session_state.current_user)}**، يمكنك هنا الاطلاع على جميع المزارع المسندة إليك ومتابعة حالات التدقيق."
     )
 
-    # Filter Options
     col1, col2, col3 = st.columns(3)
     with col1:
         filter_reviewer = st.selectbox(
@@ -250,7 +327,7 @@ if nav_choice == "📋 قائمة المهام والمزارع":
             format_func=lambda k: "جميع المراجعين" if k == "الكل" else wd.display_name(k),
         )
     with col2:
-        govs = sorted(list(set(f["governorate"] for f in raw_farms)))
+        govs = sorted(list(set(f.get("governorate", "غير محدد") for f in raw_farms)))
         filter_gov = st.selectbox("تصفية حسب المحافظة:", options=["الكل"] + govs)
     with col3:
         filter_status = st.selectbox(
@@ -265,21 +342,20 @@ if nav_choice == "📋 قائمة المهام والمزارع":
             }.get(s, s),
         )
 
-    # Filter records
     table_rows = []
     reviews_master = st.session_state.all_reviews.get("master", {})
 
-    for f in raw_farms:
-        sid = str(f["_id"])
-        fid = f["farm_id"]
+    for idx, f in enumerate(raw_farms):
+        sid = str(f.get("_id", idx + 1))
+        fid = f.get("farm_id", f"FARM-{sid}")
         assign_info = st.session_state.assignments.get(sid, {})
-        assigned_to = assign_info.get("to", "غير مسند")
+        assigned_to = assign_info.get("to") or wd.TEAM_KEYS[idx % len(wd.TEAM_KEYS)]
         rev = reviews_master.get(fid, {})
         rev_status = rev.get("Form_Status", "Pending Review")
 
         if filter_reviewer != "الكل" and assigned_to != filter_reviewer:
             continue
-        if filter_gov != "الكل" and f["governorate"] != filter_gov:
+        if filter_gov != "الكل" and f.get("governorate") != filter_gov:
             continue
         if filter_status != "الكل" and rev_status != filter_status:
             continue
@@ -287,13 +363,13 @@ if nav_choice == "📋 قائمة المهام والمزارع":
         table_rows.append(
             {
                 "كود المزرعة": fid,
-                "اسم المزرعة": f["farm_name"],
-                "المحافظة": f["governorate"],
-                "اسم المزارع": f["rep_name"],
-                "المهندس المراجع": f["engineer_name"],
-                "المساحة (فدان)": f["farm_area"],
+                "اسم المزرعة": f.get("farm_name", "—"),
+                "المحافظة": f.get("governorate", "—"),
+                "اسم المزارع": f.get("rep_name", "—"),
+                "المهندس المراجع": f.get("engineer_name", "—"),
+                "المساحة (فدان)": f.get("farm_area", 0.0),
                 "المراجع المسند": wd.display_name(assigned_to),
-                "تاريخ الزيارة": f["visit_date"],
+                "تاريخ الزيارة": f.get("visit_date", "—"),
                 "حالة الاعتماد": rev_status,
                 "sub_id": sid,
             }
@@ -315,29 +391,27 @@ if nav_choice == "📋 قائمة المهام والمزارع":
 elif nav_choice == "🌾 فحص المزرعة وقواعد PGS":
     st.header("🌾 فحص المزرعة والتحقق الهندسي وقواعد PGS")
 
-    farm_choices = {f"{f['farm_id']} — {f['farm_name']} ({f['governorate']})": f for f in raw_farms}
+    farm_choices = {f"{f.get('farm_id')} — {f.get('farm_name')} ({f.get('governorate')})": f for f in raw_farms}
     selected_label = st.selectbox("اختر المزرعة للمعاينة والتدقيق:", options=list(farm_choices.keys()))
     farm = farm_choices[selected_label]
 
-    sub_id = str(farm["_id"])
-    farm_id = farm["farm_id"]
+    sub_id = str(farm.get("_id", ""))
+    farm_id = farm.get("farm_id", "")
     reviews_master = st.session_state.all_reviews.get("master", {})
     existing_rev = reviews_master.get(farm_id, {})
 
-    # Top metrics row
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("كود المزرعة", farm["farm_id"])
+        st.metric("كود المزرعة", farm.get("farm_id", "—"))
     with col2:
-        st.metric("المحافظة", farm["governorate"])
+        st.metric("المحافظة", farm.get("governorate", "—"))
     with col3:
-        st.metric("المساحة المسجلة", f"{farm['farm_area']} فدان")
+        st.metric("المساحة المسجلة", f"{farm.get('farm_area', 0.0)} فدان")
     with col4:
-        st.metric("مهندس المعاينة", farm["engineer_name"])
+        st.metric("مهندس المعاينة", farm.get("engineer_name", "—"))
 
     st.markdown("---")
 
-    # Geometry & Polygon Parsing
     poly_coords, is_repaired = core.parse_polygon_coords(farm.get("gps_polygon", ""))
     utm_metrics = core.calculate_utm_metrics(poly_coords) if poly_coords else {}
     area_gps_feddan = utm_metrics.get("area_feddan", 0.0)
@@ -351,12 +425,13 @@ elif nav_choice == "🌾 فحص المزرعة وقواعد PGS":
         g_col1, g_col2, g_col3 = st.columns(3)
         with g_col1:
             st.metric("مساحة مضلع GPS", f"{area_gps_feddan:.2f} فدان")
-            diff_feddan = abs(farm["farm_area"] - area_gps_feddan)
-            diff_pct = (diff_feddan / max(farm["farm_area"], 0.01)) * 100
+            farm_ent_area = float(farm.get("farm_area") or 0.0)
+            diff_feddan = abs(farm_ent_area - area_gps_feddan)
+            diff_pct = (diff_feddan / max(farm_ent_area, 0.01)) * 100
             if diff_pct <= 10:
                 st.success(f"مطابقة ممتازة (الفارق: {diff_pct:.1f}%)")
             else:
-                st.error(f"فارق كبير ({diff_pct:.1f}%) بين المسجل ومضلع GPS!")
+                st.error(f"فارق ({diff_pct:.1f}%) بين المسجل ومضلع GPS!")
         with g_col2:
             st.metric("محيط المزرعة", f"{perimeter_m:.1f} متر")
         with g_col3:
@@ -365,13 +440,11 @@ elif nav_choice == "🌾 فحص المزرعة وقواعد PGS":
         if is_repaired:
             st.warning("⚠️ تم رصد تقاطع ذاتي (Bowtie) في تسلسل النقاط، وتم فكه وإصلاحه هندسياً تلقائياً.")
 
-        # Interactive Folium Map
         if poly_coords and len(poly_coords) >= 3:
             mean_lat = sum(p[1] for p in poly_coords) / len(poly_coords)
             mean_lon = sum(p[0] for p in poly_coords) / len(poly_coords)
 
             m = Map(location=[mean_lat, mean_lon], zoom_start=17, tiles=None)
-            # Add ESRI Satellite layer
             TileLayer(
                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                 attr="Esri World Imagery",
@@ -380,7 +453,6 @@ elif nav_choice == "🌾 فحص المزرعة وقواعد PGS":
                 control=True,
             ).add_to(m)
 
-            # Draw polygon (Folium expects [lat, lon])
             folium_coords = [[p[1], p[0]] for p in poly_coords]
             FoliumPolygon(
                 locations=folium_coords,
@@ -389,18 +461,17 @@ elif nav_choice == "🌾 فحص المزرعة وقواعد PGS":
                 fill=True,
                 fill_color="#10b981",
                 fill_opacity=0.25,
-                tooltip=f"مزرعة {farm['farm_name']}",
+                tooltip=f"مزرعة {farm.get('farm_name')}",
             ).add_to(m)
 
-            Marker([mean_lat, mean_lon], tooltip=f"مركز {farm['farm_id']}").add_to(m)
-
+            Marker([mean_lat, mean_lon], tooltip=f"مركز {farm.get('farm_id')}").add_to(m)
             st_folium(m, height=420, use_container_width=True)
         else:
             st.warning("لا توجد إحداثيات GPS صالحة لرسم المضلع.")
 
     with t2:
         st.subheader("2. فحص الغطاء النباتي وتعداد الأشجار بالأقمار الصناعية")
-        st.caption("يعتمد هذا التحليل على حساب مؤشر الخضرة الزائد (ExG) على امتداد ممر الحدود (8 أمتار) دون استهلاك موارد المعالج.")
+        st.caption("تحليل بصري فائق السرعة عبر مؤشر الخضرة الزائد (ExG) على ممر الحدود (8 أمتار) دون استنزاف المعالج.")
 
         canopy_result = core.analyze_farm_satellite_canopy(
             poly_coords,
@@ -423,21 +494,21 @@ elif nav_choice == "🌾 فحص المزرعة وقواعد PGS":
             )
 
         st.info(
-            f"🌱 نسبة الغطاء النباتي على الحدود: **{canopy_result['veg_pct']}%** | 📅 تاريخ التقاط القمر الصناعي (ArcGIS): **{canopy_result['imagery_date'] or 'حديث'}**"
+            f"🌱 نسبة الغطاء النباتي على الحدود: **{canopy_result['veg_pct']}%** | 📅 تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}**"
         )
 
-        if canopy_result.get("annotated_img"):
-            st.image(
+        # SAFE IMAGE RENDERING (No TypeError across any Streamlit version)
+        if canopy_result.get("annotated_img") is not None:
+            safe_image(
                 canopy_result["annotated_img"],
                 caption="صورة القمر الصناعي عالية الدقة مع تتبع حدود المزرعة",
-                use_container_width=True,
             )
 
     with t3:
         st.subheader("3. تقرير محرك قواعد PGS والاعتماد النهائي")
 
-        # Run PGS rules engine
-        rule_findings = pgs.evaluate_pgs_rules(farm, farm, poly_coords)
+        flat_payload = farm.get("flat") or farm
+        rule_findings = pgs.evaluate_pgs_rules(farm, flat_payload, poly_coords)
 
         for finding in rule_findings:
             if finding["passed"]:
@@ -478,7 +549,7 @@ elif nav_choice == "🌾 فحص المزرعة وقواعد PGS":
             height=100,
         )
 
-        save_col1, save_col2 = st.columns([1, 2])
+        save_col1, save_col2, save_col3 = st.columns([1, 1, 2])
         with save_col1:
             if st.button("💾 حفظ القرار محلياً", type="primary", use_container_width=True):
                 new_record = {
@@ -489,9 +560,33 @@ elif nav_choice == "🌾 فحص المزرعة وقواعد PGS":
                     "Consolidated_Comments": "; ".join(f["message"] for f in rule_findings if not f["passed"]),
                 }
                 store.save_master_review(farm_id, sub_id, new_record)
-                st.session_state.all_reviews = store.get_all_reviews()
-                st.success("تم حفظ قرار المراجعة بنجاح!")
+                st.session_state.all_reviews["master"][farm_id] = new_record
+                st.success("تم حفظ القرار محلياً!")
+
         with save_col2:
+            if SECRET_AIRTABLE_KEY and st.button("☁️ مزامنة مع Airtable", use_container_width=True):
+                new_record = {
+                    "farm_id": farm_id,
+                    "submission_id": sub_id,
+                    "Form_Status": selected_status,
+                    "General_Auditor_Note": auditor_notes,
+                    "Auditor_Name": wd.display_name(st.session_state.current_user),
+                    "Rejected_Items_Count": sum(1 for f in rule_findings if not f["passed"]),
+                    "Consolidated_Comments": "; ".join(f["message"] for f in rule_findings if not f["passed"]),
+                    "Reviewed_At": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
+                air_res = store.sync_to_airtable(
+                    SECRET_AIRTABLE_KEY,
+                    SECRET_AIRTABLE_BASE,
+                    SECRET_AIRTABLE_TABLE,
+                    new_record,
+                )
+                if air_res.get("ok"):
+                    st.success(air_res.get("message"))
+                else:
+                    st.error(air_res.get("message"))
+
+        with save_col3:
             st.caption(
                 f"آخر تحديث: {existing_rev.get('Reviewed_At', 'لم تُراجع بعد')} بواسطة {existing_rev.get('Auditor_Name', '—')}"
             )
@@ -507,17 +602,17 @@ elif nav_choice == "📊 سجل المراجعات وتصدير Excel":
     report_rows = []
 
     for f in raw_farms:
-        fid = f["farm_id"]
+        fid = f.get("farm_id")
         rev = reviews_master.get(fid, {})
-        assign = st.session_state.assignments.get(str(f["_id"]), {})
+        assign = st.session_state.assignments.get(str(f.get("_id")), {})
 
         report_rows.append(
             {
                 "كود المزرعة": fid,
-                "اسم المزرعة": f["farm_name"],
-                "المحافظة": f["governorate"],
-                "المساحة المسجلة": f["farm_area"],
-                "المهندس المراجع": f["engineer_name"],
+                "اسم المزرعة": f.get("farm_name", "—"),
+                "المحافظة": f.get("governorate", "—"),
+                "المساحة المسجلة": f.get("farm_area", 0.0),
+                "المهندس المراجع": f.get("engineer_name", "—"),
                 "المراجع المسند": wd.display_name(assign.get("to")),
                 "قرار الاستمارة": rev.get("Form_Status", "Pending Review"),
                 "اسم المراجع المعتمد": rev.get("Auditor_Name", "—"),
@@ -530,7 +625,6 @@ elif nav_choice == "📊 سجل المراجعات وتصدير Excel":
     df_report = pd.DataFrame(report_rows)
     st.dataframe(df_report, use_container_width=True, hide_index=True)
 
-    # Generate Excel in-memory
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_report.to_excel(writer, index=False, sheet_name="EBDA_Farm_Audit_Report")
@@ -555,9 +649,9 @@ elif nav_choice == "⚖️ التوزيع العادل للمهام":
 
     unval_items = [
         {
-            "subId": str(f["_id"]),
-            "farmCode": f["farm_id"],
-            "governorate": f["governorate"],
+            "subId": str(f.get("_id")),
+            "farmCode": f.get("farm_id"),
+            "governorate": f.get("governorate"),
         }
         for f in raw_farms
     ]

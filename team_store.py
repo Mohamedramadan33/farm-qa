@@ -205,3 +205,76 @@ def sync_to_airtable(
         return {"ok": False, "message": f"رفض Airtable الطلب (كود {resp.status_code}): {resp.text[:250]}"}
     except Exception as e:
         return {"ok": False, "message": f"خطأ في الاتصال بـ Airtable: {e}"}
+
+
+def fetch_kobo_submissions(server_url: str, asset_uid: str, token: str) -> List[Dict[str, Any]]:
+    """
+    Fetches live submissions from KoboToolbox API
+    """
+    if not token or not asset_uid:
+        return []
+    clean_server = server_url.rstrip("/")
+    url = f"{clean_server}/api/v2/assets/{asset_uid}/data.json?limit=3000"
+    headers = {"Authorization": f"Token {token}"}
+    rows: List[Dict[str, Any]] = []
+
+    try:
+        while url:
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code == 401:
+                print("Invalid or expired Kobo Token (401)")
+                break
+            if not resp.ok:
+                print(f"Kobo API error {resp.status_code}")
+                break
+            data = resp.json()
+            results = data.get("results", [])
+            if isinstance(results, list):
+                rows.extend(results)
+            url = data.get("next")
+    except Exception as e:
+        print(f"Error fetching Kobo: {e}")
+    return rows
+
+
+def fetch_airtable_reviews(api_key: str, base_id: str, table_name: str) -> Dict[str, Any]:
+    """
+    Fetches all master review records from Airtable
+    """
+    if not api_key or not base_id or not table_name:
+        return {}
+    url = f"https://api.airtable.com/v0/{base_id}/{table_name}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    reviews: Dict[str, Any] = {}
+
+    try:
+        offset = None
+        while True:
+            params = {}
+            if offset:
+                params["offset"] = offset
+            resp = requests.get(url, headers=headers, params=params, timeout=20)
+            if not resp.ok:
+                break
+            data = resp.json()
+            for rec in data.get("records", []):
+                fields = rec.get("fields", {})
+                fid = str(fields.get("farm_id", "")).strip()
+                if fid:
+                    reviews[fid] = {
+                        "farm_id": fid,
+                        "submission_id": str(fields.get("submission_id", "")),
+                        "Form_Status": str(fields.get("Form_Status", "Pending Review")),
+                        "Rejected_Items_Count": int(fields.get("Rejected_Items_Count", 0) or 0),
+                        "Consolidated_Comments": str(fields.get("Consolidated_Comments", "")),
+                        "General_Auditor_Note": str(fields.get("General_Auditor_Note", "")),
+                        "Auditor_Name": str(fields.get("Auditor_Name", "")),
+                        "Reviewed_At": str(fields.get("Reviewed_At", "")),
+                    }
+            offset = data.get("offset")
+            if not offset:
+                break
+    except Exception as e:
+        print(f"Error fetching Airtable: {e}")
+    return reviews
+
