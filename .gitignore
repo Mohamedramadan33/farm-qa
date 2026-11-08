@@ -1,5 +1,5 @@
-master_form_reviews.csv
-field_level_reviews.csv
-debug_imgs/
+node_modules/
+dist/
+.env
+.env.local
 *.tmp
-__pycache__/

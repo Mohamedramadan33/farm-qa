@@ -1,0 +1,5 @@
+{
+  "name": "EBDA & Kobo — Farm QA Audit",
+  "description": "Agricultural PGS form verification, GPS boundary geometry validation, satellite tree crown audit, and team worklist management.",
+  "requestFramePermissions": []
+}
