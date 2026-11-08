@@ -104,6 +104,27 @@ def save_field_decisions(farm_id: str, field_rows: List[Dict[str, Any]]):
     _save_json(REVIEWS_FILE, data)
 
 
+def save_photo_decision(farm_id: str, photo_key: str, decision: str, comment: str):
+    data = get_all_reviews()
+    if "photos" not in data:
+        data["photos"] = {}
+    fid = str(farm_id)
+    if fid not in data["photos"]:
+        data["photos"][fid] = {}
+    data["photos"][fid][photo_key] = {
+        "decision": decision,
+        "comment": comment,
+        "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    _save_json(REVIEWS_FILE, data)
+
+
+def get_photo_decisions(farm_id: str) -> Dict[str, Any]:
+    data = get_all_reviews()
+    return data.get("photos", {}).get(str(farm_id), {})
+
+
+
 def get_assignments() -> Dict[str, Dict[str, Any]]:
     return _load_json(ASSIGNMENTS_FILE, {})
 

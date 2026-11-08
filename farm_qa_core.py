@@ -155,6 +155,38 @@ def extract_farm_record(raw_sub: Dict[str, Any], idx: int = 0) -> Dict[str, Any]
                     pass
 
     attachments = raw_sub.get("_attachments", [])
+    photos: List[Dict[str, Any]] = []
+
+    # Map filename to human label
+    for att in attachments:
+        fn = str(att.get("filename", "")).strip()
+        url = att.get("download_url") or att.get("download_medium_url") or att.get("download_small_url") or ""
+        mime = str(att.get("mimetype", "")).lower()
+
+        if url and ("image" in mime or any(fn.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"])):
+            title = fn
+            for k, v in flat.items():
+                if str(v).strip() == fn:
+                    leaf = k.split("/")[-1].lower()
+                    if "boundary" in leaf or "tree" in leaf or "شجر" in leaf:
+                        title = "صورة أشجار الحدود"
+                    elif "soil" in leaf or "تربة" in leaf:
+                        title = "صورة عينة التربة"
+                    elif "tenure" in leaf or "حيازة" in leaf:
+                        title = "صورة الحيازة / الملكية"
+                    elif "committee" in leaf or "لجنة" in leaf:
+                        title = "صورة لجنة المعاينة"
+                    elif "crop" in leaf or "محصول" in leaf:
+                        title = "صورة المحصول"
+                    else:
+                        title = f"صورة: {k.split('/')[-1]}"
+                    break
+            photos.append({
+                "filename": fn,
+                "url": url,
+                "title": title,
+                "mimetype": mime,
+            })
 
     return {
         "_id": raw_sub.get("_id", idx + 1),
@@ -178,8 +210,10 @@ def extract_farm_record(raw_sub: Dict[str, Any], idx: int = 0) -> Dict[str, Any]
         "gps_polygon": gps_poly,
         "soil_points": "; ".join(soil_points_list),
         "attachments": attachments,
+        "photos": photos,
         "flat": flat,
     }
+
 
 
 def parse_polygon_coords(poly_str: Any) -> Tuple[Optional[List[Tuple[float, float]]], bool]:
