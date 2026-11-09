@@ -885,10 +885,11 @@ def analyze_farm_satellite_canopy(
     area_feddan: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Automatic Full-Parcel Tree Detection across entire farm area (interior + boundary):
-    - Uses fixed standard agronomic distances automatically from tree type.
-    - Scans the entire parcel polygon area (not just the boundary).
-    - Detects optical crown peaks (ExG local maxima) with zero manual inputs required.
+    High-Precision Automatic Tree Detection across full parcel area (interior + boundary):
+    - Uses fixed agronomic standard distances automatically from tree type.
+    - Adaptively scales tile zoom to fit parcel size (e.g. 5 feddans vs 100+ feddans).
+    - Detects optical crown peaks using local ExG contrast & prominence.
+    - Generates BOTH clean natural satellite image and annotated tree detection image.
     """
     # 1. Automatic fixed standard agronomic spacing
     if custom_spacing_m is not None and custom_spacing_m > 0:
@@ -905,6 +906,7 @@ def analyze_farm_satellite_canopy(
             "forecast": 0,
             "imagery_date": "غير متاح",
             "annotated_img": None,
+            "clean_img": None,
             "spacing_m": spacing_m,
             "tree_points": [],
         }
@@ -919,11 +921,25 @@ def analyze_farm_satellite_canopy(
 
     imagery_date = fetch_satellite_capture_date(center_lon, center_lat)
 
+    # Calculate real-world parcel dimensions in meters
+    d_lat_m = abs(max_lat - min_lat) * 111139.0
+    d_lon_m = abs(max_lon - min_lon) * 111139.0 * math.cos(math.radians(center_lat))
+    max_span_m = max(d_lat_m, d_lon_m)
+
+    # Adaptive Zoom based on real farm footprint (e.g. 5 feddans vs 100 feddans)
+    if max_span_m > 1100:
+        zoom = 16  # Large farms (> 80 feddans)
+    elif max_span_m > 380:
+        zoom = 17  # Medium-large farms (15 - 80 feddans)
+    else:
+        zoom = 18  # Small-medium parcels (< 15 feddans)
+
     x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
     x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
 
-    if abs(x2 - x1) > 1 or abs(y2 - y1) > 1:
-        zoom = 17
+    # Clamp tile range to max 3x3 to guarantee ultra-fast fetch and zero memory bloat
+    if abs(x2 - x1) >= 4 or abs(y2 - y1) >= 4:
+        zoom = max(15, zoom - 1)
         x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
         x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
 
@@ -961,13 +977,16 @@ def analyze_farm_satellite_canopy(
     r = arr[:, :, 0]
     g = arr[:, :, 1]
     b = arr[:, :, 2]
+
+    # Optical Indices: Excess Green & Chlorophyll Ratio
     exg = 2.0 * g - r - b
+    is_plant = (g > r * 1.02) & (g > b * 0.95) & (exg > 4.0)
 
     parcel_mask = np.array(parcel_mask_img) > 0
     total_parcel_pixels = int(np.sum(parcel_mask))
 
     if total_parcel_pixels > 0 and has_tile:
-        veg_pixels = (exg > 8.0) & parcel_mask
+        veg_pixels = is_plant & parcel_mask
         veg_pct = round(float(np.sum(veg_pixels) / total_parcel_pixels * 100.0), 1)
     else:
         veg_pct = 50.0
@@ -980,18 +999,25 @@ def analyze_farm_satellite_canopy(
 
     px_per_m = total_px_len / max(perimeter_m, 1.0)
     spacing_px = max(6.0, spacing_m * px_per_m)
-    search_r = max(2, int(spacing_px * 0.40))
+    search_r = max(2, int(spacing_px * 0.45))
 
-    annotated = stitched.copy()
+    # --- 1. CLEAN SATELLITE IMAGE (صورة نقية طبيعية مع حدود المزرعة فقط وبدون علامات) ---
+    clean_img = stitched.copy()
+    draw_clean = ImageDraw.Draw(clean_img)
+    draw_clean.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
+    # Clean image header banner
+    draw_clean.rectangle([0, 0, width_px, 32], fill=(15, 23, 42))
+    header_clean = f"SATELLITE VIEW (CLEAN) | Farm Boundary GPS | Date: {imagery_date or 'Recent'}"
+    draw_clean.text((12, 9), header_clean, fill=(0, 255, 200))
+
+    # --- 2. ANNOTATED TREE DETECTION IMAGE (صورة مرصود ومحدد عليها الأشجار) ---
+    annotated = clean_img.copy()
     draw_ann = ImageDraw.Draw(annotated)
-
-    # 1. Draw boundary line around the farm
-    draw_ann.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
 
     placed_points: List[Tuple[int, int]] = []
     tree_points_coords: List[Dict[str, Any]] = []
 
-    # 2. Scan entire parcel interior (بكامل مساحة المزرعة من الداخل)
+    # Scan parcel interior with optical peak prominence
     min_x = max(0, min(p[0] for p in poly_px))
     max_x = min(width_px - 1, max(p[0] for p in poly_px))
     min_y = max(0, min(p[1] for p in poly_px))
@@ -1008,17 +1034,25 @@ def analyze_farm_satellite_canopy(
                 win_x2 = min(width_px, gx + search_r + 1)
                 sub_exg = exg[win_y1:win_y2, win_x1:win_x2]
                 sub_mask = parcel_mask[win_y1:win_y2, win_x1:win_x2]
-                if np.any(sub_mask):
-                    masked_exg = np.where(sub_mask, sub_exg, -999.0)
+                sub_plant = is_plant[win_y1:win_y2, win_x1:win_x2]
+
+                valid_sub = sub_mask & sub_plant
+                if np.any(valid_sub):
+                    masked_exg = np.where(valid_sub, sub_exg, -999.0)
                     max_pos = np.unravel_index(np.argmax(masked_exg), masked_exg.shape)
                     peak_val = masked_exg[max_pos]
-                    if peak_val > 6.0:  # Green foliage peak
+
+                    # Local prominence check (peak must stand out from neighborhood)
+                    local_mean = np.mean(sub_exg[sub_mask]) if np.any(sub_mask) else 0.0
+                    prominence = peak_val - local_mean
+
+                    if peak_val > 10.0 or (peak_val > 6.0 and prominence > 2.0):
                         cand_y = win_y1 + int(max_pos[0])
                         cand_x = win_x1 + int(max_pos[1])
-                        if not any(math.hypot(cand_x - px, cand_y - py) < (spacing_px * 0.65) for px, py in placed_points):
+                        if not any(math.hypot(cand_x - px, cand_y - py) < (spacing_px * 0.70) for px, py in placed_points):
                             placed_points.append((cand_x, cand_y))
 
-    # 3. Scan boundary edges (مصدات الرياح والأشجار الحدودية)
+    # Scan boundary edges for windbreak trees
     for i in range(len(poly_px) - 1):
         pA, pB = poly_px[i], poly_px[i + 1]
         seg_len = math.hypot(pB[0] - pA[0], pB[1] - pA[1])
@@ -1039,14 +1073,15 @@ def analyze_farm_satellite_canopy(
                 if sub_exg[max_pos] > 6.0:
                     cand_y = win_y1 + int(max_pos[0])
                     cand_x = win_x1 + int(max_pos[1])
-                    if not any(math.hypot(cand_x - px, cand_y - py) < (spacing_px * 0.60) for px, py in placed_points):
+                    if not any(math.hypot(cand_x - px, cand_y - py) < (spacing_px * 0.65) for px, py in placed_points):
                         placed_points.append((cand_x, cand_y))
 
-    # Draw tree points & badges
+    # Draw tree crown markers & badges
     step_badge = max(10, len(placed_points) // 10) if len(placed_points) > 20 else 1
     for t_idx, (tx, ty) in enumerate(placed_points):
         tree_id = t_idx + 1
         r_mark = 4
+        # Glowing green circular marker with black border
         draw_ann.ellipse([tx - r_mark - 1, ty - r_mark - 1, tx + r_mark + 1, ty + r_mark + 1], fill=(0, 0, 0))
         draw_ann.ellipse([tx - r_mark, ty - r_mark, tx + r_mark, ty + r_mark], fill=(34, 197, 94))
 
@@ -1067,7 +1102,7 @@ def analyze_farm_satellite_canopy(
 
     final_ai_count = len(placed_points)
 
-    # Header stats overlay banner on the image
+    # Annotated header stats overlay banner
     banner_h = 36
     draw_ann.rectangle([0, 0, width_px, banner_h], fill=(15, 23, 42))
     header_text = f"ALL-AREA TREE COUNT: {final_ai_count} trees | Fixed Spacing: {spacing_m}m | Veg: {veg_pct}% | Date: {imagery_date or 'Recent'}"
@@ -1081,6 +1116,7 @@ def analyze_farm_satellite_canopy(
         "forecast": final_ai_count,
         "imagery_date": imagery_date or "حديث",
         "annotated_img": annotated,
+        "clean_img": clean_img,
         "spacing_m": spacing_m,
         "tree_points": tree_points_coords,
     }

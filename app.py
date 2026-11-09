@@ -666,8 +666,81 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
 elif nav_choice == "🌾 فحص المزرعة الشامل والصور والأشجار":
     st.header("🌾 فحص المزرعة الشامل — القياسات، الأشجار، الصور وقواعد PGS")
 
-    farm_keys = {f"{f.get('farm_id')} — {f.get('farm_name')} ({f.get('governorate')})": f for f in raw_farms}
-    selected_farm_label = st.selectbox("اختر المزرعة للمعاينة والتدقيق:", options=list(farm_keys.keys()))
+    # 🔍 Search & Validation Filter for Farm Inspection
+    s_col_v2_1, s_col_v2_2 = st.columns([3, 1.5])
+    with s_col_v2_1:
+        farm_search_query = st.text_input(
+            "🔍 ابحث عن المزرعة للمعاينة والتدقيق (بالكود، الاسم، المحافظة، المزارع، المهندس):",
+            placeholder="مثال: EG/308 أو Abou-Madawy أو البحيرة أو بشار...",
+            key="v2_farm_search_input",
+        ).strip().lower()
+    with s_col_v2_2:
+        val_filter_v2 = st.selectbox(
+            "تصفية بحالة الاعتماد (Validation):",
+            ["الكل (Show all)", "Approved (معتمد)", "On hold (معلق)", "Not approved (مرفوض)", "- (غير محدد)"],
+            key="v2_val_filter_box",
+        )
+
+    # Filter raw_farms based on search query & validation status
+    search_results = []
+    for f in raw_farms:
+        if not f or not isinstance(f, dict):
+            continue
+        fid = str(f.get("farm_id", ""))
+        fname = str(f.get("farm_name", ""))
+        gov = str(f.get("governorate", ""))
+        farmer = str(f.get("rep_name", ""))
+        eng = str(f.get("engineer_name", ""))
+
+        v_info = core.normalize_kobo_validation_status(f.get("_validation_status"))
+        v_code = v_info["code"]
+
+        # Validation status filter
+        if val_filter_v2 == "Approved (معتمد)" and v_code != "approved":
+            continue
+        elif val_filter_v2 == "On hold (معلق)" and v_code != "on_hold":
+            continue
+        elif val_filter_v2 == "Not approved (مرفوض)" and v_code != "not_approved":
+            continue
+        elif val_filter_v2 == "- (غير محدد)" and v_code != "unvalidated":
+            continue
+
+        # Search query check
+        if farm_search_query:
+            corpus = f"{fid} {fname} {gov} {farmer} {eng}".lower()
+            if farm_search_query not in corpus:
+                continue
+
+        search_results.append(f)
+
+    if not search_results:
+        st.warning("⚠️ لا توجد مزارع مطابقة لكلمات البحث أو الفلتر المختار. يتم عرض جميع المزارع.")
+        search_results = raw_farms
+
+    # Construct farm choices with clear Validation status in every option
+    farm_keys = {}
+    for f in search_results:
+        fid = str(f.get("farm_id", "—"))
+        fname = str(f.get("farm_name", "—"))
+        gov = str(f.get("governorate", "—"))
+        v_info = core.normalize_kobo_validation_status(f.get("_validation_status"))
+        if v_info["code"] == "approved":
+            v_badge = "[Approved ✅]"
+        elif v_info["code"] == "not_approved":
+            v_badge = "[Not approved ❌]"
+        elif v_info["code"] == "on_hold":
+            v_badge = "[On hold ⏳]"
+        else:
+            v_badge = "[- ⚪]"
+
+        display_label = f"{fid} — {fname} — {v_badge} ({gov})"
+        farm_keys[display_label] = f
+
+    selected_farm_label = st.selectbox(
+        "اختر المزرعة للمعاينة والتدقيق (من نتائج البحث):",
+        options=list(farm_keys.keys()),
+        help="تظهر حالة Validation المعتمدة في Kobo لكل مزرعة بجانب الكود والاسم.",
+    )
     farm = farm_keys[selected_farm_label]
 
     sub_id = str(farm.get("_id", ""))
@@ -675,9 +748,10 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
     reviews_master = st.session_state.all_reviews.get("master", {})
     existing_rev = reviews_master.get(farm_id, {})
     current_assign = st.session_state.assignments.get(sub_id, {}).get("to", "غير مسند")
+    val_status_farm = core.normalize_kobo_validation_status(farm.get("_validation_status"))
 
-    # Header Card
-    h_col1, h_col2, h_col3, h_col4, h_col5 = st.columns(5)
+    # Header Cards (6 Columns with dedicated Validation status card)
+    h_col1, h_col2, h_col3, h_col4, h_col5, h_col6 = st.columns(6)
     with h_col1:
         st.metric("كود المزرعة", farm.get("farm_id", "—"))
     with h_col2:
@@ -688,6 +762,8 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         st.metric("مهندس المعاينة", farm.get("engineer_name", "—"))
     with h_col5:
         st.metric("المراجع المسند", wd.display_name(current_assign))
+    with h_col6:
+        st.metric("اعتماد Kobo (Validation)", val_status_farm["label_en"], val_status_farm["label_ar"])
 
     st.markdown("---")
 
@@ -772,13 +848,59 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             else:
                 st.warning(f"⚠️ تم رصد {ai_trees} شجرة بالقمر الصناعي بكامل المساحة مقابل {kobo_trees} شجرة مسجلة بالاستمارة (عجز {abs(diff)}-).")
 
-        # High-Resolution Satellite Image with Counted Trees Drawn Across the Entire Farm Parcel
-        if canopy_result.get("annotated_img") is not None:
-            st.markdown("##### 🛰️ صورة القمر الصناعي محدد عليها الأشجار المرصودة بكامل مساحة المزرعة والحدود:")
-            safe_image(
-                canopy_result["annotated_img"],
-                caption=f"صورة القمر الصناعي — تم رصد وتحديد {canopy_result['ai_count']} شجرة عبر كامل مساحة مضلع المزرعة والحدود (مسافة ثابتة: {canopy_result['spacing_m']} متر)",
-            )
+        # High-Resolution Satellite Image Display: With Trees vs Clean Without Trees
+        st.markdown("---")
+        st.markdown("##### 🛰️ استعراض صور القمر الصناعي للمزرعة (مع الأشجار أو صورة نقية):")
+
+        img_view_mode = st.radio(
+            "اختر طريقة عرض صورة القمر الصناعي:",
+            [
+                "🌲 صورة القمر الصناعي مع رصد وترقيم الأشجار (AI)",
+                "🛰️ صورة القمر الصناعي الطبيعية النقية (بدون علامات شجر)",
+                "🔄 عرض الصورتين جنباً إلى جنب (مقارنة بصرية شاملة)",
+            ],
+            index=0,
+            horizontal=True,
+            key=f"img_view_mode_{farm_id}",
+        )
+
+        has_annotated = canopy_result.get("annotated_img") is not None
+        has_clean = canopy_result.get("clean_img") is not None
+
+        if img_view_mode == "🌲 صورة القمر الصناعي مع رصد وترقيم الأشجار (AI)":
+            if has_annotated:
+                safe_image(
+                    canopy_result["annotated_img"],
+                    caption=f"🌲 صورة القمر الصناعي مع رصد وترقيم {canopy_result['ai_count']} شجرة عبر كامل مساحة مضلع المزرعة والحدود (مسافة ثابتة: {canopy_result['spacing_m']} متر)",
+                )
+            else:
+                st.info("جاري تجهيز الصورة الفضائية للمزرعة...")
+
+        elif img_view_mode == "🛰️ صورة القمر الصناعي الطبيعية النقية (بدون علامات شجر)":
+            if has_clean:
+                safe_image(
+                    canopy_result["clean_img"],
+                    caption=f"🛰️ صورة القمر الصناعي الطبيعية النقية — حدود مضلع المزرعة فقط بدون علامات شجر لفحص الطبيعة والأرضية بالعين المجردة",
+                )
+            elif has_annotated:
+                safe_image(canopy_result["annotated_img"])
+            else:
+                st.info("جاري تجهيز الصورة الفضائية للمزرعة...")
+
+        elif img_view_mode == "🔄 عرض الصورتين جنباً إلى جنب (مقارنة بصرية شاملة)":
+            side_col1, side_col2 = st.columns(2)
+            with side_col1:
+                st.markdown("**🛰️ الصورة الطبيعية النقية (بدون علامات):**")
+                if has_clean:
+                    safe_image(canopy_result["clean_img"], caption="الصورة الأصلية مع حدود المزرعة فقط")
+                else:
+                    st.info("الصورة غير متاحة")
+            with side_col2:
+                st.markdown(f"**🌲 الصورة مع رصد الأشجار ({canopy_result['ai_count']} شجرة):**")
+                if has_annotated:
+                    safe_image(canopy_result["annotated_img"], caption=f"رصد وترقيم {canopy_result['ai_count']} شجرة (AI)")
+                else:
+                    st.info("الصورة غير متاحة")
 
         st.markdown("---")
         st.subheader("📐 مضلع GPS وخريطة المزرعة التفاعلية (مع نقاط الأشجار)")
