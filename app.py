@@ -251,7 +251,8 @@ def load_kobo_data(token: str, server_url: str, asset_uid: str) -> List[Dict[str
     raw_list = store.fetch_kobo_submissions(server_url, asset_uid, token)
     if not raw_list:
         return []
-    return [core.extract_farm_record(r, idx) for idx, r in enumerate(raw_list)]
+    schema_labels = store.fetch_kobo_asset_schema(server_url, asset_uid, token)
+    return [core.extract_farm_record(r, idx, schema_labels=schema_labels) for idx, r in enumerate(raw_list)]
 
 
 @st.cache_data(ttl=3600)
@@ -837,24 +838,35 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         else:
             for p_idx, p_item in enumerate(farm_photos):
                 fn = p_item.get("filename", f"photo_{p_idx+1}")
-                title = p_item.get("title", fn)
+                clean_fn = p_item.get("clean_filename") or (fn.split("/")[-1] if "/" in fn else fn)
+                title = p_item.get("title") or f"صورة المعاينة الميدانية {p_idx+1}"
+                field_key = p_item.get("field_key", "")
+                section = p_item.get("section", "")
                 url = p_item.get("url", "")
-                existing_p_dec = photo_decisions.get(fn, {})
+                existing_p_dec = photo_decisions.get(clean_fn, {}) or photo_decisions.get(fn, {})
 
                 with st.container():
                     st.markdown(f"#### 📷 {p_idx+1}. {title}")
+                    meta_badges = []
+                    if section:
+                        meta_badges.append(f"🏷️ **القسم:** {section}")
+                    if field_key:
+                        meta_badges.append(f"📌 **سؤال الاستمارة:** `{field_key}`")
+                    meta_badges.append(f"📁 **اسم الملف:** `{clean_fn}`")
+                    st.caption(" | ".join(meta_badges))
+
                     col_img, col_act = st.columns([1.5, 2])
 
                     with col_img:
                         if "kobotoolbox" in url or "kf.kobo" in url:
                             img_bytes = fetch_authenticated_kobo_image(url, token_to_use)
                             if img_bytes:
-                                safe_image(Image.open(BytesIO(img_bytes)), caption=fn)
+                                safe_image(Image.open(BytesIO(img_bytes)), caption=f"{title}")
                             else:
                                 st.caption("تعذر تحميل الصورة مباشرة من Kobo. اضغط للفتح بالمتصفح:")
-                                st.markdown(f"[🔗 فتح الصورة ({fn})]({url})")
+                                st.markdown(f"[🔗 فتح الصورة ({clean_fn})]({url})")
                         else:
-                            safe_image(url, caption=fn)
+                            safe_image(url, caption=f"{title}")
 
                     with col_act:
                         dec_options = ["مقبول", "مرفوض", "يحتاج تعديل", "استيضاح"]
@@ -862,7 +874,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                         dec_idx = dec_options.index(curr_dec) if curr_dec in dec_options else 0
 
                         p_choice = st.radio(
-                            f"قرار السؤال / الصورة ({fn}):",
+                            f"قرار الاعتماد ({title}):",
                             options=dec_options,
                             index=dec_idx,
                             horizontal=True,
@@ -872,11 +884,12 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                         p_comment = st.text_input(
                             f"سبب التعليق / الملاحظة على {title}:",
                             value=existing_p_dec.get("comment", ""),
-                            placeholder="مثال: الصورة واضحة / غير واضحة / تحتاج إعادة التقاط...",
+                            placeholder="مثال: الصورة واضحة ومطابقة / تحتاج استيضاح / غير مطابقة...",
                             key=f"p_com_{farm_id}_{p_idx}",
                         )
 
                         if st.button(f"💾 حفظ قرار وتعليق الصورة {p_idx+1}", key=f"btn_save_p_{farm_id}_{p_idx}"):
+                            store.save_photo_decision(farm_id, clean_fn, p_choice, p_comment)
                             store.save_photo_decision(farm_id, fn, p_choice, p_comment)
                             st.success(f"تم حفظ تعليق وقرار '{title}' بنجاح!")
 

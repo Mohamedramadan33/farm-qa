@@ -258,6 +258,48 @@ def fetch_kobo_submissions(server_url: str, asset_uid: str, token: str) -> List[
     return rows
 
 
+def fetch_kobo_asset_schema(server_url: str, asset_uid: str, token: str) -> Dict[str, str]:
+    """
+    Fetches the KoboToolbox asset survey questions to map question/field keys directly
+    to the human Arabic titles defined in the form.
+    """
+    if not token or not asset_uid:
+        return {}
+    clean_server = server_url.rstrip("/")
+    url = f"{clean_server}/api/v2/assets/{asset_uid}.json"
+    headers = {"Authorization": f"Token {token}"}
+    labels_map: Dict[str, str] = {}
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.ok:
+            data = resp.json()
+            survey = data.get("content", {}).get("survey", [])
+            for q in survey:
+                name = q.get("name") or q.get("$autoname")
+                label_val = q.get("label")
+                if not name or not label_val:
+                    continue
+                clean_lbl = ""
+                if isinstance(label_val, str):
+                    clean_lbl = label_val.strip()
+                elif isinstance(label_val, list) and label_val:
+                    clean_lbl = str(label_val[0]).strip()
+                elif isinstance(label_val, dict):
+                    clean_lbl = (
+                        label_val.get("Arabic (ar)")
+                        or label_val.get("Arabic")
+                        or label_val.get("ar")
+                        or list(label_val.values())[0]
+                    )
+                    clean_lbl = str(clean_lbl).strip() if clean_lbl else ""
+                if clean_lbl:
+                    labels_map[name] = clean_lbl
+                    labels_map[name.split("/")[-1]] = clean_lbl
+    except Exception as e:
+        print(f"Error fetching Kobo asset schema: {e}")
+    return labels_map
+
+
 def fetch_airtable_reviews(api_key: str, base_id: str, table_name: str) -> Dict[str, Any]:
     """
     Fetches all master review records from Airtable

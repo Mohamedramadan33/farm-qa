@@ -73,7 +73,310 @@ def flatten_dict(d: Any, parent: str = '', sep: str = '/') -> Dict[str, Any]:
     return items
 
 
-def extract_farm_record(raw_sub: Dict[str, Any], idx: int = 0) -> Dict[str, Any]:
+KOBO_QUESTION_LABELS: Dict[str, Tuple[str, str]] = {
+    # Basic & Farm Info
+    'farm_id': ('كود المزرعة', 'البيانات الأساسية'),
+    'at_house/farm_id': ('كود المزرعة', 'البيانات الأساسية'),
+    'farm_name': ('اسم المزرعة', 'البيانات الأساسية'),
+    'at_house/farm_name': ('اسم المزرعة', 'البيانات الأساسية'),
+    'engineer_name': ('اسم المهندس المراجع', 'بيانات المهندس والزيارة'),
+    'engineer_data/engineer_name': ('اسم المهندس المراجع', 'بيانات المهندس والزيارة'),
+    '__002': ('المحافظة', 'بيانات المهندس والزيارة'),
+    'engineer_data/__002': ('المحافظة', 'بيانات المهندس والزيارة'),
+    'governorate': ('المحافظة', 'بيانات المهندس والزيارة'),
+    'visit_date': ('تاريخ الزيارة الميدانية', 'بيانات المهندس والزيارة'),
+    'engineer_data/visit_date': ('تاريخ الزيارة الميدانية', 'بيانات المهندس والزيارة'),
+    'audit_type': ('نوع الزيارة والتفتيش', 'بيانات المهندس والزيارة'),
+    'engineer_data/audit_type': ('نوع الزيارة والتفتيش', 'بيانات المهندس والزيارة'),
+    '__010': ('الموسم الزراعي', 'بيانات المهندس والزيارة'),
+    'engineer_data/__010': ('الموسم الزراعي', 'بيانات المهندس والزيارة'),
+    'season': ('الموسم الزراعي', 'بيانات المهندس والزيارة'),
+    'rep_name': ('اسم المزارع / ممثل المزرعة', 'بيانات المزرعة والمزارع'),
+    'farm_details/rep_name': ('اسم المزارع / ممثل المزرعة', 'بيانات المزرعة والمزارع'),
+    'rep_phone': ('رقم تليفون ممثل المزرعة', 'بيانات المزرعة والمزارع'),
+    'farm_details/rep_phone': ('رقم تليفون ممثل المزرعة', 'بيانات المزرعة والمزارع'),
+    '__009': ('نوع الملكية (فردية / مجموعة مزارعين)', 'بيانات المزرعة والمزارع'),
+    'farm_details/__009': ('نوع الملكية (فردية / مجموعة مزارعين)', 'بيانات المزرعة والمزارع'),
+
+    # Area & Boundaries
+    'farm_area': ('إجمالي المساحة بالفدان', 'المساحة والحدود'),
+    'farm_details/farm_area': ('إجمالي المساحة بالفدان', 'المساحة والحدود'),
+    'gps_outline_of_farm': ('إحداثيات حدود المزرعة GPS', 'المساحة والحدود'),
+    'farm_details/gps_outline_of_farm': ('إحداثيات حدود المزرعة GPS', 'المساحة والحدود'),
+
+    # Soil & Irrigation
+    '__047': ('نوع التربة', 'التربة والري'),
+    'farm_details/__047': ('نوع التربة', 'التربة والري'),
+    'soil_type': ('نوع التربة', 'التربة والري'),
+    '__048': ('طريقة ونظام الري', 'التربة والري'),
+    'farm_details/__048': ('طريقة ونظام الري', 'التربة والري'),
+    'irrig_type': ('طريقة ونظام الري', 'التربة والري'),
+    'irrigation_amount_feddan_year': ('كمية الاستهلاك المائي (م3/فدان/سنة)', 'التربة والري'),
+    'sample_point': ('إحداثيات نقاط أخذ عينات التربة GPS', 'التربة والري'),
+    'soil_samples/sample_point': ('إحداثيات نقاط أخذ عينات التربة GPS', 'التربة والري'),
+    'soil_photo': ('صورة سحب عينة التربة الميدانية', 'التربة والري'),
+    'soil_samples/soil_photo': ('صورة سحب عينة التربة الميدانية', 'التربة والري'),
+
+    # Trees & Boundary
+    'tree_type': ('نوع شجر الحدود ومصدات الرياح', 'أشجار الحدود ومصدات الرياح'),
+    'boundary_trees/tree_type': ('نوع شجر الحدود ومصدات الرياح', 'أشجار الحدود ومصدات الرياح'),
+    'tree_number': ('عدد أشجار الحدود المسجل بالمعاينة', 'أشجار الحدود ومصدات الرياح'),
+    'boundary_trees/tree_number': ('عدد أشجار الحدود المسجل بالمعاينة', 'أشجار الحدود ومصدات الرياح'),
+    'boundary_photo': ('صورة أشجار الحدود ومصدات الرياح', 'أشجار الحدود ومصدات الرياح'),
+    'boundary_trees/boundary_photo': ('صورة أشجار الحدود ومصدات الرياح', 'أشجار الحدود ومصدات الرياح'),
+    'trees_photo': ('صورة أشجار الحدود ومصدات الرياح', 'أشجار الحدود ومصدات الرياح'),
+    'windbreak_photo': ('صورة مصدات الرياح المحيطة', 'أشجار الحدود ومصدات الرياح'),
+
+    # Compost & Organic Fertilizers (SEKEM / EBDA / PGS)
+    'compost_photo': ('صورة كومة الكومبوست والتسميد العضوي', 'الكومبوست والتسميد العضوي'),
+    'group_compost/compost_photo': ('صورة كومة الكومبوست والتسميد العضوي', 'الكومبوست والتسميد العضوي'),
+    'compost/compost_photo': ('صورة كومة الكومبوست والتسميد العضوي', 'الكومبوست والتسميد العضوي'),
+    'compost/photo': ('صورة كومة الكومبوست والتسميد العضوي', 'الكومبوست والتسميد العضوي'),
+    'compost_pile_photo': ('صورة كومة الكومبوست والتسميد العضوي', 'الكومبوست والتسميد العضوي'),
+    'group_compost/photo': ('صورة كومة الكومبوست والتسميد العضوي', 'الكومبوست والتسميد العضوي'),
+    'compost_source': ('مصدر مواد وخامات الكومبوست', 'الكومبوست والتسميد العضوي'),
+    'group_compost/compost_source': ('مصدر مواد وخامات الكومبوست', 'الكومبوست والتسميد العضوي'),
+    'compost_turnings': ('عدد مرات تقليب كومة الكومبوست', 'الكومبوست والتسميد العضوي'),
+    'group_compost/compost_turnings': ('عدد مرات تقليب كومة الكومبوست', 'الكومبوست والتسميد العضوي'),
+    'fertilizer_photo': ('صورة التسميد والأسمدة العضوية', 'الكومبوست والتسميد العضوي'),
+    'organic_fertilizer': ('نوع ومصدر السماد العضوي المستخدم', 'الكومبوست والتسميد العضوي'),
+
+    # Water, Well & Solar
+    'well_photo': ('صورة بئر مياه الري / محطة الرفع', 'التربة والري'),
+    'water_source_photo': ('صورة مصدر مياه الري والتحليل', 'التربة والري'),
+    'irrigation_photo': ('صورة شبكة ومحابس الري', 'التربة والري'),
+    'group_irrigation/well_photo': ('صورة بئر مياه الري / محطة الرفع', 'التربة والري'),
+    'solar_photo': ('صورة محطة وألواح الطاقة الشمسية', 'الطاقة والبنية التحتية'),
+    'solar_panels_photo': ('صورة محطة وألواح الطاقة الشمسية', 'الطاقة والبنية التحتية'),
+    'group_solar/solar_photo': ('صورة محطة وألواح الطاقة الشمسية', 'الطاقة والبنية التحتية'),
+
+    # Storage & Warehouse
+    'storage_photo': ('صورة مخزن المزرعة وخلوه من الكيماويات', 'المستودعات والمخازن'),
+    'warehouse_photo': ('صورة مخزن المزرعة وخلوه من الكيماويات', 'المستودعات والمخازن'),
+    'group_storage/storage_photo': ('صورة مخزن المزرعة وخلوه من الكيماويات', 'المستودعات والمخازن'),
+    'pesticide_storage_photo': ('صورة فحص المخزن للتأكد من خلوه من المبيدات', 'المستودعات والمخازن'),
+
+    # Animals & Livestock
+    'animal_photo': ('صورة حظيرة الماشية والإنتاج الحيواني', 'الإنتاج الحيواني'),
+    'barn_photo': ('صورة حظيرة الماشية والإنتاج الحيواني', 'الإنتاج الحيواني'),
+    'livestock_photo': ('صورة الماشية والحيوانات بالمزرعة', 'الإنتاج الحيواني'),
+
+    # Crops & Farm Land
+    'crop_photo': ('صورة المحصول المنزرع وحالة النباتات', 'المحصول والعمليات الزراعية'),
+    'field_photo': ('صورة الحقل والأرض المنزرعة', 'المحصول والعمليات الزراعية'),
+    'farm_overview_photo': ('صورة عامة للمزرعة وبيئتها', 'المحصول والعمليات الزراعية'),
+
+    # Buffer Zone & Surroundings
+    'buffer_photo': ('صورة المنطقة العازلة ومزارع الجيران', 'المنطقة العازلة ومخاطر التلوث'),
+    'buffer_zone_photo': ('صورة المنطقة العازلة ومزارع الجيران', 'المنطقة العازلة ومخاطر التلوث'),
+    'neighbor_photo': ('صورة أنشطة المزارع المجاورة', 'المنطقة العازلة ومخاطر التلوث'),
+    'contamination_risk_photo': ('صورة تقييم مخاطر التلوث من الجوار', 'المنطقة العازلة ومخاطر التلوث'),
+
+    # Bio-Dynamic Preparations
+    'bd_prep_photo': ('صورة مستحضرات الزراعة الحيوية (BD Preps)', 'الزراعة الحيوية والبيوديناميك'),
+    'preparation_photo': ('صورة تجهيز مستحضرات البيوديناميك', 'الزراعة الحيوية والبيوديناميك'),
+
+    # Legal & Documentation
+    'tenure_photo': ('صورة الحيازة الزراعية / عقد الملكية أو الإيجار', 'المستندات والحيازات'),
+    'docs/tenure_photo': ('صورة الحيازة الزراعية / عقد الملكية أو الإيجار', 'المستندات والحيازات'),
+    'contract_photo': ('صورة عقد الملكية أو الإيجار', 'المستندات والحيازات'),
+    'id_photo': ('صورة بطاقة الرقم القومي للمزارع', 'المستندات والحيازات'),
+    'biodiversity_doc': ('بيان خطة التنوع الحيوي والمحميات', 'المستندات والحيازات'),
+    'docs/biodiversity_doc': ('بيان خطة التنوع الحيوي والمحميات', 'المستندات والحيازات'),
+    'biodiversity_photo': ('صورة التنوع الحيوي والمناطق الطبيعية', 'المستندات والحيازات'),
+    'gmo_doc': ('إقرار عدم استخدام تقاوي معدلة وراثياً (GMO)', 'المستندات والحيازات'),
+    'docs/gmo_doc': ('إقرار عدم استخدام تقاوي معدلة وراثياً (GMO)', 'المستندات والحيازات'),
+    'ledger_photo': ('صورة سجل المزرعة وعمليات التسميد والري', 'المستندات والحيازات'),
+    'docs/ledger_photo': ('صورة سجل المزرعة وعمليات التسميد والري', 'المستندات والحيازات'),
+
+    # Audit Committee
+    'committee_photo': ('صورة أعضاء لجنة المعاينة والتفتيش', 'لجنة المراجعة والتفتيش'),
+    'member_photo_1': ('صورة عضو لجنة المراجعة 1', 'لجنة المراجعة والتفتيش'),
+    'member_photo_2': ('صورة عضو لجنة المراجعة 2', 'لجنة المراجعة والتفتيش'),
+    'member_photo_3': ('صورة عضو لجنة المراجعة 3', 'لجنة المراجعة والتفتيش'),
+
+    # Audit Notes & Decisions
+    'non_compliance': ('حالات عدم المطابقة المرصودة', 'ملاحظات وتوصيات التفتيش'),
+    'audit_notes/non_compliance': ('حالات عدم المطابقة المرصودة', 'ملاحظات وتوصيات التفتيش'),
+    'corrective_measures': ('الإجراءات التصحيحية المتفق عليها', 'ملاحظات وتوصيات التفتيش'),
+    'audit_notes/corrective_measures': ('الإجراءات التصحيحية المتفق عليها', 'ملاحظات وتوصيات التفتيش'),
+    'auditors_recommendations': ('توصيات وقرارات لجنة المراجعة', 'ملاحظات وتوصيات التفتيش'),
+    'audit_notes/auditors_recommendations': ('توصيات وقرارات لجنة المراجعة', 'ملاحظات وتوصيات التفتيش'),
+}
+
+
+def clean_kobo_semantic_title(key: str) -> Tuple[str, str]:
+    """
+    Translates any Kobo question field key into a clear Arabic title and section.
+    """
+    if not key:
+        return "صورة مرفقة بالمعاينة", "الصور والمرفقات الميدانية"
+
+    leaf = key.split("/")[-1].lower()
+    full = key.lower()
+
+    if key in KOBO_QUESTION_LABELS:
+        return KOBO_QUESTION_LABELS[key]
+    if leaf in KOBO_QUESTION_LABELS:
+        return KOBO_QUESTION_LABELS[leaf]
+
+    # Compost & Fertilizers
+    if any(w in full for w in ["compost", "كومبوست", "سماد", "fertiliz", "manure"]):
+        return "صورة كومة الكومبوست والتسميد العضوي", "الكومبوست والتسميد العضوي"
+
+    # Boundary Trees & Windbreaks
+    if any(w in full for w in ["boundary", "tree", "windbreak", "شجر", "مصد"]):
+        return "صورة أشجار الحدود ومصدات الرياح", "أشجار الحدود ومصدات الرياح"
+
+    # Soil & Samples
+    if any(w in full for w in ["soil", "sample", "تربة", "عينة"]):
+        return "صورة سحب عينة التربة الميدانية", "التربة والري"
+
+    # Irrigation & Water Sources
+    if any(w in full for w in ["well", "water", "irrig", "pump", "بئر", "ري", "طلمبة", "مياه"]):
+        return "صورة مصدر مياه الري والبئر / الطلمبة", "التربة والري"
+
+    # Solar & Energy
+    if any(w in full for w in ["solar", "energy", "panel", "شمسية", "طاقة"]):
+        return "صورة محطة وألواح الطاقة الشمسية", "الطاقة والبنية التحتية"
+
+    # Tenure & Ownership
+    if any(w in full for w in ["tenure", "contract", "ownership", "حيازة", "عقد", "ملكية", "deed"]):
+        return "صورة الحيازة الزراعية / عقد الملكية والإيجار", "المستندات والحيازات"
+
+    # Biodiversity
+    if any(w in full for w in ["biodiversity", "تنوع", "wildlife"]):
+        return "صورة التنوع الحيوي والمحميات الطبيعية", "التنوع الحيوي"
+
+    # GMO / Seeds
+    if any(w in full for w in ["gmo", "وراثي", "تقاوي", "seed"]):
+        return "صورة فحص وخلو التقاوي من التعديل الوراثي (GMO)", "المستندات والحيازات"
+
+    # Ledger & Records
+    if any(w in full for w in ["ledger", "record", "سجل", "دفتر"]):
+        return "صورة سجل المزرعة والعمليات الزراعية", "المستندات والحيازات"
+
+    # Storage & Warehouse
+    if any(w in full for w in ["storage", "store", "warehouse", "مخزن", "مستودع"]):
+        return "صورة مخزن المزرعة وخلوه من الكيماويات", "المستودعات والمخازن"
+
+    # Pesticide check
+    if any(w in full for w in ["pesticide", "chemical", "مبيد"]):
+        return "صورة خلو المزرعة من المبيدات الكيماوية", "المستودعات والمخازن"
+
+    # Animals & Barns
+    if any(w in full for w in ["animal", "barn", "livestock", "cow", "sheep", "ماشية", "حظيرة"]):
+        return "صورة حظيرة الماشية والإنتاج الحيواني", "الإنتاج الحيواني"
+
+    # Crops & Fields
+    if any(w in full for w in ["crop", "plant", "field", "محصول", "حقل", "نبات"]):
+        return "صورة المحصول المنزرع وحالة النباتات", "المحصول والعمليات الزراعية"
+
+    # Audit Committee
+    if any(w in full for w in ["committee", "auditor", "member", "لجنة", "معاينة", "مفتش"]):
+        return "صورة أعضاء لجنة المعاينة والتفتيش", "لجنة المراجعة والتفتيش"
+
+    # Farmer / Representative
+    if any(w in full for w in ["farmer", "rep", "owner", "مزارع", "مالك"]):
+        return "صورة المزارع / ممثل المزرعة", "البيانات الأساسية"
+
+    # Buffer & Neighbors
+    if any(w in full for w in ["buffer", "neighbor", "عازل", "جار", "جوار"]):
+        return "صورة المنطقة العازلة ومزارع الجوار", "المنطقة العازلة ومخاطر التلوث"
+
+    # Bio-Dynamic
+    if any(w in full for w in ["bd_prep", "preparation", "500", "501", "بيوديناميك"]):
+        return "صورة مستحضرات الزراعة الحيوية (BD Preps)", "الزراعة الحيوية والبيوديناميك"
+
+    # Clean fallback title
+    readable = leaf.replace("_", " ").title()
+    return f"صورة: {readable}", "الصور والمرفقات الميدانية"
+
+
+def resolve_kobo_photo_title(
+    fn: str,
+    flat_dict: Dict[str, Any],
+    schema_labels: Optional[Dict[str, str]] = None,
+    photo_idx: int = 1
+) -> Dict[str, str]:
+    """
+    Resolves photo metadata into clear, human-readable Arabic question title and section.
+    Never returns an obscure filepath, UUID or hash!
+    """
+    clean_fn = fn.split("/")[-1].strip() if "/" in fn else fn.strip()
+    matched_key = ""
+
+    # 1. Search flat dictionary for matching field
+    for k, v in flat_dict.items():
+        if v is None:
+            continue
+        v_str = str(v).strip()
+        if not v_str:
+            continue
+        v_base = v_str.split("/")[-1].strip() if "/" in v_str else v_str
+
+        if (
+            v_str == fn
+            or v_base == clean_fn
+            or v_str == clean_fn
+            or (len(clean_fn) >= 6 and clean_fn in v_str)
+            or (len(v_base) >= 6 and v_base in fn)
+            or fn.endswith(v_str)
+        ):
+            matched_key = k
+            break
+
+    # 2. Derive human Arabic title
+    title = ""
+    section = "الصور والمرفقات الميدانية"
+
+    if matched_key:
+        leaf_key = matched_key.split("/")[-1]
+        # Check custom schema labels fetched from Kobo asset API
+        if schema_labels:
+            title = schema_labels.get(matched_key) or schema_labels.get(leaf_key) or ""
+
+        # Check standard dictionary & semantic rules
+        if not title:
+            title, section = clean_kobo_semantic_title(matched_key)
+    else:
+        # Keyword deduction from filename if available
+        fn_low = fn.lower()
+        if any(w in fn_low for w in ["compost", "كومبوست", "سماد"]):
+            title = "صورة كومة الكومبوست والتسميد العضوي"
+            section = "الكومبوست والتسميد العضوي"
+        elif any(w in fn_low for w in ["boundary", "tree", "شجر"]):
+            title = "صورة أشجار الحدود ومصدات الرياح"
+            section = "أشجار الحدود ومصدات الرياح"
+        elif any(w in fn_low for w in ["soil", "تربة"]):
+            title = "صورة سحب عينة التربة"
+            section = "التربة والري"
+        elif any(w in fn_low for w in ["well", "water", "irrig", "بئر", "ري"]):
+            title = "صورة مصدر مياه الري والبئر"
+            section = "التربة والري"
+        elif any(w in fn_low for w in ["solar", "شمسية"]):
+            title = "صورة محطة وألواح الطاقة الشمسية"
+            section = "الطاقة والبنية التحتية"
+        elif any(w in fn_low for w in ["tenure", "حيازة"]):
+            title = "صورة الحيازة الزراعية / عقد الملكية"
+            section = "المستندات والحيازات"
+        else:
+            title = f"صورة المعاينة الميدانية ({photo_idx})"
+            section = "الصور والمرفقات الميدانية"
+
+    return {
+        "title": title,
+        "section": section,
+        "clean_filename": clean_fn,
+        "field_key": matched_key,
+    }
+
+
+def extract_farm_record(
+    raw_sub: Dict[str, Any],
+    idx: int = 0,
+    schema_labels: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """
     Intelligently extracts standard farm audit record from any live Kobo submission JSON
     regardless of whether questions are nested inside groups or at root.
@@ -154,39 +457,46 @@ def extract_farm_record(raw_sub: Dict[str, Any], idx: int = 0) -> Dict[str, Any]
                 except ValueError:
                     pass
 
+    # Extract all photos with intelligent human Arabic titles
     attachments = raw_sub.get("_attachments", [])
     photos: List[Dict[str, Any]] = []
+    seen_clean_files = set()
 
-    # Map filename to human label
+    # 1. From _attachments
     for att in attachments:
         fn = str(att.get("filename", "")).strip()
         url = att.get("download_url") or att.get("download_medium_url") or att.get("download_small_url") or ""
         mime = str(att.get("mimetype", "")).lower()
 
-        if url and ("image" in mime or any(fn.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"])):
-            title = fn
-            for k, v in flat.items():
-                if str(v).strip() == fn:
-                    leaf = k.split("/")[-1].lower()
-                    if "boundary" in leaf or "tree" in leaf or "شجر" in leaf:
-                        title = "صورة أشجار الحدود"
-                    elif "soil" in leaf or "تربة" in leaf:
-                        title = "صورة عينة التربة"
-                    elif "tenure" in leaf or "حيازة" in leaf:
-                        title = "صورة الحيازة / الملكية"
-                    elif "committee" in leaf or "لجنة" in leaf:
-                        title = "صورة لجنة المعاينة"
-                    elif "crop" in leaf or "محصول" in leaf:
-                        title = "صورة المحصول"
-                    else:
-                        title = f"صورة: {k.split('/')[-1]}"
-                    break
+        if url and ("image" in mime or any(fn.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".heic"])):
+            info = resolve_kobo_photo_title(fn, flat, schema_labels, photo_idx=len(photos) + 1)
+            seen_clean_files.add(info["clean_filename"])
             photos.append({
                 "filename": fn,
+                "clean_filename": info["clean_filename"],
                 "url": url,
-                "title": title,
+                "title": info["title"],
+                "section": info["section"],
+                "field_key": info["field_key"],
                 "mimetype": mime,
             })
+
+    # 2. Check flat for any photo fields not present in _attachments
+    for k, v in flat.items():
+        if isinstance(v, str) and any(v.lower().strip().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".heic"]):
+            v_clean = v.split("/")[-1].strip()
+            if v_clean not in seen_clean_files:
+                seen_clean_files.add(v_clean)
+                info = resolve_kobo_photo_title(v, flat, schema_labels, photo_idx=len(photos) + 1)
+                photos.append({
+                    "filename": v,
+                    "clean_filename": v_clean,
+                    "url": v if v.startswith("http") else "",
+                    "title": info["title"],
+                    "section": info["section"],
+                    "field_key": k,
+                    "mimetype": "image/jpeg",
+                })
 
     return {
         "_id": raw_sub.get("_id", idx + 1),
@@ -215,73 +525,26 @@ def extract_farm_record(raw_sub: Dict[str, Any], idx: int = 0) -> Dict[str, Any]
     }
 
 
-KOBO_QUESTION_LABELS = {
-    'farm_id': ('كود المزرعة', 'البيانات الأساسية'),
-    'at_house/farm_id': ('كود المزرعة', 'البيانات الأساسية'),
-    'farm_name': ('اسم المزرعة', 'البيانات الأساسية'),
-    'at_house/farm_name': ('اسم المزرعة', 'البيانات الأساسية'),
-    'engineer_name': ('اسم المهندس المراجع', 'بيانات المهندس والزيارة'),
-    'engineer_data/engineer_name': ('اسم المهندس المراجع', 'بيانات المهندس والزيارة'),
-    '__002': ('المحافظة', 'بيانات المهندس والزيارة'),
-    'engineer_data/__002': ('المحافظة', 'بيانات المهندس والزيارة'),
-    'visit_date': ('تاريخ الزيارة الميدانية', 'بيانات المهندس والزيارة'),
-    'engineer_data/visit_date': ('تاريخ الزيارة الميدانية', 'بيانات المهندس والزيارة'),
-    'audit_type': ('نوع الزيارة والتفتيش', 'بيانات المهندس والزيارة'),
-    'engineer_data/audit_type': ('نوع الزيارة والتفتيش', 'بيانات المهندس والزيارة'),
-    '__010': ('الموسم الزراعي', 'بيانات المهندس والزيارة'),
-    'engineer_data/__010': ('الموسم الزراعي', 'بيانات المهندس والزيارة'),
-    'rep_name': ('اسم المزارع / ممثل المزرعة', 'بيانات المزرعة والمزارع'),
-    'farm_details/rep_name': ('اسم المزارع / ممثل المزرعة', 'بيانات المزرعة والمزارع'),
-    'rep_phone': ('رقم تليفون ممثل المزرعة', 'بيانات المزرعة والمزارع'),
-    'farm_details/rep_phone': ('رقم تليفون ممثل المزرعة', 'بيانات المزرعة والمزارع'),
-    '__009': ('نوع الملكية (فردية / مجموعة مزارعين)', 'بيانات المزرعة والمزارع'),
-    'farm_details/__009': ('نوع الملكية (فردية / مجموعة مزارعين)', 'بيانات المزرعة والمزارع'),
-    'farm_area': ('إجمالي المساحة بالفدان', 'المساحة والحدود'),
-    'farm_details/farm_area': ('إجمالي المساحة بالفدان', 'المساحة والحدود'),
-    'gps_outline_of_farm': ('إحداثيات حدود المزرعة GPS', 'المساحة والحدود'),
-    'farm_details/gps_outline_of_farm': ('إحداثيات حدود المزرعة GPS', 'المساحة والحدود'),
-    '__047': ('نوع التربة', 'التربة والري'),
-    'farm_details/__047': ('نوع التربة', 'التربة والري'),
-    '__048': ('طريقة ونظام الري', 'التربة والري'),
-    'farm_details/__048': ('طريقة ونظام الري', 'التربة والري'),
-    'irrigation_amount_feddan_year': ('كمية الاستهلاك المائي (م3/فدان/سنة)', 'التربة والري'),
-    'tree_type': ('نوع شجر الحدود ومصدات الرياح', 'أشجار الحدود'),
-    'boundary_trees/tree_type': ('نوع شجر الحدود ومصدات الرياح', 'أشجار الحدود'),
-    'tree_number': ('عدد أشجار الحدود المسجل بالمعاينة', 'أشجار الحدود'),
-    'boundary_trees/tree_number': ('عدد أشجار الحدود المسجل بالمعاينة', 'أشجار الحدود'),
-    'boundary_photo': ('صورة أشجار الحدود', 'الصور والمرفقات الميدانية'),
-    'boundary_trees/boundary_photo': ('صورة أشجار الحدود', 'الصور والمرفقات الميدانية'),
-    'sample_point': ('إحداثيات نقاط أخذ عينات التربة GPS', 'التربة والري'),
-    'soil_samples/sample_point': ('إحداثيات نقاط أخذ عينات التربة GPS', 'التربة والري'),
-    'soil_photo': ('صورة أخذ عينة التربة', 'الصور والمرفقات الميدانية'),
-    'soil_samples/soil_photo': ('صورة أخذ عينة التربة', 'الصور والمرفقات الميدانية'),
-    'tenure_photo': ('صورة الحيازة / عقد الملكية', 'المستندات والحيازات'),
-    'docs/tenure_photo': ('صورة الحيازة / عقد الملكية', 'المستندات والحيازات'),
-    'biodiversity_doc': ('بيان خطة التنوع الحيوي', 'المستندات والحيازات'),
-    'docs/biodiversity_doc': ('بيان خطة التنوع الحيوي', 'المستندات والحيازات'),
-    'gmo_doc': ('إقرار عدم استخدام تقاوي معدلة وراثياً (GMO)', 'المستندات والحيازات'),
-    'docs/gmo_doc': ('إقرار عدم استخدام تقاوي معدلة وراثياً (GMO)', 'المستندات والحيازات'),
-    'ledger_photo': ('صورة سجل المزرعة وعمليات التسميد', 'المستندات والحيازات'),
-    'docs/ledger_photo': ('صورة سجل المزرعة وعمليات التسميد', 'المستندات والحيازات'),
-    'member_photo_1': ('صورة عضو لجنة المراجعة 1', 'لجنة المراجعة'),
-    'member_photo_2': ('صورة عضو لجنة المراجعة 2', 'لجنة المراجعة'),
-    'member_photo_3': ('صورة عضو لجنة المراجعة 3', 'لجنة المراجعة'),
-    'non_compliance': ('حالات عدم المطابقة المرصودة', 'ملاحظات وتوصيات التفتيش'),
-    'audit_notes/non_compliance': ('حالات عدم المطابقة المرصودة', 'ملاحظات وتوصيات التفتيش'),
-    'corrective_measures': ('الإجراءات التصحيحية المتفق عليها', 'ملاحظات وتوصيات التفتيش'),
-    'audit_notes/corrective_measures': ('الإجراءات التصحيحية المتفق عليها', 'ملاحظات وتوصيات التفتيش'),
-    'auditors_recommendations': ('توصيات لجنة المراجعة', 'ملاحظات وتوصيات التفتيش'),
-    'audit_notes/auditors_recommendations': ('توصيات لجنة المراجعة', 'ملاحظات وتوصيات التفتيش'),
-}
-
-
-def get_form_qa_items(flat_dict: Dict[str, Any], photos_list: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+def get_form_qa_items(
+    flat_dict: Dict[str, Any],
+    photos_list: Optional[List[Dict[str, Any]]] = None,
+    schema_labels: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """
     Returns an ordered list of all question & answer items from the Kobo submission,
     linking any question that has an attached photo to its image URL.
     """
     qa_items: List[Dict[str, Any]] = []
-    photos_map = {p.get("filename"): p for p in (photos_list or []) if p.get("filename")}
+
+    # Map photos by full filename and clean basename
+    photos_by_name: Dict[str, Dict[str, Any]] = {}
+    for p in (photos_list or []):
+        fn = p.get("filename", "")
+        clean_fn = p.get("clean_filename", "")
+        if fn:
+            photos_by_name[fn] = p
+        if clean_fn:
+            photos_by_name[clean_fn] = p
 
     # Ignore meta keys
     ignore_prefixes = ("_", "meta/", "formhub/", "__version__", "deviceid", "instanceID")
@@ -293,21 +556,34 @@ def get_form_qa_items(flat_dict: Dict[str, Any], photos_list: Optional[List[Dict
             continue
 
         leaf = k.split('/')[-1]
-        label_info = KOBO_QUESTION_LABELS.get(k) or KOBO_QUESTION_LABELS.get(leaf)
-        if label_info:
-            q_title, q_section = label_info
-        else:
-            q_title = leaf.replace("_", " ")
-            q_section = k.split('/')[0].replace("_", " ") if '/' in k else "بيانات الاستمارة"
+
+        # 1. Check custom schema labels
+        q_title = ""
+        q_section = ""
+        if schema_labels:
+            q_title = schema_labels.get(k) or schema_labels.get(leaf) or ""
+
+        # 2. Check semantic dictionary
+        if not q_title:
+            q_title, q_section = clean_kobo_semantic_title(k)
 
         str_val = str(v).strip()
-        matching_photo = photos_map.get(str_val)
-        photo_url = matching_photo.get("url") if matching_photo else None
-        if not photo_url and any(str_val.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
+        str_val_clean = str_val.split("/")[-1].strip() if "/" in str_val else str_val
+
+        # Match photo
+        matching_photo = (
+            photos_by_name.get(str_val)
+            or photos_by_name.get(str_val_clean)
+        )
+        if not matching_photo and any(str_val.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".heic"]):
             for p in (photos_list or []):
-                if str_val in p.get("url", ""):
-                    photo_url = p.get("url")
+                p_fn = p.get("filename", "")
+                p_c = p.get("clean_filename", "")
+                if str_val_clean in p_fn or p_c in str_val:
+                    matching_photo = p
                     break
+
+        photo_url = matching_photo.get("url") if matching_photo else None
 
         qa_items.append({
             "field_key": k,
@@ -315,7 +591,7 @@ def get_form_qa_items(flat_dict: Dict[str, Any], photos_list: Optional[List[Dict
             "section": q_section,
             "answer": str_val,
             "photo_url": photo_url,
-            "photo_filename": str_val if photo_url else None,
+            "photo_filename": matching_photo.get("clean_filename") if matching_photo else (str_val_clean if photo_url else None),
         })
 
     return qa_items
