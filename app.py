@@ -256,7 +256,18 @@ def load_kobo_data(token: str, server_url: str, asset_uid: str) -> List[Dict[str
     if not raw_list:
         return []
     schema_labels = store.fetch_kobo_asset_schema(server_url, asset_uid, token)
-    return [core.extract_farm_record(r, idx, schema_labels=schema_labels) for idx, r in enumerate(raw_list)]
+    records: List[Dict[str, Any]] = []
+    for idx, r in enumerate(raw_list):
+        if not r or not isinstance(r, dict):
+            continue
+        try:
+            rec = core.extract_farm_record(r, idx, schema_labels=schema_labels)
+            if rec and isinstance(rec, dict):
+                records.append(rec)
+        except Exception as e:
+            print(f"Error parsing farm record #{idx}: {e}")
+            continue
+    return records
 
 
 @st.cache_data(ttl=3600)
@@ -375,17 +386,21 @@ if token_to_use:
     with st.spinner("جاري سحب بيانات الاستمارات الحية من KoboToolbox..."):
         live_farms = load_kobo_data(token_to_use, server_to_use, asset_to_use)
 
-if live_farms:
-    raw_farms = live_farms
-    data_source_badge = f"🟢 Kobo API حي ({len(live_farms)} استمارة)"
-else:
+raw_farms = [f for f in (live_farms if live_farms else DEMO_FARMS) if f and isinstance(f, dict)]
+if not raw_farms:
     raw_farms = DEMO_FARMS
+
+if live_farms:
+    data_source_badge = f"🟢 Kobo API حي ({len(raw_farms)} استمارة)"
+else:
     data_source_badge = f"⚪ وضع تجريبي ({len(DEMO_FARMS)} مزارع)"
 
 # Ensure default assignments for unassigned farms
 saved_assigns = st.session_state.assignments
 needs_save = False
 for idx, f in enumerate(raw_farms):
+    if not f or not isinstance(f, dict):
+        continue
     sid = str(f.get("_id", idx + 1))
     if sid not in saved_assigns:
         saved_assigns[sid] = {

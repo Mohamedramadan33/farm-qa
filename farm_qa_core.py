@@ -372,8 +372,68 @@ def resolve_kobo_photo_title(
     }
 
 
+def normalize_kobo_validation_status(val_raw: Any) -> Dict[str, str]:
+    """
+    Normalizes Kobo validation status into standard codes and labels:
+    - code: 'approved', 'not_approved', 'on_hold', 'unvalidated'
+    - label_en: 'Approved', 'Not approved', 'On hold', '-'
+    - label_ar: 'معتمد (Approved)', 'مرفوض (Not approved)', 'معلق (On hold)', 'غير محدد (-)'
+    - color: '#10b981', '#ef4444', '#f59e0b', '#94a3b8'
+    """
+    if not val_raw:
+        return {
+            "code": "unvalidated",
+            "label_en": "-",
+            "label_ar": "غير محدد (-)",
+            "color": "#94a3b8",
+            "uid": "",
+        }
+
+    if isinstance(val_raw, dict):
+        uid = str(val_raw.get("uid") or "").lower()
+        lbl = str(val_raw.get("label") or "").lower()
+    else:
+        uid = str(val_raw).lower()
+        lbl = str(val_raw).lower()
+
+    if "approved" in uid or "approved" in lbl:
+        if "not" in uid or "not" in lbl or "غير" in lbl or "رفض" in lbl:
+            return {
+                "code": "not_approved",
+                "label_en": "Not approved",
+                "label_ar": "مرفوض (Not approved)",
+                "color": "#ef4444",
+                "uid": "validation_status_not_approved",
+            }
+        else:
+            return {
+                "code": "approved",
+                "label_en": "Approved",
+                "label_ar": "معتمد (Approved)",
+                "color": "#10b981",
+                "uid": "validation_status_approved",
+            }
+    elif "hold" in uid or "hold" in lbl or "معلق" in lbl or "انتظار" in lbl:
+        return {
+            "code": "on_hold",
+            "label_en": "On hold",
+            "label_ar": "معلق (On hold)",
+            "color": "#f59e0b",
+            "uid": "validation_status_on_hold",
+            "description": "معلق للمراجعة الإضافية",
+        }
+    else:
+        return {
+            "code": "unvalidated",
+            "label_en": "-",
+            "label_ar": "غير محدد (-)",
+            "color": "#94a3b8",
+            "uid": "",
+        }
+
+
 def extract_farm_record(
-    raw_sub: Dict[str, Any],
+    raw_sub: Any,
     idx: int = 0,
     schema_labels: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
@@ -381,6 +441,8 @@ def extract_farm_record(
     Intelligently extracts standard farm audit record from any live Kobo submission JSON
     regardless of whether questions are nested inside groups or at root.
     """
+    if not isinstance(raw_sub, dict):
+        raw_sub = {}
     flat = flatten_dict(raw_sub)
     sub_id = str(raw_sub.get("_id", f"sub_{idx+1}"))
     sub_time = str(raw_sub.get("_submission_time", ""))
@@ -498,66 +560,7 @@ def extract_farm_record(
                     "mimetype": "image/jpeg",
                 })
 
-def normalize_kobo_validation_status(val_raw: Any) -> Dict[str, str]:
-    """
-    Normalizes Kobo validation status into standard codes and labels:
-    - code: 'approved', 'not_approved', 'on_hold', 'unvalidated'
-    - label_en: 'Approved', 'Not approved', 'On hold', '-'
-    - label_ar: 'معتمد (Approved)', 'مرفوض (Not approved)', 'معلق (On hold)', 'غير محدد (-)'
-    - color: '#10b981', '#ef4444', '#f59e0b', '#94a3b8'
-    """
-    if not val_raw:
-        return {
-            "code": "unvalidated",
-            "label_en": "-",
-            "label_ar": "غير محدد (-)",
-            "color": "#94a3b8",
-            "uid": "",
-        }
-
-    if isinstance(val_raw, dict):
-        uid = str(val_raw.get("uid") or "").lower()
-        lbl = str(val_raw.get("label") or "").lower()
-    else:
-        uid = str(val_raw).lower()
-        lbl = str(val_raw).lower()
-
-    if "approved" in uid or "approved" in lbl:
-        if "not" in uid or "not" in lbl or "غير" in lbl or "رفض" in lbl:
-            return {
-                "code": "not_approved",
-                "label_en": "Not approved",
-                "label_ar": "مرفوض (Not approved)",
-                "color": "#ef4444",
-                "uid": "validation_status_not_approved",
-            }
-        else:
-            return {
-                "code": "approved",
-                "label_en": "Approved",
-                "label_ar": "معتمد (Approved)",
-                "color": "#10b981",
-                "uid": "validation_status_approved",
-            }
-    elif "hold" in uid or "hold" in lbl or "معلق" in lbl or "انتظار" in lbl:
-        return {
-            "code": "on_hold",
-            "label_en": "On hold",
-            "label_ar": "معلق (On hold)",
-            "color": "#f59e0b",
-            "uid": "validation_status_on_hold",
-        }
-    else:
-        return {
-            "code": "unvalidated",
-            "label_en": "-",
-            "label_ar": "غير محدد (-)",
-            "color": "#94a3b8",
-            "uid": "",
-        }
-
-
-    val_raw = raw_sub.get("_validation_status", {})
+    val_raw = raw_sub.get("_validation_status", {}) if isinstance(raw_sub, dict) else {}
     val_norm = normalize_kobo_validation_status(val_raw)
 
     return {

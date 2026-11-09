@@ -1,7 +1,5 @@
 [server]
 headless = true
-maxCachedMessageAge = 60
-disconnectedSessionTTL = 120
 
 [browser]
 gatherUsageStats = false
