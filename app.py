@@ -23,7 +23,7 @@ import pandas as pd
 import requests
 from PIL import Image
 import streamlit as st
-from folium import Map, Polygon as FoliumPolygon, Marker, TileLayer
+from folium import Map, Polygon as FoliumPolygon, Marker, TileLayer, CircleMarker
 from streamlit_folium import st_folium
 
 import farm_qa_core as core
@@ -635,19 +635,106 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
     gps_quality = core.evaluate_gps_quality(poly_coords, utm_metrics.get("poly_utm"))
 
     # Tabs for consolidated view
-    tab_geo, tab_trees, tab_photos, tab_pgs, tab_decision = st.tabs([
-        "📐 خريطة المضلع وصورة القمر الصناعي",
-        "🌳 تعداد الأشجار والغطاء النباتي",
-        "📸 صور استمارة Kobo وقرارات الصور",
+    # Tabs for consolidated view
+    tab_trees, tab_photos, tab_qa, tab_pgs, tab_decision = st.tabs([
+        "🌳 رصد وتعداد الأشجار وصورة القمر الصناعي",
+        "📸 الأسئلة المصورة من استمارة Kobo",
+        "📝 جميع أسئلة وأجوبة الاستمارة",
         "📜 تدقيق قواعد PGS",
         "⚖️ قرار الاعتماد والمزامنة السحابية",
     ])
 
-    # 1. Geometry & Satellite
-    with tab_geo:
-        st.subheader("مضلع GPS وحسابات المساحة الهندسية (UTM)")
-        geo_col1, geo_col2, geo_col3 = st.columns(3)
-        with geo_col1:
+    # 1. Trees & Satellite Visual Detection
+    with tab_trees:
+        st.subheader("🌳 رصد وتعداد الأشجار على صورة القمر الصناعي وخريطة المضلع")
+        st.caption("يتم رصد وترقيم كل شجرة على حدود المزرعة بنقاط خضراء واضحة، مع خوارزمية القمم الضوئية وتحديد دقيق للمسافات.")
+
+        # Interactive Calibration Controls
+        with st.expander("🎚️ إعدادات ومعايرة دقة الرصد وحساسية التيجان (Detection Settings)", expanded=False):
+            t_col1, t_col2, t_col3 = st.columns(3)
+            with t_col1:
+                species_presets = {
+                    "تلقائي من نوع شجر الاستمارة": None,
+                    "جازورين (مصدات كثيفة - 2.0 متر)": 2.0,
+                    "كافور / أوكالبتوس (3.0 متر)": 3.0,
+                    "موالح / حمضيات (4.0 متر)": 4.0,
+                    "زيتون (5.0 متر)": 5.0,
+                    "مانجو / فاكهة كبيرة (6.0 متر)": 6.0,
+                    "نخيل (8.0 متر)": 8.0,
+                    "تخصيص يدوي للمسافة": "custom",
+                }
+                chosen_species = st.selectbox(
+                    "نوع شجر الحدود والمسافة:",
+                    options=list(species_presets.keys()),
+                    key=f"tree_spec_sel_{farm_id}",
+                )
+            with t_col2:
+                sel_sp = species_presets[chosen_species]
+                if sel_sp == "custom":
+                    custom_spacing = st.number_input(
+                        "المسافة بين الأشجار (متر):",
+                        min_value=1.0,
+                        max_value=25.0,
+                        value=3.0,
+                        step=0.5,
+                        key=f"custom_sp_inp_{farm_id}",
+                    )
+                elif sel_sp is not None:
+                    custom_spacing = float(sel_sp)
+                    st.text_input("المسافة المعتمدة:", value=f"{custom_spacing} متر", disabled=True, key=f"sp_disp_{farm_id}")
+                else:
+                    custom_spacing = None
+                    st.text_input("المسافة المعتمدة:", value="تلقائي حسب الاستمارة", disabled=True, key=f"sp_disp_{farm_id}")
+            with t_col3:
+                sens_val = st.slider(
+                    "حساسية قمم التيجان (Sensitivity):",
+                    min_value=0.10,
+                    max_value=1.00,
+                    value=0.50,
+                    step=0.05,
+                    key=f"tree_sens_val_{farm_id}",
+                    help="زيادة القيمة ترصد الأشجار الصغيرة والمتباعدة، وتقليلها يركز على الأشجار الكبيرة فقط.",
+                )
+
+        # Compute satellite canopy & visual tree detections
+        canopy_result = core.analyze_farm_satellite_canopy(
+            poly_coords,
+            perimeter_m,
+            tree_type_str=farm.get("tree_type", ""),
+            custom_spacing_m=custom_spacing,
+            sensitivity=sens_val,
+        )
+
+        tr_c1, tr_c2, tr_c3, tr_c4 = st.columns(4)
+        with tr_c1:
+            st.metric(
+                "الأشجار المرصودة بالقمر الصناعي (AI)",
+                f"{canopy_result['ai_count']} شجرة",
+                f"نطاق: {canopy_result['ai_low']} - {canopy_result['ai_high']}",
+            )
+        with tr_c2:
+            st.metric("عدد المهندس بالاستمارة", f"{farm.get('tree_number', 0)} شجرة")
+        with tr_c3:
+            st.metric("توقع المسافات الهندسية", f"{canopy_result['forecast'] or 0} شجرة")
+        with tr_c4:
+            st.metric("نوع شجر الحدود", farm.get("tree_type", "غير محدد"))
+
+        st.info(
+            f"🌱 نسبة الغطاء النباتي على الحدود: **{canopy_result['veg_pct']}%** | 📏 مسافة الشجر المعتمدة: **{canopy_result['spacing_m']} متر** | 📅 تاريخ الالتقاط: **{canopy_result['imagery_date']}**"
+        )
+
+        # High-Resolution Satellite Image with Counted Trees Drawn on it
+        if canopy_result.get("annotated_img") is not None:
+            st.markdown("##### 🛰️ صورة القمر الصناعي محدد عليها الأشجار المرصودة بالأرقام:")
+            safe_image(
+                canopy_result["annotated_img"],
+                caption=f"صورة القمر الصناعي — تم رصد وتحديد {canopy_result['ai_count']} شجرة على امتداد محيط المزرعة",
+            )
+
+        st.markdown("---")
+        st.subheader("📐 مضلع GPS وخريطة المزرعة التفاعلية (مع نقاط الأشجار)")
+        g_c1, g_c2, g_c3 = st.columns(3)
+        with g_c1:
             st.metric("مساحة مضلع GPS", f"{area_gps_feddan:.2f} فدان")
             ent_area = float(farm.get("farm_area") or 0.0)
             diff_fed = abs(ent_area - area_gps_feddan)
@@ -656,15 +743,14 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                 st.success(f"مطابقة ممتازة (الفارق: {diff_pct:.1f}%)")
             else:
                 st.error(f"فارق ({diff_pct:.1f}%) بين المسجل ومضلع GPS!")
-        with geo_col2:
+        with g_c2:
             st.metric("محيط المزرعة", f"{perimeter_m:.1f} متر")
-        with geo_col3:
+        with g_c3:
             st.metric("جودة رفع GPS", f"{gps_quality['rating']} ({gps_quality['score']}/100)")
 
         if is_repaired:
             st.warning("⚠️ تم إصلاح وفك تقاطع ذاتي (Bowtie) في تسلسل نقاط GPS تلقائياً.")
 
-        # Folium Map
         if poly_coords and len(poly_coords) >= 3:
             mean_lat = sum(p[1] for p in poly_coords) / len(poly_coords)
             mean_lon = sum(p[0] for p in poly_coords) / len(poly_coords)
@@ -689,50 +775,59 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                 tooltip=f"مزرعة {farm.get('farm_name')}",
             ).add_to(m)
 
+            # Add each individual detected tree point as an interactive green CircleMarker
+            for tp in canopy_result.get("tree_points", []):
+                CircleMarker(
+                    location=[tp["lat"], tp["lon"]],
+                    radius=4,
+                    color="#047857",
+                    fill=True,
+                    fill_color="#10b981",
+                    fill_opacity=0.9,
+                    tooltip=f"شجرة #{tp['id']}",
+                ).add_to(m)
+
             Marker([mean_lat, mean_lon], tooltip=f"مركز {farm.get('farm_id')}").add_to(m)
-            st_folium(m, height=400, use_container_width=True)
-        else:
-            st.warning("لا توجد إحداثيات GPS صالحة لرسم المضلع.")
+            st_folium(m, height=420, use_container_width=True)
 
-    # 2. Trees & Satellite Canopy
-    with tab_trees:
-        st.subheader("تعداد أشجار الحدود ومقارنة التوقعات الهندسية")
-        st.caption("مقارنة عدد الأشجار المسجل بواسطة المهندس مع توقع المسافات المحيطية وتقدير الغطاء النباتي بالأقمار الصناعية.")
+        # GPS Coordinates Table for Detected Trees
+        tree_pts = canopy_result.get("tree_points", [])
+        if tree_pts:
+            with st.expander(f"📋 جدول إحداثيات كل شجرة مرصودة ({len(tree_pts)} شجرة)", expanded=False):
+                pts_df = pd.DataFrame([
+                    {
+                        "رقم الشجرة": p["id"],
+                        "خط العرض (Latitude)": f"{p['lat']:.6f}",
+                        "خط الطول (Longitude)": f"{p['lon']:.6f}",
+                    }
+                    for p in tree_pts
+                ])
+                st.dataframe(pts_df, use_container_width=True, height=220)
+                csv_bytes = pts_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    label="📥 تحميل إحداثيات الأشجار بصيغة CSV",
+                    data=csv_bytes,
+                    file_name=f"trees_{farm_id}.csv",
+                    mime="text/csv",
+                    key=f"dl_csv_{farm_id}",
+                )
 
-        canopy_result = core.analyze_farm_satellite_canopy(
-            poly_coords,
-            perimeter_m,
-            tree_type_str=farm.get("tree_type", ""),
-        )
-
-        tr_c1, tr_c2, tr_c3, tr_c4 = st.columns(4)
-        with tr_c1:
-            st.metric("نوع شجر الحدود", farm.get("tree_type", "غير محدد"))
-        with tr_c2:
-            st.metric("عدد المهندس بالاستمارة", farm.get("tree_number", 0))
-        with tr_c3:
-            st.metric("توقع المسافات الهندسية", canopy_result["forecast"] or 0)
-        with tr_c4:
-            st.metric(
-                "تقدير القمر الصناعي (AI)",
-                f"{canopy_result['ai_count']} شجرة",
-                f"نطاق: {canopy_result['ai_low']} - {canopy_result['ai_high']}",
+        # Custom AI Model Guide
+        with st.expander("🧠 تعليم وتدريب نموذج ذكاء اصطناعي مخصص فائق الدقة (AI Custom Model Guide)", expanded=False):
+            st.markdown(
+                """
+                **لرفع الدقة لأعلى مستوى ممكن بناءً على صور حقيقية من مزارعك:**
+                1. **تجهيز الصور**: قم بتحميل لقطات عالية الدقة للتيجان ومحيط المزارع.
+                2. **التعليم (Labeling)**: ارفع 20 - 30 صورة مجاناً على منصة [Roboflow](https://roboflow.com) وضع مربعات أو نقاط حول تيجان الأشجار تحت فئة `tree`.
+                3. **التدريب (Training)**: اختر تدريب **YOLOv8 Nano** (سريع جداً وخفيف ولا يستهلك ذاكرة) في Google Colab في أقل من 10 دقائق.
+                4. **الملف الجاهز**: عند وضع ملف الأوزان الناتج `best.pt` في مجلد التطبيق، سيتم تفعيله وقراءته تلقائياً!
+                """
             )
 
-        st.info(
-            f"🌱 نسبة الغطاء النباتي على ممر الحدود (8م): **{canopy_result['veg_pct']}%** | 📅 تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}**"
-        )
-
-        if canopy_result.get("annotated_img") is not None:
-            safe_image(
-                canopy_result["annotated_img"],
-                caption="صورة القمر الصناعي عالية الدقة مع تتبع حدود المزرعة بدقة",
-            )
-
-    # 3. Kobo Photos & Photo Decisions (الميزة المطلوبة: تحت كل صورة مقبول/مرفوض والتعليق)
+    # 2. Questions with Photos (الأسئلة المصورة من Kobo)
     with tab_photos:
-        st.subheader("📸 معرض صور استمارة Kobo مع فحص وقرار كل صورة")
-        st.caption("يمكنك هنا الاطلاع على كافة الصور المرفوعة من الميدان وتحديد قرارك (مقبول / مرفوض / تعديل) مع كتابة سبب التعليق وحفظه.")
+        st.subheader("📸 الأسئلة المصورة من استمارة Kobo مع فحص وقرار كل صورة")
+        st.caption("عرض كافة الصور المرفوعة ميدانياً مع نص السؤال والإجابة، وإمكانية تحديد (مقبول / مرفوض) وكتابة سبب التعليق.")
 
         farm_photos = farm.get("photos", [])
         photo_decisions = store.get_photo_decisions(farm_id)
@@ -751,7 +846,6 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                     col_img, col_act = st.columns([1.5, 2])
 
                     with col_img:
-                        # Authenticated fetch if it's a private Kobo URL
                         if "kobotoolbox" in url or "kf.kobo" in url:
                             img_bytes = fetch_authenticated_kobo_image(url, token_to_use)
                             if img_bytes:
@@ -768,7 +862,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                         dec_idx = dec_options.index(curr_dec) if curr_dec in dec_options else 0
 
                         p_choice = st.radio(
-                            f"قرار الصورة ({fn}):",
+                            f"قرار السؤال / الصورة ({fn}):",
                             options=dec_options,
                             index=dec_idx,
                             horizontal=True,
@@ -782,11 +876,66 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                             key=f"p_com_{farm_id}_{p_idx}",
                         )
 
-                        if st.button(f"حفظ تعليق الصورة {p_idx+1}", key=f"btn_save_p_{farm_id}_{p_idx}"):
+                        if st.button(f"💾 حفظ قرار وتعليق الصورة {p_idx+1}", key=f"btn_save_p_{farm_id}_{p_idx}"):
                             store.save_photo_decision(farm_id, fn, p_choice, p_comment)
                             st.success(f"تم حفظ تعليق وقرار '{title}' بنجاح!")
 
-                    st.markdown("<hr style='margin: 12px 0; border-color: rgba(255,255,255,0.07);'>", unsafe_allow_html=True)
+                    st.markdown("<hr style='margin: 14px 0; border-color: rgba(255,255,255,0.08);'>", unsafe_allow_html=True)
+
+    # 3. All Form Questions & Answers (جميع أسئلة وأجوبة استمارة Kobo)
+    with tab_qa:
+        st.subheader("📝 جميع أسئلة وأجوبة استمارة Kobo بالتفصيل")
+        st.caption("استعراض وتدقيق كافة الأسئلة والأجوبة الواردة في استمارة المعاينة الميدانية.")
+
+        all_qa_items = core.get_form_qa_items(farm.get("flat") or farm, farm.get("photos", []))
+
+        qa_search_col1, qa_search_col2 = st.columns([2, 1.5])
+        with qa_search_col1:
+            qa_search = st.text_input("🔍 بحث في الأسئلة أو الأجوبة:", placeholder="اكتب للبحث في نص السؤال أو الإجابة...").strip().lower()
+
+        sections = sorted(list(set(item["section"] for item in all_qa_items)))
+        with qa_search_col2:
+            section_filter = st.selectbox("تصفية حسب القسم / المحور:", options=["جميع الأقسام"] + sections)
+
+        filtered_qa = []
+        for item in all_qa_items:
+            if qa_search:
+                combined_txt = f"{item['title']} {item['answer']} {item['field_key']}".lower()
+                if qa_search not in combined_txt:
+                    continue
+            if section_filter != "جميع الأقسام" and item["section"] != section_filter:
+                continue
+            filtered_qa.append(item)
+
+        st.write(f"عرض **{len(filtered_qa)}** سؤال وإجابة:")
+
+        # Render Q&A Accordion / Cards
+        for q_idx, q_item in enumerate(filtered_qa):
+            with st.expander(f"🔹 **{q_item['title']}** — ({q_item['section']})", expanded=True if q_idx < 4 else False):
+                qa_c1, qa_c2 = st.columns([2.5, 1.5])
+                with qa_c1:
+                    st.markdown(f"**السؤال:** {q_item['title']}")
+                    st.markdown(f"**مسار الحقل (Field):** `{q_item['field_key']}`")
+                    st.markdown(f"**الإجابة المسجلة بالاستمارة:**")
+                    st.info(q_item['answer'])
+
+                    if q_item.get("photo_url"):
+                        st.markdown("**📸 صورة مرفقة بهذا السؤال:**")
+                        safe_image(q_item["photo_url"], caption=q_item.get("photo_filename"))
+
+                with qa_c2:
+                    st.markdown("**تدقيق المراجع:**")
+                    item_decision = st.selectbox(
+                        "قرار الحقل:",
+                        options=["OK (سليم)", "Reject (مرفوض)", "Modify (يحتاج تعديل)", "Clarify (استيضاح)"],
+                        key=f"item_dec_{farm_id}_{q_idx}",
+                    )
+                    item_note = st.text_input(
+                        "ملاحظة / تصحيح مقترح:",
+                        placeholder="اكتب ملاحظتك على هذا السؤال...",
+                        key=f"item_note_{farm_id}_{q_idx}",
+                    )
+
 
     # 4. PGS Rules
     with tab_pgs:

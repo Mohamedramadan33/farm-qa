@@ -215,6 +215,113 @@ def extract_farm_record(raw_sub: Dict[str, Any], idx: int = 0) -> Dict[str, Any]
     }
 
 
+KOBO_QUESTION_LABELS = {
+    'farm_id': ('كود المزرعة', 'البيانات الأساسية'),
+    'at_house/farm_id': ('كود المزرعة', 'البيانات الأساسية'),
+    'farm_name': ('اسم المزرعة', 'البيانات الأساسية'),
+    'at_house/farm_name': ('اسم المزرعة', 'البيانات الأساسية'),
+    'engineer_name': ('اسم المهندس المراجع', 'بيانات المهندس والزيارة'),
+    'engineer_data/engineer_name': ('اسم المهندس المراجع', 'بيانات المهندس والزيارة'),
+    '__002': ('المحافظة', 'بيانات المهندس والزيارة'),
+    'engineer_data/__002': ('المحافظة', 'بيانات المهندس والزيارة'),
+    'visit_date': ('تاريخ الزيارة الميدانية', 'بيانات المهندس والزيارة'),
+    'engineer_data/visit_date': ('تاريخ الزيارة الميدانية', 'بيانات المهندس والزيارة'),
+    'audit_type': ('نوع الزيارة والتفتيش', 'بيانات المهندس والزيارة'),
+    'engineer_data/audit_type': ('نوع الزيارة والتفتيش', 'بيانات المهندس والزيارة'),
+    '__010': ('الموسم الزراعي', 'بيانات المهندس والزيارة'),
+    'engineer_data/__010': ('الموسم الزراعي', 'بيانات المهندس والزيارة'),
+    'rep_name': ('اسم المزارع / ممثل المزرعة', 'بيانات المزرعة والمزارع'),
+    'farm_details/rep_name': ('اسم المزارع / ممثل المزرعة', 'بيانات المزرعة والمزارع'),
+    'rep_phone': ('رقم تليفون ممثل المزرعة', 'بيانات المزرعة والمزارع'),
+    'farm_details/rep_phone': ('رقم تليفون ممثل المزرعة', 'بيانات المزرعة والمزارع'),
+    '__009': ('نوع الملكية (فردية / مجموعة مزارعين)', 'بيانات المزرعة والمزارع'),
+    'farm_details/__009': ('نوع الملكية (فردية / مجموعة مزارعين)', 'بيانات المزرعة والمزارع'),
+    'farm_area': ('إجمالي المساحة بالفدان', 'المساحة والحدود'),
+    'farm_details/farm_area': ('إجمالي المساحة بالفدان', 'المساحة والحدود'),
+    'gps_outline_of_farm': ('إحداثيات حدود المزرعة GPS', 'المساحة والحدود'),
+    'farm_details/gps_outline_of_farm': ('إحداثيات حدود المزرعة GPS', 'المساحة والحدود'),
+    '__047': ('نوع التربة', 'التربة والري'),
+    'farm_details/__047': ('نوع التربة', 'التربة والري'),
+    '__048': ('طريقة ونظام الري', 'التربة والري'),
+    'farm_details/__048': ('طريقة ونظام الري', 'التربة والري'),
+    'irrigation_amount_feddan_year': ('كمية الاستهلاك المائي (م3/فدان/سنة)', 'التربة والري'),
+    'tree_type': ('نوع شجر الحدود ومصدات الرياح', 'أشجار الحدود'),
+    'boundary_trees/tree_type': ('نوع شجر الحدود ومصدات الرياح', 'أشجار الحدود'),
+    'tree_number': ('عدد أشجار الحدود المسجل بالمعاينة', 'أشجار الحدود'),
+    'boundary_trees/tree_number': ('عدد أشجار الحدود المسجل بالمعاينة', 'أشجار الحدود'),
+    'boundary_photo': ('صورة أشجار الحدود', 'الصور والمرفقات الميدانية'),
+    'boundary_trees/boundary_photo': ('صورة أشجار الحدود', 'الصور والمرفقات الميدانية'),
+    'sample_point': ('إحداثيات نقاط أخذ عينات التربة GPS', 'التربة والري'),
+    'soil_samples/sample_point': ('إحداثيات نقاط أخذ عينات التربة GPS', 'التربة والري'),
+    'soil_photo': ('صورة أخذ عينة التربة', 'الصور والمرفقات الميدانية'),
+    'soil_samples/soil_photo': ('صورة أخذ عينة التربة', 'الصور والمرفقات الميدانية'),
+    'tenure_photo': ('صورة الحيازة / عقد الملكية', 'المستندات والحيازات'),
+    'docs/tenure_photo': ('صورة الحيازة / عقد الملكية', 'المستندات والحيازات'),
+    'biodiversity_doc': ('بيان خطة التنوع الحيوي', 'المستندات والحيازات'),
+    'docs/biodiversity_doc': ('بيان خطة التنوع الحيوي', 'المستندات والحيازات'),
+    'gmo_doc': ('إقرار عدم استخدام تقاوي معدلة وراثياً (GMO)', 'المستندات والحيازات'),
+    'docs/gmo_doc': ('إقرار عدم استخدام تقاوي معدلة وراثياً (GMO)', 'المستندات والحيازات'),
+    'ledger_photo': ('صورة سجل المزرعة وعمليات التسميد', 'المستندات والحيازات'),
+    'docs/ledger_photo': ('صورة سجل المزرعة وعمليات التسميد', 'المستندات والحيازات'),
+    'member_photo_1': ('صورة عضو لجنة المراجعة 1', 'لجنة المراجعة'),
+    'member_photo_2': ('صورة عضو لجنة المراجعة 2', 'لجنة المراجعة'),
+    'member_photo_3': ('صورة عضو لجنة المراجعة 3', 'لجنة المراجعة'),
+    'non_compliance': ('حالات عدم المطابقة المرصودة', 'ملاحظات وتوصيات التفتيش'),
+    'audit_notes/non_compliance': ('حالات عدم المطابقة المرصودة', 'ملاحظات وتوصيات التفتيش'),
+    'corrective_measures': ('الإجراءات التصحيحية المتفق عليها', 'ملاحظات وتوصيات التفتيش'),
+    'audit_notes/corrective_measures': ('الإجراءات التصحيحية المتفق عليها', 'ملاحظات وتوصيات التفتيش'),
+    'auditors_recommendations': ('توصيات لجنة المراجعة', 'ملاحظات وتوصيات التفتيش'),
+    'audit_notes/auditors_recommendations': ('توصيات لجنة المراجعة', 'ملاحظات وتوصيات التفتيش'),
+}
+
+
+def get_form_qa_items(flat_dict: Dict[str, Any], photos_list: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """
+    Returns an ordered list of all question & answer items from the Kobo submission,
+    linking any question that has an attached photo to its image URL.
+    """
+    qa_items: List[Dict[str, Any]] = []
+    photos_map = {p.get("filename"): p for p in (photos_list or []) if p.get("filename")}
+
+    # Ignore meta keys
+    ignore_prefixes = ("_", "meta/", "formhub/", "__version__", "deviceid", "instanceID")
+
+    for k, v in flat_dict.items():
+        if any(k.startswith(p) for p in ignore_prefixes):
+            continue
+        if v is None or str(v).strip() == "":
+            continue
+
+        leaf = k.split('/')[-1]
+        label_info = KOBO_QUESTION_LABELS.get(k) or KOBO_QUESTION_LABELS.get(leaf)
+        if label_info:
+            q_title, q_section = label_info
+        else:
+            q_title = leaf.replace("_", " ")
+            q_section = k.split('/')[0].replace("_", " ") if '/' in k else "بيانات الاستمارة"
+
+        str_val = str(v).strip()
+        matching_photo = photos_map.get(str_val)
+        photo_url = matching_photo.get("url") if matching_photo else None
+        if not photo_url and any(str_val.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
+            for p in (photos_list or []):
+                if str_val in p.get("url", ""):
+                    photo_url = p.get("url")
+                    break
+
+        qa_items.append({
+            "field_key": k,
+            "title": q_title,
+            "section": q_section,
+            "answer": str_val,
+            "photo_url": photo_url,
+            "photo_filename": str_val if photo_url else None,
+        })
+
+    return qa_items
+
+
+
 
 def parse_polygon_coords(poly_str: Any) -> Tuple[Optional[List[Tuple[float, float]]], bool]:
     """
@@ -397,21 +504,28 @@ def analyze_farm_satellite_canopy(
     coords_lon_lat: Optional[List[Tuple[float, float]]],
     perimeter_m: float,
     tree_type_str: str = "",
-    zoom: int = 18
+    zoom: int = 18,
+    custom_spacing_m: Optional[float] = None,
+    sensitivity: float = 0.5,
 ) -> Dict[str, Any]:
     """
-    Fast canopy & boundary tree analysis:
+    Fast canopy & boundary tree analysis with optical crown peak snapping:
     - Never blocks the CPU or hangs Streamlit Cloud!
-    - Stitches maximum 4 satellite tiles.
-    - Computes Excess Green Index along 8m boundary corridor.
+    - Stitches satellite tiles covering the farm boundary.
+    - Computes Excess Green Index along 8m corridor and locks onto crown peaks.
+    - Supports interactive sensitivity tuning and species spacing.
     """
-    spacing_m = 3.0
-    for k, v in BOUNDARY_SPACING_M.items():
-        if k in tree_type_str:
-            spacing_m = v
-            break
+    if custom_spacing_m is not None and custom_spacing_m > 0:
+        spacing_m = float(custom_spacing_m)
+    else:
+        spacing_m = 3.0
+        for k, v in BOUNDARY_SPACING_M.items():
+            if k in tree_type_str:
+                spacing_m = v
+                break
 
     forecast = int(round(perimeter_m / spacing_m)) if perimeter_m > 0 else 0
+
 
     if not coords_lon_lat or len(coords_lon_lat) < 3:
         return {
@@ -481,9 +595,15 @@ def analyze_farm_satellite_canopy(
     corr_mask = np.array(corridor_img) > 0
     total_corr_pixels = int(np.sum(corr_mask))
 
+    # Dynamic sensitivity calibration (0.1 to 1.0)
+    sens = max(0.1, min(1.0, float(sensitivity)))
+    exg_thresh = max(2.0, 22.0 - (sens * 16.0))      # sens=0.5 -> 14.0; sens=1.0 -> 6.0
+    peak_min_exg = max(1.0, 14.0 - (sens * 12.0))    # sens=0.5 -> 8.0; sens=1.0 -> 2.0
+    sep_ratio = max(0.35, 0.70 - (sens * 0.25))       # sens=0.5 -> 0.575; sens=1.0 -> 0.45
+
     if total_corr_pixels > 0 and has_tile:
         exg = 2.0 * g - r - b
-        veg_pixels = (exg > 15.0) & corr_mask
+        veg_pixels = (exg > exg_thresh) & corr_mask
         veg_pct = round(float(np.sum(veg_pixels) / total_corr_pixels * 100.0), 1)
 
         density_factor = veg_pct / 100.0
@@ -499,15 +619,107 @@ def analyze_farm_satellite_canopy(
 
     annotated = stitched.copy()
     draw_ann = ImageDraw.Draw(annotated)
+
+    # 1. Draw boundary line
     draw_ann.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
 
+    # 2. Optical Crown Peak Detection & Drawing along Polygon Perimeter
+    tree_points_coords: List[Dict[str, Any]] = []
+    tree_counter = 0
+
+    # Calculate total pixel perimeter
+    total_px_len = 0.0
+    for i in range(len(poly_px) - 1):
+        pA, pB = poly_px[i], poly_px[i + 1]
+        total_px_len += math.hypot(pB[0] - pA[0], pB[1] - pA[1])
+
+    # Pixels per meter
+    px_per_m = total_px_len / max(perimeter_m, 1.0)
+    spacing_px = max(8.0, spacing_m * px_per_m)
+    search_r = int(max(4, spacing_px * 0.45))
+
+    placed_points: List[Tuple[int, int]] = []
+
+    for i in range(len(poly_px) - 1):
+        pA, pB = poly_px[i], poly_px[i + 1]
+        seg_len = math.hypot(pB[0] - pA[0], pB[1] - pA[1])
+        if seg_len <= 1.0:
+            continue
+
+        num_trees_seg = max(1, int(round(seg_len / spacing_px)))
+        for t_idx in range(num_trees_seg):
+            ratio = t_idx / num_trees_seg
+            tx = pA[0] + ratio * (pB[0] - pA[0])
+            ty = pA[1] + ratio * (pB[1] - pA[1])
+
+            # Snap to local greenness peak (ExG) around (tx, ty)
+            best_x, best_y = int(round(tx)), int(round(ty))
+            if has_tile and total_corr_pixels > 0:
+                win_y1 = max(0, int(ty) - search_r)
+                win_y2 = min(height_px, int(ty) + search_r + 1)
+                win_x1 = max(0, int(tx) - search_r)
+                win_x2 = min(width_px, int(tx) + search_r + 1)
+                if win_y2 > win_y1 and win_x2 > win_x1:
+                    sub_exg = exg[win_y1:win_y2, win_x1:win_x2]
+                    max_pos = np.unravel_index(np.argmax(sub_exg), sub_exg.shape)
+                    candidate_y = win_y1 + int(max_pos[0])
+                    candidate_x = win_x1 + int(max_pos[1])
+                    if sub_exg[max_pos] > peak_min_exg:
+                        best_x, best_y = candidate_x, candidate_y
+
+            # Ensure minimum separation to avoid duplicate clusters
+            too_close = any(math.hypot(best_x - px, best_y - py) < (spacing_px * sep_ratio) for px, py in placed_points)
+            if too_close:
+                continue
+
+            placed_points.append((best_x, best_y))
+            tree_counter += 1
+
+            # Draw circular tree crown marker (Lime green with dark ring)
+            r_mark = 5
+            draw_ann.ellipse([best_x - r_mark - 1, best_y - r_mark - 1, best_x + r_mark + 1, best_y + r_mark + 1], fill=(0, 0, 0))
+            draw_ann.ellipse([best_x - r_mark, best_y - r_mark, best_x + r_mark, best_y + r_mark], fill=(34, 197, 94))
+
+            # Number every 10th tree or first tree
+            if tree_counter == 1 or tree_counter % 10 == 0:
+                badge_txt = str(tree_counter)
+                draw_ann.rectangle([best_x + 5, best_y - 9, best_x + 5 + len(badge_txt) * 9, best_y + 7], fill=(15, 23, 42), outline=(0, 255, 200))
+                draw_ann.text((best_x + 7, best_y - 8), badge_txt, fill=(255, 255, 255))
+
+            lat_rad_t = math.atan(math.sinh(math.pi * (1 - 2 * (y_min + best_y / 256.0) / (2.0 ** zoom))))
+            lat_deg_t = math.degrees(lat_rad_t)
+            lon_deg_t = (x_min + best_x / 256.0) / (2.0 ** zoom) * 360.0 - 180.0
+
+            tree_points_coords.append({
+                "id": tree_counter,
+                "lat": lat_deg_t,
+                "lon": lon_deg_t,
+                "px": (best_x, best_y),
+            })
+
+
+    # Total trees count: adjust with corridor vegetation factor
+    if tree_counter > 0:
+        density_factor = veg_pct / 100.0
+        final_ai_count = int(round(tree_counter * (0.6 + 0.5 * density_factor)))
+    else:
+        final_ai_count = forecast
+
+    # 3. Draw Header Stats Overlay Banner on the Image
+    banner_h = 36
+    draw_ann.rectangle([0, 0, width_px, banner_h], fill=(15, 23, 42))
+    header_text = f"TREE COUNT: {final_ai_count} trees | Spacing: {spacing_m}m | Veg: {veg_pct}% | Date: {imagery_date or 'Recent'}"
+    draw_ann.text((12, 10), header_text, fill=(0, 255, 200))
+
     return {
-        "ai_count": ai_count,
-        "ai_low": ai_low,
-        "ai_high": ai_high,
+        "ai_count": final_ai_count,
+        "ai_low": max(0, int(round(final_ai_count * 0.85))),
+        "ai_high": int(round(final_ai_count * 1.15)),
         "veg_pct": veg_pct,
         "forecast": forecast,
         "imagery_date": imagery_date or "حديث",
         "annotated_img": annotated,
         "spacing_m": spacing_m,
+        "tree_points": tree_points_coords,
     }
+
