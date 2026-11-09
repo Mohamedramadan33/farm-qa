@@ -274,6 +274,16 @@ def fetch_authenticated_kobo_image(url: str, token: str) -> Optional[bytes]:
     return None
 
 
+@st.cache_data(ttl=180)
+def load_cached_airtable_reviews(key: str, base: str, table: str) -> Dict[str, Any]:
+    if not key or not base or not table:
+        return {}
+    try:
+        return store.fetch_airtable_reviews(key, base, table)
+    except Exception:
+        return {}
+
+
 # -------------------------------------------------------------------
 # Session State Initialization
 # -------------------------------------------------------------------
@@ -287,7 +297,7 @@ if "all_reviews" not in st.session_state:
     local_reviews = store.get_all_reviews()
     if SECRET_AIRTABLE_KEY and SECRET_AIRTABLE_BASE and SECRET_AIRTABLE_TABLE:
         try:
-            airtable_master = store.fetch_airtable_reviews(
+            airtable_master = load_cached_airtable_reviews(
                 SECRET_AIRTABLE_KEY, SECRET_AIRTABLE_BASE, SECRET_AIRTABLE_TABLE
             )
             for fid, rec in airtable_master.items():

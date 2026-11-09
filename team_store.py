@@ -316,7 +316,7 @@ def fetch_airtable_reviews(api_key: str, base_id: str, table_name: str) -> Dict[
             params = {}
             if offset:
                 params["offset"] = offset
-            resp = requests.get(url, headers=headers, params=params, timeout=20)
+            resp = requests.get(url, headers=headers, params=params, timeout=6)
             if not resp.ok:
                 break
             data = resp.json()
