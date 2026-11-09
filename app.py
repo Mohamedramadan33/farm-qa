@@ -730,89 +730,54 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
 
     # 1. Trees & Satellite Visual Detection
     with tab_trees:
-        st.subheader("🌳 رصد وتعداد الأشجار على صورة القمر الصناعي وخريطة المضلع")
-        st.caption("يتم رصد وترقيم كل شجرة على حدود المزرعة بنقاط خضراء واضحة، مع خوارزمية القمم الضوئية وتحديد دقيق للمسافات.")
+        st.subheader("🌳 رصد وتعداد الأشجار لكامل مساحة المزرعة (الحدود والأحواض الداخلية)")
+        st.caption("يتم رصد وترقيم الأشجار تلقائياً عبر كامل مساحة مضلع المزرعة والحدود باستخدام المسافات الزراعية الثابتة بالنظام وبدون أي تدخل يدوي.")
 
-        # Interactive Calibration Controls
-        with st.expander("🎚️ إعدادات ومعايرة دقة الرصد وحساسية التيجان (Detection Settings)", expanded=False):
-            t_col1, t_col2, t_col3 = st.columns(3)
-            with t_col1:
-                species_presets = {
-                    "تلقائي من نوع شجر الاستمارة": None,
-                    "جازورين (مصدات كثيفة - 2.0 متر)": 2.0,
-                    "كافور / أوكالبتوس (3.0 متر)": 3.0,
-                    "موالح / حمضيات (4.0 متر)": 4.0,
-                    "زيتون (5.0 متر)": 5.0,
-                    "مانجو / فاكهة كبيرة (6.0 متر)": 6.0,
-                    "نخيل (8.0 متر)": 8.0,
-                    "تخصيص يدوي للمسافة": "custom",
-                }
-                chosen_species = st.selectbox(
-                    "نوع شجر الحدود والمسافة:",
-                    options=list(species_presets.keys()),
-                    key=f"tree_spec_sel_{farm_id}",
-                )
-            with t_col2:
-                sel_sp = species_presets[chosen_species]
-                if sel_sp == "custom":
-                    custom_spacing = st.number_input(
-                        "المسافة بين الأشجار (متر):",
-                        min_value=1.0,
-                        max_value=25.0,
-                        value=3.0,
-                        step=0.5,
-                        key=f"custom_sp_inp_{farm_id}",
-                    )
-                elif sel_sp is not None:
-                    custom_spacing = float(sel_sp)
-                    st.text_input("المسافة المعتمدة:", value=f"{custom_spacing} متر", disabled=True, key=f"sp_disp_{farm_id}")
-                else:
-                    custom_spacing = None
-                    st.text_input("المسافة المعتمدة:", value="تلقائي حسب الاستمارة", disabled=True, key=f"sp_disp_{farm_id}")
-            with t_col3:
-                sens_val = st.slider(
-                    "حساسية قمم التيجان (Sensitivity):",
-                    min_value=0.10,
-                    max_value=1.00,
-                    value=0.50,
-                    step=0.05,
-                    key=f"tree_sens_val_{farm_id}",
-                    help="زيادة القيمة ترصد الأشجار الصغيرة والمتباعدة، وتقليلها يركز على الأشجار الكبيرة فقط.",
-                )
-
-        # Compute satellite canopy & visual tree detections
+        # Compute full-parcel tree detection automatically with system fixed spacings
         canopy_result = core.analyze_farm_satellite_canopy(
             poly_coords,
             perimeter_m,
             tree_type_str=farm.get("tree_type", ""),
-            custom_spacing_m=custom_spacing,
-            sensitivity=sens_val,
+            area_feddan=area_gps_feddan,
+        )
+
+        # Fixed agronomic system badge
+        tree_type_display = farm.get("tree_type", "بساتين عامة / شجر حدود")
+        st.info(
+            f"🌲 **نظام الرصد التلقائي:** يتم حساب كامل مساحة المزرعة بمسافة ثابتة معتمدة هندسياً **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}**"
         )
 
         tr_c1, tr_c2, tr_c3, tr_c4 = st.columns(4)
         with tr_c1:
             st.metric(
-                "الأشجار المرصودة بالقمر الصناعي (AI)",
+                "الأشجار المرصودة (AI بكامل المساحة)",
                 f"{canopy_result['ai_count']} شجرة",
                 f"نطاق: {canopy_result['ai_low']} - {canopy_result['ai_high']}",
             )
         with tr_c2:
             st.metric("عدد المهندس بالاستمارة", f"{farm.get('tree_number', 0)} شجرة")
         with tr_c3:
-            st.metric("توقع المسافات الهندسية", f"{canopy_result['forecast'] or 0} شجرة")
+            st.metric("نسبة الغطاء النباتي للمزرعة", f"{canopy_result['veg_pct']}%")
         with tr_c4:
-            st.metric("نوع شجر الحدود", farm.get("tree_type", "غير محدد"))
+            st.metric("مسافة النظام الثابتة", f"{canopy_result['spacing_m']} متر")
 
-        st.info(
-            f"🌱 نسبة الغطاء النباتي على الحدود: **{canopy_result['veg_pct']}%** | 📏 مسافة الشجر المعتمدة: **{canopy_result['spacing_m']} متر** | 📅 تاريخ الالتقاط: **{canopy_result['imagery_date']}**"
-        )
+        kobo_trees = int(farm.get("tree_number", 0) or 0)
+        ai_trees = canopy_result["ai_count"]
+        if kobo_trees > 0:
+            diff = ai_trees - kobo_trees
+            if abs(diff) <= max(5, int(kobo_trees * 0.15)):
+                st.success(f"✅ مطابقة ممتازة: رصد الذكاء الاصطناعي لكامل المساحة ({ai_trees} شجرة) متطابق مع عدد المهندس ({kobo_trees} شجرة).")
+            elif diff > 0:
+                st.info(f"ℹ️ تم رصد {ai_trees} شجرة بالقمر الصناعي بكامل مساحة المزرعة مقابل {kobo_trees} شجرة مسجلة بالاستمارة (زيادة {diff}+).")
+            else:
+                st.warning(f"⚠️ تم رصد {ai_trees} شجرة بالقمر الصناعي بكامل المساحة مقابل {kobo_trees} شجرة مسجلة بالاستمارة (عجز {abs(diff)}-).")
 
-        # High-Resolution Satellite Image with Counted Trees Drawn on it
+        # High-Resolution Satellite Image with Counted Trees Drawn Across the Entire Farm Parcel
         if canopy_result.get("annotated_img") is not None:
-            st.markdown("##### 🛰️ صورة القمر الصناعي محدد عليها الأشجار المرصودة بالأرقام:")
+            st.markdown("##### 🛰️ صورة القمر الصناعي محدد عليها الأشجار المرصودة بكامل مساحة المزرعة والحدود:")
             safe_image(
                 canopy_result["annotated_img"],
-                caption=f"صورة القمر الصناعي — تم رصد وتحديد {canopy_result['ai_count']} شجرة على امتداد محيط المزرعة",
+                caption=f"صورة القمر الصناعي — تم رصد وتحديد {canopy_result['ai_count']} شجرة عبر كامل مساحة مضلع المزرعة والحدود (مسافة ثابتة: {canopy_result['spacing_m']} متر)",
             )
 
         st.markdown("---")

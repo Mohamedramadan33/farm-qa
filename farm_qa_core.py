@@ -22,15 +22,45 @@ from shapely.validation import make_valid
 FEDDAN_M2 = 4200.83
 DUP_IOU_THRESHOLD = 0.80
 
-BOUNDARY_SPACING_M = {
+# Fixed standard agronomic distances for trees across parcel & boundary (محددات هندسية زراعية ثابتة)
+FIXED_STANDARD_TREE_SPACING = {
+    # Windbreaks & boundary trees (مصدات الرياح وأشجار الحدود)
     "جازورين": 2.5, "كازورينا": 2.5, "casuarina": 2.5,
-    "كافور": 2.5, "ماهوجني": 3.0, "mahogany": 3.0,
-    "فيكس": 3.0, "ficus": 3.0, "توت": 3.5,
-    "نخيل": 6.0, "نخل": 6.0, "palm": 6.0,
-    "زيتون": 5.0, "olive": 5.0, "مانجو": 5.0,
-    "مانجا": 5.0, "mango": 5.0, "موالح": 4.0,
-    "citrus": 4.0, "موز": 3.0, "banana": 3.0,
+    "كافور": 3.0, "eucalyptus": 3.0, "أوكالبتوس": 3.0,
+    "ماهوجني": 3.5, "mahogany": 3.5,
+    "فيكس": 3.5, "ficus": 3.5,
+    "توت": 4.0, "mulberry": 4.0,
+
+    # Orchards & Field parcel trees (بساتين وأشجار داخل كامل مساحة المزرعة)
+    "نخيل": 7.0, "نخل": 7.0, "بلح": 7.0, "تمر": 7.0, "palm": 7.0, "dates": 7.0,
+    "زيتون": 5.0, "olive": 5.0,
+    "مانجو": 6.0, "مانجا": 6.0, "mango": 6.0,
+    "موالح": 4.0, "برتقال": 4.0, "ليمون": 4.0, "يوسفي": 4.0, "citrus": 4.0, "orange": 4.0,
+    "رمان": 4.0, "pomegranate": 4.0,
+    "عنب": 3.0, "كرم": 3.0, "grape": 3.0,
+    "تين": 4.0, "fig": 4.0,
+    "موز": 3.0, "banana": 3.0,
+    "جوافة": 4.0, "guava": 4.0,
+    "خوخ": 4.0, "peach": 4.0,
+    "مشمش": 4.0, "apricot": 4.0,
+    "برقوق": 4.0, "plum": 4.0,
+    "تفاح": 4.0, "apple": 4.0,
+    "كمثرى": 4.0, "pear": 4.0,
 }
+
+BOUNDARY_SPACING_M = FIXED_STANDARD_TREE_SPACING
+
+
+def get_fixed_tree_spacing(tree_type_str: str) -> float:
+    """
+    Returns fixed agronomic standard distance in meters automatically from the tree type.
+    Defaults to 4.0 meters for general orchards.
+    """
+    t_clean = (tree_type_str or "").lower().strip()
+    for k, v in FIXED_STANDARD_TREE_SPACING.items():
+        if k in t_clean:
+            return v
+    return 4.0
 
 AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
@@ -852,36 +882,31 @@ def analyze_farm_satellite_canopy(
     zoom: int = 18,
     custom_spacing_m: Optional[float] = None,
     sensitivity: float = 0.5,
+    area_feddan: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Fast canopy & boundary tree analysis with optical crown peak snapping:
-    - Never blocks the CPU or hangs Streamlit Cloud!
-    - Stitches satellite tiles covering the farm boundary.
-    - Computes Excess Green Index along 8m corridor and locks onto crown peaks.
-    - Supports interactive sensitivity tuning and species spacing.
+    Automatic Full-Parcel Tree Detection across entire farm area (interior + boundary):
+    - Uses fixed standard agronomic distances automatically from tree type.
+    - Scans the entire parcel polygon area (not just the boundary).
+    - Detects optical crown peaks (ExG local maxima) with zero manual inputs required.
     """
+    # 1. Automatic fixed standard agronomic spacing
     if custom_spacing_m is not None and custom_spacing_m > 0:
         spacing_m = float(custom_spacing_m)
     else:
-        spacing_m = 3.0
-        for k, v in BOUNDARY_SPACING_M.items():
-            if k in tree_type_str:
-                spacing_m = v
-                break
-
-    forecast = int(round(perimeter_m / spacing_m)) if perimeter_m > 0 else 0
-
+        spacing_m = get_fixed_tree_spacing(tree_type_str)
 
     if not coords_lon_lat or len(coords_lon_lat) < 3:
         return {
-            "ai_count": forecast,
-            "ai_low": max(0, int(round(forecast * 0.85))),
-            "ai_high": int(round(forecast * 1.15)),
-            "veg_pct": 50.0,
-            "forecast": forecast,
+            "ai_count": 0,
+            "ai_low": 0,
+            "ai_high": 0,
+            "veg_pct": 0.0,
+            "forecast": 0,
             "imagery_date": "غير متاح",
             "annotated_img": None,
             "spacing_m": spacing_m,
+            "tree_points": [],
         }
 
     min_lon = min(p[0] for p in coords_lon_lat)
@@ -927,141 +952,133 @@ def analyze_farm_satellite_canopy(
 
     poly_px = [to_px(p[0], p[1]) for p in coords_lon_lat]
 
-    corridor_img = Image.new("L", (width_px, height_px), 0)
-    draw_corr = ImageDraw.Draw(corridor_img)
-    corridor_px_width = 16 if zoom == 18 else 8
-    draw_corr.polygon(poly_px, outline=255, fill=0, width=corridor_px_width)
+    # Full Parcel Mask (Interior + Boundary)
+    parcel_mask_img = Image.new("L", (width_px, height_px), 0)
+    draw_parcel = ImageDraw.Draw(parcel_mask_img)
+    draw_parcel.polygon(poly_px, outline=255, fill=255)
 
     arr = np.array(stitched, dtype=np.float32)
     r = arr[:, :, 0]
     g = arr[:, :, 1]
     b = arr[:, :, 2]
+    exg = 2.0 * g - r - b
 
-    corr_mask = np.array(corridor_img) > 0
-    total_corr_pixels = int(np.sum(corr_mask))
+    parcel_mask = np.array(parcel_mask_img) > 0
+    total_parcel_pixels = int(np.sum(parcel_mask))
 
-    # Dynamic sensitivity calibration (0.1 to 1.0)
-    sens = max(0.1, min(1.0, float(sensitivity)))
-    exg_thresh = max(2.0, 22.0 - (sens * 16.0))      # sens=0.5 -> 14.0; sens=1.0 -> 6.0
-    peak_min_exg = max(1.0, 14.0 - (sens * 12.0))    # sens=0.5 -> 8.0; sens=1.0 -> 2.0
-    sep_ratio = max(0.35, 0.70 - (sens * 0.25))       # sens=0.5 -> 0.575; sens=1.0 -> 0.45
-
-    if total_corr_pixels > 0 and has_tile:
-        exg = 2.0 * g - r - b
-        veg_pixels = (exg > exg_thresh) & corr_mask
-        veg_pct = round(float(np.sum(veg_pixels) / total_corr_pixels * 100.0), 1)
-
-        density_factor = veg_pct / 100.0
-        ai_raw = forecast * (0.4 + 0.7 * density_factor)
-        ai_count = int(round(ai_raw))
-        ai_low = max(0, int(round(ai_count * 0.85)))
-        ai_high = int(round(ai_count * 1.15))
+    if total_parcel_pixels > 0 and has_tile:
+        veg_pixels = (exg > 8.0) & parcel_mask
+        veg_pct = round(float(np.sum(veg_pixels) / total_parcel_pixels * 100.0), 1)
     else:
-        veg_pct = 45.0
-        ai_count = forecast
-        ai_low = int(round(forecast * 0.85))
-        ai_high = int(round(forecast * 1.15))
+        veg_pct = 50.0
 
-    annotated = stitched.copy()
-    draw_ann = ImageDraw.Draw(annotated)
-
-    # 1. Draw boundary line
-    draw_ann.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
-
-    # 2. Optical Crown Peak Detection & Drawing along Polygon Perimeter
-    tree_points_coords: List[Dict[str, Any]] = []
-    tree_counter = 0
-
-    # Calculate total pixel perimeter
+    # Calculate pixel scale
     total_px_len = 0.0
     for i in range(len(poly_px) - 1):
         pA, pB = poly_px[i], poly_px[i + 1]
         total_px_len += math.hypot(pB[0] - pA[0], pB[1] - pA[1])
 
-    # Pixels per meter
     px_per_m = total_px_len / max(perimeter_m, 1.0)
-    spacing_px = max(8.0, spacing_m * px_per_m)
-    search_r = int(max(4, spacing_px * 0.45))
+    spacing_px = max(6.0, spacing_m * px_per_m)
+    search_r = max(2, int(spacing_px * 0.40))
+
+    annotated = stitched.copy()
+    draw_ann = ImageDraw.Draw(annotated)
+
+    # 1. Draw boundary line around the farm
+    draw_ann.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
 
     placed_points: List[Tuple[int, int]] = []
+    tree_points_coords: List[Dict[str, Any]] = []
 
+    # 2. Scan entire parcel interior (بكامل مساحة المزرعة من الداخل)
+    min_x = max(0, min(p[0] for p in poly_px))
+    max_x = min(width_px - 1, max(p[0] for p in poly_px))
+    min_y = max(0, min(p[1] for p in poly_px))
+    max_y = min(height_px - 1, max(p[1] for p in poly_px))
+
+    step_px = max(5, int(spacing_px * 0.85))
+
+    for gy in range(min_y + 2, max_y - 2, step_px):
+        for gx in range(min_x + 2, max_x - 2, step_px):
+            if parcel_mask[gy, gx]:
+                win_y1 = max(0, gy - search_r)
+                win_y2 = min(height_px, gy + search_r + 1)
+                win_x1 = max(0, gx - search_r)
+                win_x2 = min(width_px, gx + search_r + 1)
+                sub_exg = exg[win_y1:win_y2, win_x1:win_x2]
+                sub_mask = parcel_mask[win_y1:win_y2, win_x1:win_x2]
+                if np.any(sub_mask):
+                    masked_exg = np.where(sub_mask, sub_exg, -999.0)
+                    max_pos = np.unravel_index(np.argmax(masked_exg), masked_exg.shape)
+                    peak_val = masked_exg[max_pos]
+                    if peak_val > 6.0:  # Green foliage peak
+                        cand_y = win_y1 + int(max_pos[0])
+                        cand_x = win_x1 + int(max_pos[1])
+                        if not any(math.hypot(cand_x - px, cand_y - py) < (spacing_px * 0.65) for px, py in placed_points):
+                            placed_points.append((cand_x, cand_y))
+
+    # 3. Scan boundary edges (مصدات الرياح والأشجار الحدودية)
     for i in range(len(poly_px) - 1):
         pA, pB = poly_px[i], poly_px[i + 1]
         seg_len = math.hypot(pB[0] - pA[0], pB[1] - pA[1])
         if seg_len <= 1.0:
             continue
-
         num_trees_seg = max(1, int(round(seg_len / spacing_px)))
         for t_idx in range(num_trees_seg):
             ratio = t_idx / num_trees_seg
-            tx = pA[0] + ratio * (pB[0] - pA[0])
-            ty = pA[1] + ratio * (pB[1] - pA[1])
+            tx = int(round(pA[0] + ratio * (pB[0] - pA[0])))
+            ty = int(round(pA[1] + ratio * (pB[1] - pA[1])))
+            win_y1 = max(0, ty - search_r)
+            win_y2 = min(height_px, ty + search_r + 1)
+            win_x1 = max(0, tx - search_r)
+            win_x2 = min(width_px, tx + search_r + 1)
+            if win_y2 > win_y1 and win_x2 > win_x1:
+                sub_exg = exg[win_y1:win_y2, win_x1:win_x2]
+                max_pos = np.unravel_index(np.argmax(sub_exg), sub_exg.shape)
+                if sub_exg[max_pos] > 6.0:
+                    cand_y = win_y1 + int(max_pos[0])
+                    cand_x = win_x1 + int(max_pos[1])
+                    if not any(math.hypot(cand_x - px, cand_y - py) < (spacing_px * 0.60) for px, py in placed_points):
+                        placed_points.append((cand_x, cand_y))
 
-            # Snap to local greenness peak (ExG) around (tx, ty)
-            best_x, best_y = int(round(tx)), int(round(ty))
-            if has_tile and total_corr_pixels > 0:
-                win_y1 = max(0, int(ty) - search_r)
-                win_y2 = min(height_px, int(ty) + search_r + 1)
-                win_x1 = max(0, int(tx) - search_r)
-                win_x2 = min(width_px, int(tx) + search_r + 1)
-                if win_y2 > win_y1 and win_x2 > win_x1:
-                    sub_exg = exg[win_y1:win_y2, win_x1:win_x2]
-                    max_pos = np.unravel_index(np.argmax(sub_exg), sub_exg.shape)
-                    candidate_y = win_y1 + int(max_pos[0])
-                    candidate_x = win_x1 + int(max_pos[1])
-                    if sub_exg[max_pos] > peak_min_exg:
-                        best_x, best_y = candidate_x, candidate_y
+    # Draw tree points & badges
+    step_badge = max(10, len(placed_points) // 10) if len(placed_points) > 20 else 1
+    for t_idx, (tx, ty) in enumerate(placed_points):
+        tree_id = t_idx + 1
+        r_mark = 4
+        draw_ann.ellipse([tx - r_mark - 1, ty - r_mark - 1, tx + r_mark + 1, ty + r_mark + 1], fill=(0, 0, 0))
+        draw_ann.ellipse([tx - r_mark, ty - r_mark, tx + r_mark, ty + r_mark], fill=(34, 197, 94))
 
-            # Ensure minimum separation to avoid duplicate clusters
-            too_close = any(math.hypot(best_x - px, best_y - py) < (spacing_px * sep_ratio) for px, py in placed_points)
-            if too_close:
-                continue
+        if tree_id == 1 or tree_id % step_badge == 0 or tree_id == len(placed_points):
+            b_txt = str(tree_id)
+            draw_ann.rectangle([tx + 4, ty - 8, tx + 4 + len(b_txt) * 8, ty + 6], fill=(15, 23, 42), outline=(0, 255, 200))
+            draw_ann.text((tx + 6, ty - 7), b_txt, fill=(255, 255, 255))
 
-            placed_points.append((best_x, best_y))
-            tree_counter += 1
+        lat_rad_t = math.atan(math.sinh(math.pi * (1 - 2 * (y_min + ty / 256.0) / (2.0 ** zoom))))
+        lat_deg_t = math.degrees(lat_rad_t)
+        lon_deg_t = (x_min + tx / 256.0) / (2.0 ** zoom) * 360.0 - 180.0
+        tree_points_coords.append({
+            "id": tree_id,
+            "lat": lat_deg_t,
+            "lon": lon_deg_t,
+            "px": (tx, ty),
+        })
 
-            # Draw circular tree crown marker (Lime green with dark ring)
-            r_mark = 5
-            draw_ann.ellipse([best_x - r_mark - 1, best_y - r_mark - 1, best_x + r_mark + 1, best_y + r_mark + 1], fill=(0, 0, 0))
-            draw_ann.ellipse([best_x - r_mark, best_y - r_mark, best_x + r_mark, best_y + r_mark], fill=(34, 197, 94))
+    final_ai_count = len(placed_points)
 
-            # Number every 10th tree or first tree
-            if tree_counter == 1 or tree_counter % 10 == 0:
-                badge_txt = str(tree_counter)
-                draw_ann.rectangle([best_x + 5, best_y - 9, best_x + 5 + len(badge_txt) * 9, best_y + 7], fill=(15, 23, 42), outline=(0, 255, 200))
-                draw_ann.text((best_x + 7, best_y - 8), badge_txt, fill=(255, 255, 255))
-
-            lat_rad_t = math.atan(math.sinh(math.pi * (1 - 2 * (y_min + best_y / 256.0) / (2.0 ** zoom))))
-            lat_deg_t = math.degrees(lat_rad_t)
-            lon_deg_t = (x_min + best_x / 256.0) / (2.0 ** zoom) * 360.0 - 180.0
-
-            tree_points_coords.append({
-                "id": tree_counter,
-                "lat": lat_deg_t,
-                "lon": lon_deg_t,
-                "px": (best_x, best_y),
-            })
-
-
-    # Total trees count: adjust with corridor vegetation factor
-    if tree_counter > 0:
-        density_factor = veg_pct / 100.0
-        final_ai_count = int(round(tree_counter * (0.6 + 0.5 * density_factor)))
-    else:
-        final_ai_count = forecast
-
-    # 3. Draw Header Stats Overlay Banner on the Image
+    # Header stats overlay banner on the image
     banner_h = 36
     draw_ann.rectangle([0, 0, width_px, banner_h], fill=(15, 23, 42))
-    header_text = f"TREE COUNT: {final_ai_count} trees | Spacing: {spacing_m}m | Veg: {veg_pct}% | Date: {imagery_date or 'Recent'}"
+    header_text = f"ALL-AREA TREE COUNT: {final_ai_count} trees | Fixed Spacing: {spacing_m}m | Veg: {veg_pct}% | Date: {imagery_date or 'Recent'}"
     draw_ann.text((12, 10), header_text, fill=(0, 255, 200))
 
     return {
         "ai_count": final_ai_count,
-        "ai_low": max(0, int(round(final_ai_count * 0.85))),
-        "ai_high": int(round(final_ai_count * 1.15)),
+        "ai_low": max(0, int(round(final_ai_count * 0.90))),
+        "ai_high": int(round(final_ai_count * 1.10)),
         "veg_pct": veg_pct,
-        "forecast": forecast,
+        "forecast": final_ai_count,
         "imagery_date": imagery_date or "حديث",
         "annotated_img": annotated,
         "spacing_m": spacing_m,
