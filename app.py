@@ -160,6 +160,7 @@ DEMO_FARMS = [
         "tree_number": 420,
         "gps_polygon": "30.0125 31.1820 18 3; 30.0145 31.1855 18 3; 30.0110 31.1870 18 3; 30.0090 31.1830 18 3; 30.0125 31.1820 18 3",
         "soil_points": "30.0120 31.1835; 30.0135 31.1850; 30.0115 31.1860; 30.0100 31.1835",
+        "_validation_status": {"uid": "validation_status_approved", "label": "Approved", "color": "#17B890"},
         "attachments": [],
         "photos": [
             {"filename": "boundary_photo.jpg", "url": "https://images.unsplash.com/photo-1500382017468-9049fed747ef?w=600&auto=format&fit=crop", "title": "صورة أشجار الحدود (جازورين)"},
@@ -187,6 +188,7 @@ DEMO_FARMS = [
         "tree_number": 190,
         "gps_polygon": "30.6520 30.1210 22 2; 30.6550 30.1245 22 2; 30.6530 30.1280 22 2; 30.6495 30.1240 22 2; 30.6520 30.1210 22 2",
         "soil_points": "30.6525 30.1230; 30.6540 30.1250; 30.6520 30.1265; 30.6505 30.1235",
+        "_validation_status": {"uid": "validation_status_on_hold", "label": "On hold", "color": "#F39C12"},
         "attachments": [],
         "photos": [
             {"filename": "olive_trees.jpg", "url": "https://images.unsplash.com/photo-1541888946425-d0fbb186f5f7?w=600&auto=format&fit=crop", "title": "صورة أشجار الزيتون على الحدود"},
@@ -212,6 +214,7 @@ DEMO_FARMS = [
         "tree_number": 310,
         "gps_polygon": "28.1150 30.7420 40 4; 28.1180 30.7460 40 4; 28.1140 30.7490 40 4; 28.1110 30.7440 40 4; 28.1150 30.7420 40 4",
         "soil_points": "28.1155 30.7435; 28.1170 30.7455; 28.1135 30.7470",
+        "_validation_status": {"uid": "validation_status_not_approved", "label": "Not approved", "color": "#E55E5E"},
         "attachments": [],
         "photos": [
             {"filename": "palm_field.jpg", "url": "https://images.unsplash.com/photo-1509316975850-ff9c5deb0cd9?w=600&auto=format&fit=crop", "title": "صورة النخيل ومصدات الرياح"},
@@ -237,6 +240,7 @@ DEMO_FARMS = [
         "tree_number": 180,
         "gps_polygon": "29.3120 30.8250 12 3; 29.3150 30.8280 12 3; 29.3130 30.8310 12 3; 29.3100 30.8270 12 3; 29.3120 30.8250 12 3",
         "soil_points": "29.3125 30.8260; 29.3140 30.8285; 29.3128 30.8295; 29.3110 30.8265",
+        "_validation_status": {},
         "attachments": [],
         "photos": [],
         "flat": {},
@@ -456,6 +460,28 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
             placeholder="مثال: 001 أو الهدى أو رضوان أو أحمد...",
         ).strip().lower()
 
+    # Quick Validation Counts
+    val_counts = {
+        "all": len(raw_farms),
+        "approved": sum(1 for f in raw_farms if core.normalize_kobo_validation_status(f.get("_validation_status"))["code"] == "approved"),
+        "not_approved": sum(1 for f in raw_farms if core.normalize_kobo_validation_status(f.get("_validation_status"))["code"] == "not_approved"),
+        "on_hold": sum(1 for f in raw_farms if core.normalize_kobo_validation_status(f.get("_validation_status"))["code"] == "on_hold"),
+        "unvalidated": sum(1 for f in raw_farms if core.normalize_kobo_validation_status(f.get("_validation_status"))["code"] == "unvalidated"),
+    }
+
+    st.markdown(
+        f"""
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px;">
+            <span style="background: rgba(255,255,255,0.06); padding: 4px 12px; border-radius: 16px; font-size: 0.85rem; border: 1px solid rgba(255,255,255,0.12);">📊 إجمالي المزارع: <b>{val_counts['all']}</b></span>
+            <span style="background: rgba(16,185,129,0.15); color: #34d399; padding: 4px 12px; border-radius: 16px; font-size: 0.85rem; border: 1px solid rgba(16,185,129,0.3);">✅ Approved: <b>{val_counts['approved']}</b></span>
+            <span style="background: rgba(239,68,68,0.15); color: #f87171; padding: 4px 12px; border-radius: 16px; font-size: 0.85rem; border: 1px solid rgba(239,68,68,0.3);">❌ Not approved: <b>{val_counts['not_approved']}</b></span>
+            <span style="background: rgba(245,158,11,0.15); color: #fbbf24; padding: 4px 12px; border-radius: 16px; font-size: 0.85rem; border: 1px solid rgba(245,158,11,0.3);">⏳ On hold: <b>{val_counts['on_hold']}</b></span>
+            <span style="background: rgba(148,163,184,0.15); color: #cbd5e1; padding: 4px 12px; border-radius: 16px; font-size: 0.85rem; border: 1px solid rgba(148,163,184,0.3);">⚪ غير محدد (-): <b>{val_counts['unvalidated']}</b></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # Filters row
     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
     with f_col1:
@@ -480,8 +506,27 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
         govs = sorted(list(set(f.get("governorate", "غير محدد") for f in raw_farms)))
         filter_gov = st.selectbox("المحافظة:", options=["الكل"] + govs)
     with f_col4:
-        val_options = ["الكل", "Approved", "Not Approved", "On Hold", "لم تحدد"]
-        filter_val = st.selectbox("حالة Kobo Validation:", options=val_options)
+        val_filter_choices = [
+            "Show all",
+            "Approved",
+            "Not approved",
+            "On hold",
+            "-",
+        ]
+        val_display_map = {
+            "Show all": f"Show all (عرض كل المزارع — {val_counts['all']})",
+            "Approved": f"Approved (المعتمدة فقط — {val_counts['approved']})",
+            "Not approved": f"Not approved (المرفوضة فقط — {val_counts['not_approved']})",
+            "On hold": f"On hold (المعلقة فقط — {val_counts['on_hold']})",
+            "-": f"- (غير المحددة — {val_counts['unvalidated']})",
+        }
+        filter_val = st.selectbox(
+            "عمود اعتماد Kobo (Validation):",
+            options=val_filter_choices,
+            format_func=lambda v: val_display_map.get(v, v),
+            index=0,
+            key="kobo_validation_filter_box",
+        )
 
     # Filter Logic
     matched_farms = []
@@ -500,8 +545,9 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
         rev = reviews_master.get(fid, {})
         rev_status = rev.get("Form_Status", "Pending Review")
 
-        kobo_val_raw = f.get("_validation_status", {})
-        kobo_val_label = kobo_val_raw.get("label", "لم تحدد") if isinstance(kobo_val_raw, dict) else "لم تحدد"
+        val_info = core.normalize_kobo_validation_status(f.get("_validation_status"))
+        val_code = val_info["code"]       # "approved", "not_approved", "on_hold", "unvalidated"
+        val_label = val_info["label_en"]   # "Approved", "Not approved", "On hold", "-"
 
         # Apply search query
         if search_query:
@@ -516,7 +562,15 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
             continue
         if filter_gov != "الكل" and gov != filter_gov:
             continue
-        if filter_val != "الكل" and filter_val not in kobo_val_label:
+
+        # Exact Kobo Validation filter
+        if filter_val == "Approved" and val_code != "approved":
+            continue
+        elif filter_val == "Not approved" and val_code != "not_approved":
+            continue
+        elif filter_val == "On hold" and val_code != "on_hold":
+            continue
+        elif filter_val == "-" and val_code != "unvalidated":
             continue
 
         matched_farms.append({
@@ -530,11 +584,15 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
             "area": f.get("farm_area", 0.0),
             "assigned_to": assigned_to,
             "status": rev_status,
-            "val_status": kobo_val_label,
+            "val_status": val_label,
+            "val_code": val_code,
             "raw": f,
         })
 
-    st.write(f"تم العثور على **{len(matched_farms)}** مزرعة مطابقة لشروط البحث.")
+    if filter_val != "Show all":
+        st.info(f"🔍 يتم الآن عرض المزارع بحالة Validation: **{filter_val}** فقط (العدد: **{len(matched_farms)}**)")
+    else:
+        st.write(f"تم العثور على **{len(matched_farms)}** مزرعة مطابقة لشروط البحث.")
 
     # Work table with inline quick assignment selector
     if matched_farms:
@@ -549,7 +607,7 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
                 "المساحة (فدان)": m["area"],
                 "المراجع المسند": wd.display_name(m["assigned_to"]),
                 "قرار المراجعة": m["status"],
-                "اعتماد Kobo": m["val_status"],
+                "Validation (اعتماد Kobo)": m["val_status"],
             })
         st.dataframe(pd.DataFrame(display_data), use_container_width=True, hide_index=True)
 
