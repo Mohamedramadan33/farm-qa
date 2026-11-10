@@ -441,7 +441,32 @@ function detectCanopyTrees(
           }
         }
       }
-      if (!isMax) continue;
+      // Annular Contrast Drop Test (عزل المحاصيل والأراضي الزراعية المسطحة)
+      // Flat agricultural crops (clover, wheat, alfalfa) have uniform greenness across the plot.
+      // An upright tree crown dome drops sharply into soil / canopy edge / shadow.
+      const rIn = Math.max(2, Math.round(crownRadiusPx * 0.75));
+      const rOut = Math.max(rIn + 2, Math.round(crownRadiusPx * 2.0));
+      let ringAcc = 0;
+      let ringCnt = 0;
+      for (let dy = -rOut; dy <= rOut; dy += 2) {
+        for (let dx = -rOut; dx <= rOut; dx += 2) {
+          const distSq = dx * dx + dy * dy;
+          if (distSq >= rIn * rIn && distSq <= rOut * rOut) {
+            const ny = y + dy;
+            const nx = x + dx;
+            if (ny >= 0 && ny < h && nx >= 0 && nx < w) {
+              ringAcc += canopyScore[ny * w + nx];
+              ringCnt++;
+            }
+          }
+        }
+      }
+      const ringMean = ringCnt > 0 ? ringAcc / ringCnt : val;
+      const annularDrop = val - ringMean;
+
+      // Reject flat crop fields: require crown annular drop >= 0.055 (or boundary shelterbelt)
+      const onBoundary = Boolean(boundaryMask[idx]);
+      if (!onBoundary && annularDrop < 0.055) continue;
 
       // Estimate local crown size
       let rPx = crownRadiusPx * 1.35;

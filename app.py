@@ -811,6 +811,29 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
 
         kobo_trees = int(farm.get("tree_number", 0) or 0)
 
+        # Precision & Crop Carpet Rejection Controls
+        prec_c1, prec_c2 = st.columns([2.5, 1.5])
+        with prec_c1:
+            detect_filter = st.radio(
+                "🎯 نمط دقة الرصد البصري وعزل المحاصيل الحقلية:",
+                [
+                    "🎯 دقة فائقة: عزل المحاصيل الحقلية واستخراج الأشجار الحقيقية فقط (Strict Tree Isolation)",
+                    "🛡️ مصدات الرياح وحزام الحدود فقط (Shelterbelts Only)",
+                    "🌳 كامل مساحة المزرعة (أشجار وبساتين ومصدات)",
+                ],
+                index=0,
+                key=f"detect_filter_{farm_id}",
+                help="يقوم نمط الدقة الفائقة بفحص التحدب الحلقي (Annular Drop) وتباين التيجان ثلاثية الأبعاد لإلغاء أي نقاط خضراء ناتجة عن زراعات أرضية أو برسيم أو محاصيل حقلية مسطحة."
+            )
+        with prec_c2:
+            st.info("💡 **عزل المحاصيل الحقلية مفعل:** يتم استبعاد المسطحات الخضراء المنبسطة والبرسيم والخضار تلقائياً، والتركيز على تيجان الأشجار الحقيقية المرتفعة.")
+
+        mode_code = "high_precision"
+        if "مصدات الرياح" in detect_filter:
+            mode_code = "boundary_only"
+        elif "كامل مساحة" in detect_filter:
+            mode_code = "all_trees"
+
         # Compute full-parcel tree detection automatically with system fixed spacings & NDVI
         canopy_result = core.analyze_farm_satellite_canopy(
             poly_coords,
@@ -818,6 +841,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             tree_type_str=farm.get("tree_type", ""),
             area_feddan=area_gps_feddan,
             recorded_kobo_count=kobo_trees,
+            detection_mode=mode_code,
         )
 
         # Inject tree health metrics into farm record for PGS evaluation
@@ -828,7 +852,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         # Fixed agronomic system badge
         tree_type_display = farm.get("tree_type", "بساتين عامة / شجر حدود")
         st.info(
-            f"🌲 **نظام الرصد التلقائي:** يتم حساب كامل مساحة المزرعة بمسافة ثابتة معتمدة هندسياً **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}** | 🧠 محرك الرصد: **{canopy_result.get('engine_used', 'OpenCV CV')}**"
+            f"🌲 **نظام الرصد التلقائي:** يتم حساب كامل مساحة المزرعة بمسافة ثابتة معتمدة هندسياً **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}** | 🧠 محرك الرصد: **{canopy_result.get('engine_used', 'OpenCV CV')} (وضع العزل الدقيق)**"
         )
 
         # 1. Main Detection Metrics

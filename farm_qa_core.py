@@ -963,6 +963,7 @@ def analyze_farm_satellite_canopy(
     sensitivity: float = 0.5,
     area_feddan: float = 0.0,
     recorded_kobo_count: Optional[int] = None,
+    detection_mode: str = "high_precision",
 ) -> Dict[str, Any]:
     """
     وحدة التحليل الجغرافية والبصرية المتكاملة (GIS & Computer Vision Module):
@@ -1091,6 +1092,7 @@ def analyze_farm_satellite_canopy(
         satellite_image=stitched,
         parcel_poly_px=poly_px,
         pixel_spacing_px=spacing_px,
+        detection_mode=detection_mode,
     )
 
     final_ai_count = cv_res["total_trees"]
