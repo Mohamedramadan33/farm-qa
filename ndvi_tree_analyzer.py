@@ -10,6 +10,7 @@ GIS & Computer Vision Module for Agricultural Farm QA Audit:
 """
 
 from typing import Dict, Any, List, Optional, Tuple, Union
+import os
 import math
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -163,17 +164,23 @@ def detect_and_classify_trees(
     parcel_mask = np.array(parcel_mask_img) > 0
     total_parcel_pixels = int(np.sum(parcel_mask))
 
-    # 3. Candidate Tree Detection
+    # 3. Candidate Tree Detection (Auto-detect best.pt in app root or models/)
     detected_boxes: List[Dict[str, Any]] = []
     used_yolo = False
+    active_yolo_path = yolo_model_path
 
-    # Attempt YOLO detection if requested
-    if HAS_YOLO and yolo_model_path:
+    if not active_yolo_path:
+        for cand in ["best.pt", "models/best.pt", "/mount/src/farm-qa/best.pt", "/mount/src/farm-qa/models/best.pt"]:
+            if os.path.exists(cand):
+                active_yolo_path = cand
+                break
+
+    # Attempt YOLO deep learning detection if available
+    if HAS_YOLO and active_yolo_path:
         try:
-            model = YOLO(yolo_model_path)
-            yolo_res = model.predict(source=np.array(orig_img), conf=0.25, verbose=False)
+            model = YOLO(active_yolo_path)
+            yolo_res = model.predict(source=np.array(orig_img), conf=0.18, verbose=False)
             if yolo_res and len(yolo_res) > 0 and len(yolo_res[0].boxes) > 0:
-                used_yolo = True
                 for b in yolo_res[0].boxes:
                     xyxy = b.xyxy[0].cpu().numpy()
                     bx1, by1, bx2, by2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
@@ -184,6 +191,8 @@ def detect_and_classify_trees(
                             "center": (cx, cy),
                             "conf": float(b.conf[0].cpu().numpy()),
                         })
+                if detected_boxes:
+                    used_yolo = True
         except Exception:
             used_yolo = False
 
@@ -454,6 +463,7 @@ def detect_and_classify_trees(
         "parcel_veg_coverage_pct": parcel_veg_coverage_pct,
         "annotated_image": annotated_img,
         "ndvi_heatmap_image": ndvi_heatmap,
-        "trees_data": trees_classified,
-        "engine_used": "YOLO v8" if used_yolo else "OpenCV Precision Spectral Morphology",
+        "engine_used": f"YOLOv8 Nano AI ({os.path.basename(active_yolo_path)})" if used_yolo else "OpenCV Precision Spectral Morphology",
+        "yolo_model_loaded": used_yolo,
+        "yolo_model_path": active_yolo_path if used_yolo else None,
     }

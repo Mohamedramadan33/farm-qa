@@ -1,0 +1,8 @@
+# YOLOv8 Tree Crown Detection Dataset Configuration
+path: ./dataset
+train: images/train
+val: images/val
+
+# Classes
+names:
+  0: tree

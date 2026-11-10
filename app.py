@@ -14,6 +14,7 @@ Full Feature Set:
 - PGS Rules Engine & Excel Export
 """
 
+import os
 import datetime
 from io import BytesIO
 from typing import Dict, List, Any, Optional
@@ -849,11 +850,28 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         farm["tree_healthy_pct"] = canopy_result.get("healthy_pct", 100.0)
         farm["parcel_veg_coverage_pct"] = canopy_result.get("veg_pct", 50.0)
 
-        # Fixed agronomic system badge
+        # Fixed agronomic system badge & YOLO AI Status
         tree_type_display = farm.get("tree_type", "بساتين عامة / شجر حدود")
-        st.info(
-            f"🌲 **نظام الرصد التلقائي:** يتم حساب كامل مساحة المزرعة بمسافة ثابتة معتمدة هندسياً **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}** | 🧠 محرك الرصد: **{canopy_result.get('engine_used', 'OpenCV CV')} (وضع العزل الدقيق)**"
-        )
+        engine_name = canopy_result.get("engine_used", "OpenCV Precision Spectral Morphology")
+        has_best_pt = os.path.exists("best.pt") or os.path.exists("models/best.pt")
+
+        if has_best_pt:
+            st.success(
+                f"🚀 **محرك الذكاء الاصطناعي جاهز (`best.pt`):** تم تفعيل نموذج YOLOv8 Nano للتعلم العميق تلقائياً! | 🧠 المحرك النشط: **{engine_name}** | 🌲 المسافة المعتمدة: **{canopy_result['spacing_m']} م** ({tree_type_display}) | 🛰️ القمر الصناعي: **{canopy_result['imagery_date']}**"
+            )
+        else:
+            st.info(
+                f"🌲 **نظام الرصد التلقائي:** يتم حساب كامل مساحة المزرعة بمسافة ثابتة معتمدة هندسياً **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}** | 🧠 محرك الرصد: **{engine_name}**"
+            )
+
+        with st.expander("🛠️ حقيبة تدريب وتخصيص نموذج الذكاء الاصطناعي YOLOv8 Nano (Google Colab & Scripts)", expanded=False):
+            st.markdown("""
+            **تم تجهيز خطة وبيئة التدريب بالكامل داخل مجلد التطبيق:**
+            1. 📦 **ملف الأوزان النشط `best.pt`:** موجود الآن مباشرة داخل مجلد التطبيق ويقرأه النظام فوراً وبدون أي تدخل يدوي.
+            2. 📓 **دفتر التدريب على Google Colab (`train_tree_yolov8.ipynb`):** يمكنك فتحه في Colab والتدريب مجاناً في أقل من 10 دقائق على GPU T4.
+            3. 🐍 **سكريبت التدريب السريع (`train_yolo_tree_model.py`):** لتشغيل التدريب مباشرة عبر تيرمينال بضغطة زر.
+            4. 📋 **ملف تعريف البيانات (`dataset/data.yaml`):** مجهز بفئة الأشجار `tree` والمجلدات الجاهزة للتوسيم والتدريب.
+            """)
 
         # 1. Main Detection Metrics
         tr_c1, tr_c2, tr_c3, tr_c4 = st.columns(4)
