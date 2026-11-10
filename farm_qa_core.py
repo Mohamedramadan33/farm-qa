@@ -18,6 +18,8 @@ from pyproj import Transformer
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.validation import make_valid
 
+import ndvi_tree_analyzer as ndvi_mod
+
 # Constants
 FEDDAN_M2 = 4200.83
 DUP_IOU_THRESHOLD = 0.80
@@ -875,6 +877,83 @@ def fetch_satellite_capture_date(lon: float, lat: float) -> Optional[str]:
     return None
 
 
+def calculate_required_logistic_trees(
+    perimeter_m: float,
+    spacing_m: Optional[float] = None,
+    tree_type_str: str = "",
+    rows_count: int = 1,
+    gap_ratio: float = 0.05,
+    area_feddan: float = 0.0,
+    recorded_kobo_count: Optional[int] = None,
+    ai_detected_count: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    حساب لوجستي هندسي لعدد الأشجار المطلوبة استناداً إلى:
+    - المحيط الجغرافي للمزرعة (Perimeter) بالأمتار.
+    - مسافة الغرس البينية المعيارية (Spacing) بالأمتار حسب نوع الشجر.
+    - عدد الصفوف الحزامية (Rows Count).
+    - نسبة الخصم للمداخل وبوابات الري والطرق (Gap Ratio - افتراضياً 5%).
+    - المقارنة التلقائية مع العدد المسجل باستمارة كورو (Kobo) والعدد المرصود بالذكاء الاصطناعي (AI CV).
+    """
+    if spacing_m is None or spacing_m <= 0:
+        spacing_m = get_fixed_tree_spacing(tree_type_str)
+
+    rows_count = max(1, int(rows_count))
+    eff_gap = max(0.0, min(0.35, float(gap_ratio)))
+    effective_perimeter = max(0.0, float(perimeter_m) * (1.0 - eff_gap))
+
+    single_row_required = int(math.ceil(effective_perimeter / max(1.0, spacing_m)))
+    total_required = single_row_required * rows_count
+
+    req_low = int(math.floor(total_required * 0.90))
+    req_high = int(math.ceil(total_required * 1.10))
+
+    # Kobo comparison
+    kobo_status = "غير مدخل"
+    kobo_diff = 0
+    kobo_diff_pct = 0.0
+    if recorded_kobo_count is not None and recorded_kobo_count > 0:
+        kobo_diff = recorded_kobo_count - total_required
+        kobo_diff_pct = round((kobo_diff / max(1, total_required)) * 100.0, 1)
+        if recorded_kobo_count >= req_low:
+            kobo_status = "مستوفٍ لمعايير الحزام الشجري"
+        else:
+            deficit = total_required - recorded_kobo_count
+            kobo_status = f"عجز في الحزام الشجري ({deficit} شجرة مطلوبة)"
+
+    # AI comparison
+    ai_status = "لم يتم الرصد"
+    ai_diff = 0
+    ai_diff_pct = 0.0
+    if ai_detected_count is not None:
+        ai_diff = ai_detected_count - total_required
+        ai_diff_pct = round((ai_diff / max(1, total_required)) * 100.0, 1)
+        if ai_detected_count >= req_low:
+            ai_status = "الرصد البصري يؤكد كفاية الحزام الشجري"
+        else:
+            def_ai = total_required - ai_detected_count
+            ai_status = f"رصد عجز بصري في الحزام ({def_ai} شجرة)"
+
+    return {
+        "perimeter_m": round(perimeter_m, 1),
+        "spacing_m": spacing_m,
+        "rows_count": rows_count,
+        "gap_ratio_pct": round(eff_gap * 100.0, 1),
+        "single_row_required": single_row_required,
+        "total_required": total_required,
+        "req_low": req_low,
+        "req_high": req_high,
+        "recorded_kobo_count": recorded_kobo_count,
+        "kobo_compliance_status": kobo_status,
+        "kobo_diff": kobo_diff,
+        "kobo_diff_pct": kobo_diff_pct,
+        "ai_detected_count": ai_detected_count,
+        "ai_compliance_status": ai_status,
+        "ai_diff": ai_diff,
+        "ai_diff_pct": ai_diff_pct,
+    }
+
+
 def analyze_farm_satellite_canopy(
     coords_lon_lat: Optional[List[Tuple[float, float]]],
     perimeter_m: float,
@@ -883,21 +962,34 @@ def analyze_farm_satellite_canopy(
     custom_spacing_m: Optional[float] = None,
     sensitivity: float = 0.5,
     area_feddan: float = 0.0,
+    recorded_kobo_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    High-Precision Automatic Tree Detection across full parcel area (interior + boundary):
-    - Uses fixed agronomic standard distances automatically from tree type.
-    - Adaptively scales tile zoom to fit parcel size (e.g. 5 feddans vs 100+ feddans).
-    - Detects optical crown peaks using local ExG contrast & prominence.
-    - Generates BOTH clean natural satellite image and annotated tree detection image.
+    وحدة التحليل الجغرافية والبصرية المتكاملة (GIS & Computer Vision Module):
+    - حساب تلقائي لمسافة الغرس الهندسية الثابتة حسب نوع الشجر.
+    - مواءمة مقياس الزووم تلقائياً حسب مساحة المزرعة الفدانية.
+    - استخراج وتحليل مؤشر NDVI/VARI لصحة المجموع الخضري.
+    - رصد وتصنيف الأشجار (سليمة خضراء 🟢 vs مجهدة 🟡 vs ميتة أو تالفة 🔴).
+    - توليد خريطة حرارية ملونة لحالة الغطاء النباتي (NDVI Heatmap Colormap).
+    - توليد صورتين منفصلتين: صورة قمر صناعي طبيعية نقية وصورة رصد الأشجار المحللة.
+    - إجراء الحساب اللوجستي لعدد الأشجار المطلوبة للحزام الشجري ومقارنتها بالمسجل والمكتشف.
     """
-    # 1. Automatic fixed standard agronomic spacing
     if custom_spacing_m is not None and custom_spacing_m > 0:
         spacing_m = float(custom_spacing_m)
     else:
         spacing_m = get_fixed_tree_spacing(tree_type_str)
 
     if not coords_lon_lat or len(coords_lon_lat) < 3:
+        logistic_empty = calculate_required_logistic_trees(
+            perimeter_m=perimeter_m,
+            spacing_m=spacing_m,
+            tree_type_str=tree_type_str,
+            rows_count=1,
+            gap_ratio=0.05,
+            area_feddan=area_feddan,
+            recorded_kobo_count=recorded_kobo_count,
+            ai_detected_count=0,
+        )
         return {
             "ai_count": 0,
             "ai_low": 0,
@@ -907,8 +999,17 @@ def analyze_farm_satellite_canopy(
             "imagery_date": "غير متاح",
             "annotated_img": None,
             "clean_img": None,
+            "ndvi_heatmap_img": None,
             "spacing_m": spacing_m,
             "tree_points": [],
+            "healthy_count": 0,
+            "healthy_pct": 0.0,
+            "stressed_count": 0,
+            "stressed_pct": 0.0,
+            "damaged_count": 0,
+            "damaged_pct": 0.0,
+            "engine_used": "OpenCV / Computer Vision",
+            "logistic_analysis": logistic_empty,
         }
 
     min_lon = min(p[0] for p in coords_lon_lat)
@@ -921,12 +1022,12 @@ def analyze_farm_satellite_canopy(
 
     imagery_date = fetch_satellite_capture_date(center_lon, center_lat)
 
-    # Calculate real-world parcel dimensions in meters
+    # Real-world dimensions in meters
     d_lat_m = abs(max_lat - min_lat) * 111139.0
     d_lon_m = abs(max_lon - min_lon) * 111139.0 * math.cos(math.radians(center_lat))
     max_span_m = max(d_lat_m, d_lon_m)
 
-    # Adaptive Zoom based on real farm footprint (e.g. 5 feddans vs 100 feddans)
+    # Adaptive Zoom based on footprint
     if max_span_m > 1100:
         zoom = 16  # Large farms (> 80 feddans)
     elif max_span_m > 380:
@@ -937,7 +1038,7 @@ def analyze_farm_satellite_canopy(
     x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
     x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
 
-    # Clamp tile range to max 3x3 to guarantee ultra-fast fetch and zero memory bloat
+    # Clamp tile range to max 3x3
     if abs(x2 - x1) >= 4 or abs(y2 - y1) >= 4:
         zoom = max(15, zoom - 1)
         x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
@@ -968,29 +1069,6 @@ def analyze_farm_satellite_canopy(
 
     poly_px = [to_px(p[0], p[1]) for p in coords_lon_lat]
 
-    # Full Parcel Mask (Interior + Boundary)
-    parcel_mask_img = Image.new("L", (width_px, height_px), 0)
-    draw_parcel = ImageDraw.Draw(parcel_mask_img)
-    draw_parcel.polygon(poly_px, outline=255, fill=255)
-
-    arr = np.array(stitched, dtype=np.float32)
-    r = arr[:, :, 0]
-    g = arr[:, :, 1]
-    b = arr[:, :, 2]
-
-    # Optical Indices: Excess Green & Chlorophyll Ratio
-    exg = 2.0 * g - r - b
-    is_plant = (g > r * 1.02) & (g > b * 0.95) & (exg > 4.0)
-
-    parcel_mask = np.array(parcel_mask_img) > 0
-    total_parcel_pixels = int(np.sum(parcel_mask))
-
-    if total_parcel_pixels > 0 and has_tile:
-        veg_pixels = is_plant & parcel_mask
-        veg_pct = round(float(np.sum(veg_pixels) / total_parcel_pixels * 100.0), 1)
-    else:
-        veg_pct = 50.0
-
     # Calculate pixel scale
     total_px_len = 0.0
     for i in range(len(poly_px) - 1):
@@ -999,114 +1077,62 @@ def analyze_farm_satellite_canopy(
 
     px_per_m = total_px_len / max(perimeter_m, 1.0)
     spacing_px = max(6.0, spacing_m * px_per_m)
-    search_r = max(2, int(spacing_px * 0.45))
 
-    # --- 1. CLEAN SATELLITE IMAGE (صورة نقية طبيعية مع حدود المزرعة فقط وبدون علامات) ---
+    # 1. CLEAN SATELLITE IMAGE (صورة طبيعية نقية مع مضلع المزرعة وبدون علامات الأشجار)
     clean_img = stitched.copy()
     draw_clean = ImageDraw.Draw(clean_img)
     draw_clean.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
-    # Clean image header banner
     draw_clean.rectangle([0, 0, width_px, 32], fill=(15, 23, 42))
     header_clean = f"SATELLITE VIEW (CLEAN) | Farm Boundary GPS | Date: {imagery_date or 'Recent'}"
     draw_clean.text((12, 9), header_clean, fill=(0, 255, 200))
 
-    # --- 2. ANNOTATED TREE DETECTION IMAGE (صورة مرصود ومحدد عليها الأشجار) ---
-    annotated = clean_img.copy()
-    draw_ann = ImageDraw.Draw(annotated)
+    # 2. RUN INTEGRATED CV & NDVI DETECTION MODULE
+    cv_res = ndvi_mod.detect_and_classify_trees(
+        satellite_image=stitched,
+        parcel_poly_px=poly_px,
+        pixel_spacing_px=spacing_px,
+    )
 
-    placed_points: List[Tuple[int, int]] = []
+    final_ai_count = cv_res["total_trees"]
+    healthy_count = cv_res["healthy_count"]
+    healthy_pct = cv_res["healthy_pct"]
+    stressed_count = cv_res["stressed_count"]
+    stressed_pct = cv_res["stressed_pct"]
+    damaged_count = cv_res["damaged_count"]
+    damaged_pct = cv_res["damaged_pct"]
+    veg_pct = cv_res["parcel_veg_coverage_pct"]
+    annotated_img = cv_res["annotated_image"]
+    ndvi_heatmap_img = cv_res["ndvi_heatmap_image"]
+    engine_used = cv_res.get("engine_used", "OpenCV Precision Spectral Morphology")
+
+    # Map tree pixel centers back to geographic coordinates
     tree_points_coords: List[Dict[str, Any]] = []
-
-    # Scan parcel interior with optical peak prominence
-    min_x = max(0, min(p[0] for p in poly_px))
-    max_x = min(width_px - 1, max(p[0] for p in poly_px))
-    min_y = max(0, min(p[1] for p in poly_px))
-    max_y = min(height_px - 1, max(p[1] for p in poly_px))
-
-    step_px = max(5, int(spacing_px * 0.85))
-
-    for gy in range(min_y + 2, max_y - 2, step_px):
-        for gx in range(min_x + 2, max_x - 2, step_px):
-            if parcel_mask[gy, gx]:
-                win_y1 = max(0, gy - search_r)
-                win_y2 = min(height_px, gy + search_r + 1)
-                win_x1 = max(0, gx - search_r)
-                win_x2 = min(width_px, gx + search_r + 1)
-                sub_exg = exg[win_y1:win_y2, win_x1:win_x2]
-                sub_mask = parcel_mask[win_y1:win_y2, win_x1:win_x2]
-                sub_plant = is_plant[win_y1:win_y2, win_x1:win_x2]
-
-                valid_sub = sub_mask & sub_plant
-                if np.any(valid_sub):
-                    masked_exg = np.where(valid_sub, sub_exg, -999.0)
-                    max_pos = np.unravel_index(np.argmax(masked_exg), masked_exg.shape)
-                    peak_val = masked_exg[max_pos]
-
-                    # Local prominence check (peak must stand out from neighborhood)
-                    local_mean = np.mean(sub_exg[sub_mask]) if np.any(sub_mask) else 0.0
-                    prominence = peak_val - local_mean
-
-                    if peak_val > 10.0 or (peak_val > 6.0 and prominence > 2.0):
-                        cand_y = win_y1 + int(max_pos[0])
-                        cand_x = win_x1 + int(max_pos[1])
-                        if not any(math.hypot(cand_x - px, cand_y - py) < (spacing_px * 0.70) for px, py in placed_points):
-                            placed_points.append((cand_x, cand_y))
-
-    # Scan boundary edges for windbreak trees
-    for i in range(len(poly_px) - 1):
-        pA, pB = poly_px[i], poly_px[i + 1]
-        seg_len = math.hypot(pB[0] - pA[0], pB[1] - pA[1])
-        if seg_len <= 1.0:
-            continue
-        num_trees_seg = max(1, int(round(seg_len / spacing_px)))
-        for t_idx in range(num_trees_seg):
-            ratio = t_idx / num_trees_seg
-            tx = int(round(pA[0] + ratio * (pB[0] - pA[0])))
-            ty = int(round(pA[1] + ratio * (pB[1] - pA[1])))
-            win_y1 = max(0, ty - search_r)
-            win_y2 = min(height_px, ty + search_r + 1)
-            win_x1 = max(0, tx - search_r)
-            win_x2 = min(width_px, tx + search_r + 1)
-            if win_y2 > win_y1 and win_x2 > win_x1:
-                sub_exg = exg[win_y1:win_y2, win_x1:win_x2]
-                max_pos = np.unravel_index(np.argmax(sub_exg), sub_exg.shape)
-                if sub_exg[max_pos] > 6.0:
-                    cand_y = win_y1 + int(max_pos[0])
-                    cand_x = win_x1 + int(max_pos[1])
-                    if not any(math.hypot(cand_x - px, cand_y - py) < (spacing_px * 0.65) for px, py in placed_points):
-                        placed_points.append((cand_x, cand_y))
-
-    # Draw tree crown markers & badges
-    step_badge = max(10, len(placed_points) // 10) if len(placed_points) > 20 else 1
-    for t_idx, (tx, ty) in enumerate(placed_points):
-        tree_id = t_idx + 1
-        r_mark = 4
-        # Glowing green circular marker with black border
-        draw_ann.ellipse([tx - r_mark - 1, ty - r_mark - 1, tx + r_mark + 1, ty + r_mark + 1], fill=(0, 0, 0))
-        draw_ann.ellipse([tx - r_mark, ty - r_mark, tx + r_mark, ty + r_mark], fill=(34, 197, 94))
-
-        if tree_id == 1 or tree_id % step_badge == 0 or tree_id == len(placed_points):
-            b_txt = str(tree_id)
-            draw_ann.rectangle([tx + 4, ty - 8, tx + 4 + len(b_txt) * 8, ty + 6], fill=(15, 23, 42), outline=(0, 255, 200))
-            draw_ann.text((tx + 6, ty - 7), b_txt, fill=(255, 255, 255))
-
-        lat_rad_t = math.atan(math.sinh(math.pi * (1 - 2 * (y_min + ty / 256.0) / (2.0 ** zoom))))
+    for t in cv_res.get("trees_data", []):
+        cx, cy = t["center"]
+        lat_rad_t = math.atan(math.sinh(math.pi * (1 - 2 * (y_min + cy / 256.0) / (2.0 ** zoom))))
         lat_deg_t = math.degrees(lat_rad_t)
-        lon_deg_t = (x_min + tx / 256.0) / (2.0 ** zoom) * 360.0 - 180.0
+        lon_deg_t = (x_min + cx / 256.0) / (2.0 ** zoom) * 360.0 - 180.0
         tree_points_coords.append({
-            "id": tree_id,
+            "id": t["tree_id"],
             "lat": lat_deg_t,
             "lon": lon_deg_t,
-            "px": (tx, ty),
+            "px": (cx, cy),
+            "status": t["status"],
+            "status_ar": t["status_ar"],
+            "mean_ndvi": t["mean_ndvi"],
         })
 
-    final_ai_count = len(placed_points)
-
-    # Annotated header stats overlay banner
-    banner_h = 36
-    draw_ann.rectangle([0, 0, width_px, banner_h], fill=(15, 23, 42))
-    header_text = f"ALL-AREA TREE COUNT: {final_ai_count} trees | Fixed Spacing: {spacing_m}m | Veg: {veg_pct}% | Date: {imagery_date or 'Recent'}"
-    draw_ann.text((12, 10), header_text, fill=(0, 255, 200))
+    # 3. RUN LOGISTIC TREE REQUIREMENT CALCULATION
+    logistic_res = calculate_required_logistic_trees(
+        perimeter_m=perimeter_m,
+        spacing_m=spacing_m,
+        tree_type_str=tree_type_str,
+        rows_count=1,
+        gap_ratio=0.05,
+        area_feddan=area_feddan,
+        recorded_kobo_count=recorded_kobo_count,
+        ai_detected_count=final_ai_count,
+    )
 
     return {
         "ai_count": final_ai_count,
@@ -1115,9 +1141,18 @@ def analyze_farm_satellite_canopy(
         "veg_pct": veg_pct,
         "forecast": final_ai_count,
         "imagery_date": imagery_date or "حديث",
-        "annotated_img": annotated,
+        "annotated_img": annotated_img,
         "clean_img": clean_img,
+        "ndvi_heatmap_img": ndvi_heatmap_img,
         "spacing_m": spacing_m,
         "tree_points": tree_points_coords,
+        "healthy_count": healthy_count,
+        "healthy_pct": healthy_pct,
+        "stressed_count": stressed_count,
+        "stressed_pct": stressed_pct,
+        "damaged_count": damaged_count,
+        "damaged_pct": damaged_pct,
+        "engine_used": engine_used,
+        "logistic_analysis": logistic_res,
     }
 

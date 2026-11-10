@@ -809,20 +809,29 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         st.subheader("🌳 رصد وتعداد الأشجار لكامل مساحة المزرعة (الحدود والأحواض الداخلية)")
         st.caption("يتم رصد وترقيم الأشجار تلقائياً عبر كامل مساحة مضلع المزرعة والحدود باستخدام المسافات الزراعية الثابتة بالنظام وبدون أي تدخل يدوي.")
 
-        # Compute full-parcel tree detection automatically with system fixed spacings
+        kobo_trees = int(farm.get("tree_number", 0) or 0)
+
+        # Compute full-parcel tree detection automatically with system fixed spacings & NDVI
         canopy_result = core.analyze_farm_satellite_canopy(
             poly_coords,
             perimeter_m,
             tree_type_str=farm.get("tree_type", ""),
             area_feddan=area_gps_feddan,
+            recorded_kobo_count=kobo_trees,
         )
+
+        # Inject tree health metrics into farm record for PGS evaluation
+        farm["tree_damaged_pct"] = canopy_result.get("damaged_pct", 0.0)
+        farm["tree_healthy_pct"] = canopy_result.get("healthy_pct", 100.0)
+        farm["parcel_veg_coverage_pct"] = canopy_result.get("veg_pct", 50.0)
 
         # Fixed agronomic system badge
         tree_type_display = farm.get("tree_type", "بساتين عامة / شجر حدود")
         st.info(
-            f"🌲 **نظام الرصد التلقائي:** يتم حساب كامل مساحة المزرعة بمسافة ثابتة معتمدة هندسياً **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}**"
+            f"🌲 **نظام الرصد التلقائي:** يتم حساب كامل مساحة المزرعة بمسافة ثابتة معتمدة هندسياً **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}** | 🧠 محرك الرصد: **{canopy_result.get('engine_used', 'OpenCV CV')}**"
         )
 
+        # 1. Main Detection Metrics
         tr_c1, tr_c2, tr_c3, tr_c4 = st.columns(4)
         with tr_c1:
             st.metric(
@@ -831,33 +840,76 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                 f"نطاق: {canopy_result['ai_low']} - {canopy_result['ai_high']}",
             )
         with tr_c2:
-            st.metric("عدد المهندس بالاستمارة", f"{farm.get('tree_number', 0)} شجرة")
+            st.metric("عدد المهندس بالاستمارة", f"{kobo_trees} شجرة")
         with tr_c3:
             st.metric("نسبة الغطاء النباتي للمزرعة", f"{canopy_result['veg_pct']}%")
         with tr_c4:
             st.metric("مسافة النظام الثابتة", f"{canopy_result['spacing_m']} متر")
 
-        kobo_trees = int(farm.get("tree_number", 0) or 0)
-        ai_trees = canopy_result["ai_count"]
-        if kobo_trees > 0:
-            diff = ai_trees - kobo_trees
-            if abs(diff) <= max(5, int(kobo_trees * 0.15)):
-                st.success(f"✅ مطابقة ممتازة: رصد الذكاء الاصطناعي لكامل المساحة ({ai_trees} شجرة) متطابق مع عدد المهندس ({kobo_trees} شجرة).")
-            elif diff > 0:
-                st.info(f"ℹ️ تم رصد {ai_trees} شجرة بالقمر الصناعي بكامل مساحة المزرعة مقابل {kobo_trees} شجرة مسجلة بالاستمارة (زيادة {diff}+).")
-            else:
-                st.warning(f"⚠️ تم رصد {ai_trees} شجرة بالقمر الصناعي بكامل المساحة مقابل {kobo_trees} شجرة مسجلة بالاستمارة (عجز {abs(diff)}-).")
+        # 2. Tree Health Classification (NDVI Canopy Health)
+        st.markdown("##### 🩺 تصنيف الحالة الصحية للأشجار والمجموع الخضري (NDVI Analysis):")
+        h_c1, h_c2, h_c3, h_c4 = st.columns(4)
+        with h_c1:
+            st.metric(
+                "🟢 أشجار سليمة ومورقة (Healthy)",
+                f"{canopy_result.get('healthy_count', 0)} شجرة",
+                f"{canopy_result.get('healthy_pct', 0.0)}% من الأشجار",
+            )
+        with h_c2:
+            st.metric(
+                "🟡 أشجار مجهدة (Stressed)",
+                f"{canopy_result.get('stressed_count', 0)} شجرة",
+                f"{canopy_result.get('stressed_pct', 0.0)}% من الأشجار",
+            )
+        with h_c3:
+            st.metric(
+                "🔴 أشجار ميتة أو تالفة (Damaged)",
+                f"{canopy_result.get('damaged_count', 0)} شجرة",
+                f"{canopy_result.get('damaged_pct', 0.0)}% من الأشجار",
+            )
+        with h_c4:
+            st.metric(
+                "🌿 كثافة التغطية الخضراء",
+                f"{canopy_result.get('veg_pct', 0.0)}%",
+                "مستوفٍ لمعايير PGS" if canopy_result.get('veg_pct', 0.0) >= 25.0 else "منخفض",
+            )
 
-        # High-Resolution Satellite Image Display: With Trees vs Clean Without Trees
+        # 3. Logistic Shelterbelt Tree Requirement Analysis
+        logis = canopy_result.get("logistic_analysis", {})
+        if logis:
+            with st.expander("📐 الحساب اللوجستي المعياري لعدد أشجار الحزام الشجري (PGS Logistics)", expanded=True):
+                lg_c1, lg_c2, lg_c3, lg_c4 = st.columns(4)
+                with lg_c1:
+                    st.metric("محيط المزرعة", f"{logis.get('perimeter_m', perimeter_m):.1f} م")
+                with lg_c2:
+                    st.metric("المسافة البينية", f"{logis.get('spacing_m', canopy_result['spacing_m'])} م")
+                with lg_c3:
+                    st.metric("الأشجار المطلوبة هندسياً", f"{logis.get('total_required', 0)} شجرة", f"صف واحد (خصم {logis.get('gap_ratio_pct', 5)}% مداخل)")
+                with lg_c4:
+                    st.metric("المسجل بالاستمارة", f"{logis.get('recorded_kobo_count', kobo_trees)} شجرة", logis.get("kobo_compliance_status", ""))
+
+                ai_trees = canopy_result["ai_count"]
+                req_trees = logis.get("total_required", 0)
+                if kobo_trees > 0:
+                    diff = ai_trees - kobo_trees
+                    if abs(diff) <= max(5, int(kobo_trees * 0.15)):
+                        st.success(f"✅ **مطابقة ممتازة:** رصد الذكاء الاصطناعي لكامل المساحة ({ai_trees} شجرة) متطابق مع عدد المهندس بالاستمارة ({kobo_trees} شجرة).")
+                    elif diff > 0:
+                        st.info(f"ℹ️ **زيادة مرصودة:** تم رصد {ai_trees} شجرة بالقمر الصناعي بكامل مساحة المزرعة مقابل {kobo_trees} شجرة مسجلة بالاستمارة (زيادة {diff}+).")
+                    else:
+                        st.warning(f"⚠️ **عجز بالاستمارة:** تم رصد {ai_trees} شجرة بالقمر الصناعي بكامل المساحة مقابل {kobo_trees} شجرة مسجلة بالاستمارة (عجز {abs(diff)}-).")
+
+        # 4. High-Resolution Satellite & NDVI Heatmap Display
         st.markdown("---")
-        st.markdown("##### 🛰️ استعراض صور القمر الصناعي للمزرعة (مع الأشجار أو صورة نقية):")
+        st.markdown("##### 🛰️ استعراض صور القمر الصناعي والمؤشر الحراري للمزرعة:")
 
         img_view_mode = st.radio(
             "اختر طريقة عرض صورة القمر الصناعي:",
             [
-                "🌲 صورة القمر الصناعي مع رصد وترقيم الأشجار (AI)",
+                "🌲 صورة القمر الصناعي مع رصد وترقيم وتصنيف الأشجار (AI)",
                 "🛰️ صورة القمر الصناعي الطبيعية النقية (بدون علامات شجر)",
-                "🔄 عرض الصورتين جنباً إلى جنب (مقارنة بصرية شاملة)",
+                "🌈 خريطة المؤشر الحراري لصحة الغطاء النباتي (NDVI Heatmap)",
+                "🔄 مقارنة شاملة جنباً إلى جنب (الصور الثلاث)",
             ],
             index=0,
             horizontal=True,
@@ -866,12 +918,13 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
 
         has_annotated = canopy_result.get("annotated_img") is not None
         has_clean = canopy_result.get("clean_img") is not None
+        has_heatmap = canopy_result.get("ndvi_heatmap_img") is not None
 
-        if img_view_mode == "🌲 صورة القمر الصناعي مع رصد وترقيم الأشجار (AI)":
+        if img_view_mode == "🌲 صورة القمر الصناعي مع رصد وترقيم وتصنيف الأشجار (AI)":
             if has_annotated:
                 safe_image(
                     canopy_result["annotated_img"],
-                    caption=f"🌲 صورة القمر الصناعي مع رصد وترقيم {canopy_result['ai_count']} شجرة عبر كامل مساحة مضلع المزرعة والحدود (مسافة ثابتة: {canopy_result['spacing_m']} متر)",
+                    caption=f"🌲 صورة القمر الصناعي مع رصد {canopy_result['ai_count']} شجرة (أخضر: سليمة 🟢 | أصفر: مجهدة 🟡 | أحمر: تالفة 🔴) عبر كامل مساحة مضلع المزرعة والحدود",
                 )
             else:
                 st.info("جاري تجهيز الصورة الفضائية للمزرعة...")
@@ -880,27 +933,42 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             if has_clean:
                 safe_image(
                     canopy_result["clean_img"],
-                    caption=f"🛰️ صورة القمر الصناعي الطبيعية النقية — حدود مضلع المزرعة فقط بدون علامات شجر لفحص الطبيعة والأرضية بالعين المجردة",
+                    caption="🛰️ صورة القمر الصناعي الطبيعية النقية — حدود مضلع المزرعة فقط بدون علامات شجر لفحص المعالم الطبيعية بالعين المجردة",
                 )
             elif has_annotated:
                 safe_image(canopy_result["annotated_img"])
             else:
                 st.info("جاري تجهيز الصورة الفضائية للمزرعة...")
 
-        elif img_view_mode == "🔄 عرض الصورتين جنباً إلى جنب (مقارنة بصرية شاملة)":
-            side_col1, side_col2 = st.columns(2)
-            with side_col1:
-                st.markdown("**🛰️ الصورة الطبيعية النقية (بدون علامات):**")
+        elif img_view_mode == "🌈 خريطة المؤشر الحراري لصحة الغطاء النباتي (NDVI Heatmap)":
+            if has_heatmap:
+                safe_image(
+                    canopy_result["ndvi_heatmap_img"],
+                    caption=f"🌈 الخريطة الحرارية لمؤشر NDVI/VARI — (أخضر داكن: غطاء نباتي عالي الكثافة والحيوية | أصفر/برتقالي: إجهاد نباتي | أحمر: تربة جرداء أو نباتات جافة/ميتة)",
+                )
+            else:
+                st.info("جاري إعداد خريطة NDVI الحرارية...")
+
+        elif img_view_mode == "🔄 مقارنة شاملة جنباً إلى جنب (الصور الثلاث)":
+            c_img1, c_img2, c_img3 = st.columns(3)
+            with c_img1:
+                st.markdown("**🛰️ الصورة الطبيعية النقية:**")
                 if has_clean:
                     safe_image(canopy_result["clean_img"], caption="الصورة الأصلية مع حدود المزرعة فقط")
                 else:
                     st.info("الصورة غير متاحة")
-            with side_col2:
-                st.markdown(f"**🌲 الصورة مع رصد الأشجار ({canopy_result['ai_count']} شجرة):**")
+            with c_img2:
+                st.markdown(f"**🌲 رصد وتصنيف الأشجار ({canopy_result['ai_count']} شجرة):**")
                 if has_annotated:
-                    safe_image(canopy_result["annotated_img"], caption=f"رصد وترقيم {canopy_result['ai_count']} شجرة (AI)")
+                    safe_image(canopy_result["annotated_img"], caption="تصنيف صحة التيجان (🟢 🟡 🔴)")
                 else:
                     st.info("الصورة غير متاحة")
+            with c_img3:
+                st.markdown("**🌈 الخريطة الحرارية (NDVI Heatmap):**")
+                if has_heatmap:
+                    safe_image(canopy_result["ndvi_heatmap_img"], caption="مؤشر حيوية الكلوروفيل والغطاء النباتي")
+                else:
+                    st.info("الخريطة غير متاحة")
 
         st.markdown("---")
         st.subheader("📐 مضلع GPS وخريطة المزرعة التفاعلية (مع نقاط الأشجار)")

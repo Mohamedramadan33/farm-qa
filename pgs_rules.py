@@ -277,7 +277,44 @@ def evaluate_pgs_rules(
                 "rule": "مطابقة المساحة",
                 "passed": False,
                 "severity": "warning",
-                "message": f"فارق كبير بين المساحة المسجلة ({area_ent:.2f} فدان) ومساحة GPS ({area_gps:.2f} فدان) بنسبة خطأ {diff_pct:.1f}%!"
+                "message": f"تفاوت بين المساحة المسجلة ({area_ent:.2f} فدان) ومساحة GPS ({area_gps:.2f} فدان) بنسبة {diff_pct:.1f}%."
+            })
+
+    # 6. Tree Health & Windbreak Condition (NDVI Healthy vs Damaged Ratio)
+    tree_damaged_pct = farm_record.get("tree_damaged_pct")
+    tree_healthy_pct = farm_record.get("tree_healthy_pct", 100.0 - (tree_damaged_pct or 0.0))
+    if tree_damaged_pct is not None:
+        if tree_damaged_pct > 15.0:
+            findings.append({
+                "rule": "الحالة الصحية للأشجار والمصدات (NDVI)",
+                "passed": False,
+                "severity": "warning",
+                "message": f"نسبة الأشجار التالفة أو الميتة مرتفعة ({tree_damaged_pct:.1f}%) وتتجاوز الحد المسموح به في PGS (15%). يلزم الترقيع لضمان عزل المزرعة ومصدات الرياح.",
+            })
+        else:
+            findings.append({
+                "rule": "الحالة الصحية للأشجار والمصدات (NDVI)",
+                "passed": True,
+                "severity": "info",
+                "message": f"الحالة الصحية لأشجار المزرعة ممتازة ({tree_healthy_pct:.1f}% سليمة خضراء) ونسبة التلف منخفضة ({tree_damaged_pct:.1f}%).",
+            })
+
+    # 7. Vegetative Canopy Green Coverage (نسبة الغطاء النباتي الفضائي)
+    veg_cov_pct = farm_record.get("parcel_veg_coverage_pct") or farm_record.get("veg_pct")
+    if veg_cov_pct is not None:
+        if float(veg_cov_pct) < 25.0:
+            findings.append({
+                "rule": "كثافة الغطاء النباتي للمزرعة",
+                "passed": False,
+                "severity": "warning",
+                "message": f"نسبة الغطاء النباتي الأخضر المرصودة بالقمر الصناعي منخفضة ({veg_cov_pct:.1f}%) — يلزم فحص الحزام العازل ومصدات الحماية.",
+            })
+        else:
+            findings.append({
+                "rule": "كثافة الغطاء النباتي للمزرعة",
+                "passed": True,
+                "severity": "info",
+                "message": f"كثافة الغطاء النباتي الأخضر للمزرعة مستوفية لمعايير الحماية والتنوع الحيوي ({veg_cov_pct:.1f}%).",
             })
 
     return findings
