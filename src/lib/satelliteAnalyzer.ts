@@ -647,18 +647,73 @@ function detectCanopyTrees(
       }
       if (!isMax) continue;
 
-      // Texture Roughness Verification at apex:
-      // Real tree crowns have high local variance and gradients at their apex
-      // Flat agricultural crops (alfalfa, clover) have smooth apexes (roughness < 8.0)
-      const apexRough = roughness[idx];
-      const onBoundary = Boolean(boundaryMask[idx]);
-      if (!onBoundary) {
-        if (apexRough < 9.0) continue;
-      } else {
-        if (apexRough < 7.5) continue;
+      // 1. Physical Tall-Tree Cast Shadow in Sun-Opposing Northern Quadrant (North/North-East in Egypt)
+      // Trees in Egypt cast distinct dark shadows (Brightness < 54) northward/northeastward
+      const shY1 = Math.max(0, y - Math.round(crownRadiusPx * 2.8));
+      const shY2 = Math.max(0, y - 2);
+      const shX1 = Math.max(0, x - Math.round(crownRadiusPx * 1.8));
+      const shX2 = Math.min(w - 1, x + Math.round(crownRadiusPx * 2.2));
+      let darkShadowPx = 0;
+      let minShadowLum = 255;
+      for (let sy = shY1; sy <= shY2; sy++) {
+        const sRow = sy * w;
+        for (let sx = shX1; sx <= shX2; sx++) {
+          const pIdx = (sRow + sx) * 4;
+          const lum = (data[pIdx] + data[pIdx + 1] + data[pIdx + 2]) / 3;
+          if (lum < minShadowLum) minShadowLum = lum;
+          if (lum < 54.0) darkShadowPx++;
+        }
+      }
+      const hasTallShadow = minShadowLum < 50.0 && darkShadowPx >= 3;
+
+      // 2. Opposing Directional Ray Pairs Drop Test (عزل تام للخطوط وحواف الحقول العادية)
+      // A 1D step-edge (field border, road line) drops in only ONE direction (towards road)
+      // while the opposite ray (towards field) remains high.
+      // A 2D tree dome drops in BOTH opposite directions across its cross-section!
+      let dropRayCount = 0;
+      let twoSidedDropPairs = 0;
+      let stepEdgePairs = 0;
+      const rRay = Math.max(4, Math.round(crownRadiusPx * 1.6));
+      const rayVals: number[] = [];
+
+      for (let a = 0; a < 8; a++) {
+        const rad = (a * Math.PI) / 4;
+        const rx = Math.round(x + rRay * Math.cos(rad));
+        const ry = Math.round(y + rRay * Math.sin(rad));
+        if (rx >= 0 && rx < w && ry >= 0 && ry < h) {
+          rayVals.push(canopyScore[ry * w + rx]);
+        } else {
+          rayVals.push(-0.5);
+        }
       }
 
-      // Annular Contrast Drop & Multi-Directional Isolation (عزل المحاصيل والأراضي الزراعية المسطحة)
+      for (let a = 0; a < 8; a++) {
+        if (val - rayVals[a] >= 0.055) {
+          dropRayCount++;
+        }
+      }
+
+      for (let pIdx = 0; pIdx < 4; pIdx++) {
+        const d1 = val - rayVals[pIdx];
+        const d2 = val - rayVals[pIdx + 4];
+        if (d1 >= 0.045 && d2 >= 0.045) {
+          twoSidedDropPairs++;
+        } else if ((d1 >= 0.12 && d2 < 0.02) || (d2 >= 0.12 && d1 < 0.02)) {
+          stepEdgePairs++;
+        }
+      }
+
+      // If it is purely a 1D step edge with NO opposing drops on any axis: REJECT IT!
+      // (This completely eliminates the necklace of fake points along the boundary vector line)
+      if (twoSidedDropPairs === 0 && !hasTallShadow) continue;
+      if (stepEdgePairs >= 2 && twoSidedDropPairs === 0) continue;
+
+      // 3. Texture Roughness Verification at apex:
+      // Real tree crowns have high local variance and gradients at their apex
+      const apexRough = roughness[idx];
+      if (apexRough < 6.8 && !hasTallShadow) continue;
+
+      // 4. Annular Contrast Drop & Multi-Directional Isolation
       const rIn = Math.max(2, Math.round(crownRadiusPx * 0.75));
       const rOut = Math.max(rIn + 2, Math.round(crownRadiusPx * 2.0));
       let ringAcc = 0;
@@ -680,29 +735,22 @@ function detectCanopyTrees(
       const annularDrop = val - ringMean;
       const ringRatio = ringMean / (val + 1e-5);
 
-      // 8-directional ray drop test: real tree crowns are isolated 3D domes
-      let dropRayCount = 0;
-      const rRay = Math.max(4, Math.round(crownRadiusPx * 1.5));
-      for (let a = 0; a < 8; a++) {
-        const rad = (a * Math.PI) / 4;
-        const rx = Math.round(x + rRay * Math.cos(rad));
-        const ry = Math.round(y + rRay * Math.sin(rad));
-        if (rx >= 0 && rx < w && ry >= 0 && ry < h) {
-          const rayVal = canopyScore[ry * w + rx];
-          if (val - rayVal >= 0.065) {
-            dropRayCount++;
-          }
-        } else {
-          dropRayCount++;
-        }
+      // Acceptance Criteria:
+      // Type A: Upright tree with tall cast shadow (palms, casuarinas, boundary trees)
+      // Type B: Isolated standalone 2D tree dome with two-sided drops on multiple axes
+      let isRealTree = false;
+      if (hasTallShadow && (twoSidedDropPairs >= 1 || dropRayCount >= 3)) {
+        isRealTree = true;
+      } else if (
+        twoSidedDropPairs >= 2 &&
+        annularDrop >= 0.055 &&
+        ringRatio <= 0.80 &&
+        dropRayCount >= 4
+      ) {
+        isRealTree = true;
       }
 
-      // Reject flat crop fields: require crown annular drop, ratio <= 0.82, and dropRayCount
-      if (!onBoundary) {
-        if (ringRatio > 0.82 || dropRayCount < 4 || annularDrop < 0.065) continue;
-      } else {
-        if (ringRatio > 0.84 || dropRayCount < 3 || annularDrop < 0.055) continue;
-      }
+      if (!isRealTree) continue;
 
       // Estimate local crown size
       let rPx = crownRadiusPx * 1.35;

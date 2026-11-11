@@ -358,7 +358,7 @@ def detect_and_classify_trees(
         # Boundary corridor width: ~12 meters in pixels
         corridor_px = max(14.0, pixel_spacing_px * 1.35)
 
-        # Construct spatial search mask
+        # Construct spatial search mask: always cover the parcel plus immediate boundary buffer
         corridor_mask = np.zeros((height_px, width_px), dtype=bool)
         if parcel_poly_px and len(parcel_poly_px) >= 3:
             corr_img = Image.new("L", (width_px, height_px), 0)
@@ -366,14 +366,14 @@ def detect_and_classify_trees(
             draw_corr.line(parcel_poly_px + [parcel_poly_px[0]], fill=255, width=int(corridor_px * 2.0))
             corridor_mask = np.array(corr_img) > 0
 
-        if detection_mode == "boundary_only":
-            target_mask = corridor_mask
-        else:
-            target_mask = parcel_mask | corridor_mask
+        # Always search the entire parcel and boundary buffer for true trees
+        # (never restrict search to an artificial 1D line that generates fake boundary necklaces)
+        target_mask = parcel_mask | corridor_mask
 
         # Find true physical tree canopy peaks across target_mask
-        # Candidate must be a local 2D maximum in dog_canopy
-        step_px = max(3, int(pixel_spacing_px * 0.35))
+        step_px = max(2, int(pixel_spacing_px * 0.28))
+        dog_th_cand = max(2.5, 3.8 * rigor_scale)
+
         for gy in range(min_y, max_y + 1, step_px):
             for gx in range(min_x, max_x + 1, step_px):
                 if not target_mask[gy, gx]:
@@ -395,37 +395,81 @@ def detect_and_classify_trees(
                 cand_x = w_x1 + int(max_pos[1])
                 dog_peak = float(sub_dog[max_pos])
 
-                if dog_peak < dog_th:
-                    continue
-
-                # Ensure strictly local maximum in 5x5 window
-                p_y1 = max(0, cand_y - 2)
-                p_y2 = min(height_px, cand_y + 3)
-                p_x1 = max(0, cand_x - 2)
-                p_x2 = min(width_px, cand_x + 3)
-                if np.max(dog_canopy[p_y1:p_y2, p_x1:p_x2]) > dog_peak:
+                if dog_peak < dog_th_cand:
                     continue
 
                 cand_ndvi = float(ndvi_matrix[cand_y, cand_x])
                 cand_exg = float(exg[cand_y, cand_x])
-
-                # Real tree canopy requires green vegetation presence
-                if cand_ndvi < 0.12 or cand_exg < 8.0:
-                    continue
-
+                cand_bright = float(brightness[cand_y, cand_x])
                 cand_tophat = float(tophat_matrix[cand_y, cand_x])
-                if cand_tophat < tophat_th:
+
+                # Tree crown requires green foliage presence (relaxed for dark casuarinas/palms)
+                if cand_ndvi < 0.08 or cand_exg < 3.0:
                     continue
 
-                # 1. Luminance Micro-Texture Roughness (عزل ملمس المحاصيل الزراعية والبرسيم المسطح):
+                # 1. Physical Tall-Tree Cast Shadow in Sun-Opposing Northern Quadrant (North / North-East in Egypt)
+                # Trees in Egypt cast deep shadows (Brightness < 55) northward/northeastward onto ground/roads
+                sh_y1 = max(0, cand_y - int(pixel_spacing_px * 2.2))
+                sh_y2 = max(0, cand_y - 2)
+                sh_x1 = max(0, cand_x - int(pixel_spacing_px * 1.5))
+                sh_x2 = min(width_px, cand_x + int(pixel_spacing_px * 1.8) + 1)
+                sh_patch = brightness[sh_y1:sh_y2, sh_x1:sh_x2]
+                has_tall_shadow = False
+                if sh_patch.size >= 6:
+                    dark_pixels = np.sum(sh_patch < 54.0)
+                    min_sh = float(np.min(sh_patch))
+                    if min_sh < 50.0 and dark_pixels >= 3:
+                        has_tall_shadow = True
+
+                # 2. Opposing Directional Pairs Drop Test (عزل تام وحاسم لحواف الحقول والخطوط العادية):
+                # A 1D step-edge (field border, ditch, road line) drops in ONLY ONE direction (towards road)
+                # while the opposite ray (towards field) remains high.
+                # A 2D tree dome drops in BOTH opposite directions across its cross-section!
+                angles = [0.0, 0.7854, 1.5708, 2.3562, 3.1416, 3.9270, 4.7124, 5.4978]
+                two_sided_drop_pairs = 0
+                step_edge_pairs = 0
+                drop_rays_total = 0
+
+                for p_idx in range(4):
+                    a1 = angles[p_idx]
+                    a2 = angles[p_idx + 4]
+                    rx1 = int(round(cand_x + r_ring * math.cos(a1)))
+                    ry1 = int(round(cand_y + r_ring * math.sin(a1)))
+                    rx2 = int(round(cand_x + r_ring * math.cos(a2)))
+                    ry2 = int(round(cand_y + r_ring * math.sin(a2)))
+
+                    val1 = float(ndvi_matrix[ry1, rx1]) if (0 <= rx1 < width_px and 0 <= ry1 < height_px) else -0.5
+                    val2 = float(ndvi_matrix[ry2, rx2]) if (0 <= rx2 < width_px and 0 <= ry2 < height_px) else -0.5
+
+                    d1 = cand_ndvi - val1
+                    d2 = cand_ndvi - val2
+
+                    if d1 >= min_drop_val:
+                        drop_rays_total += 1
+                    if d2 >= min_drop_val:
+                        drop_rays_total += 1
+
+                    if d1 >= 0.045 and d2 >= 0.045:
+                        two_sided_drop_pairs += 1
+                    elif (d1 >= 0.12 and d2 < 0.02) or (d2 >= 0.12 and d1 < 0.02):
+                        step_edge_pairs += 1
+
+                # If it is purely a 1D step edge with NO opposing drops on any axis: REJECT IT!
+                # (This completely eliminates the necklace of fake points along the boundary vector line)
+                if two_sided_drop_pairs == 0 and not has_tall_shadow:
+                    continue
+                if step_edge_pairs >= 2 and two_sided_drop_pairs == 0:
+                    continue
+
+                # 3. Luminance Micro-Texture Roughness (عزل المحاصيل والبرسيم المسطح الأملس):
                 patch_gray = gray_arr[max(0, cand_y - 3):min(height_px, cand_y + 4),
                                       max(0, cand_x - 3):min(width_px, cand_x + 4)]
                 lum_std = float(np.std(patch_gray)) if patch_gray.size >= 9 else 0.0
-                if lum_std < 9.5:
-                    # Smooth agricultural crop carpet -> REJECT!
+                if lum_std < 6.8 and not has_tall_shadow:
+                    # Smooth flat agricultural crop carpet -> REJECT!
                     continue
 
-                # 2. Radial Annular Drop (Tree Dome vs Flat Field)
+                # 4. Radial Annular Drop (Tree Dome vs Flat Field)
                 ring_y1 = max(0, cand_y - r_ring)
                 ring_y2 = min(height_px, cand_y + r_ring + 1)
                 ring_x1 = max(0, cand_x - r_ring)
@@ -440,27 +484,19 @@ def detect_and_classify_trees(
                 annular_drop = mean_core - mean_ring
                 ring_ratio = mean_ring / (mean_core + 1e-5)
 
-                if annular_drop < drop_th or ring_ratio > ratio_th:
-                    continue
+                # Acceptance Criteria:
+                # Type A: Upright tree with tall cast shadow (e.g. palms, casuarinas, boundary trees)
+                # Type B: Isolated standalone 2D tree dome with two-sided drops on multiple axes
+                is_real_tree = False
+                if has_tall_shadow and (two_sided_drop_pairs >= 1 or drop_rays_total >= 3):
+                    is_real_tree = True
+                elif two_sided_drop_pairs >= 2 and annular_drop >= drop_th and ring_ratio <= ratio_th and drop_rays_total >= 4:
+                    ring_bright = brightness[ring_y1:ring_y2, ring_x1:ring_x2]
+                    min_ring_b = float(np.min(ring_bright)) if ring_bright.size > 0 else 100.0
+                    if min_ring_b < 75.0 or cand_tophat >= tophat_th:
+                        is_real_tree = True
 
-                # 3. Multi-directional isolation (8 compass rays)
-                drop_rays = count_directional_drops(
-                    ndvi_matrix, cand_x, cand_y, r_drop=r_ring, w=width_px, h=height_px,
-                    center_val=cand_ndvi, min_drop=min_drop_val
-                )
-                if drop_rays < 4:
-                    continue
-
-                # 4. Local 3D shadow or skirt contrast
-                ring_bright = brightness[ring_y1:ring_y2, ring_x1:ring_x2]
-                core_bright = brightness[max(0, cand_y - r_core):min(height_px, cand_y + r_core + 1),
-                                         max(0, cand_x - r_core):min(width_px, cand_x + r_core + 1)]
-                mean_core_b = float(np.mean(core_bright)) if core_bright.size > 0 else 100.0
-                min_ring_b = float(np.min(ring_bright)) if ring_bright.size > 0 else 100.0
-                has_shadow = (min_ring_b < mean_core_b * 0.85 and min_ring_b < 75.0) or np.any(shadow_map[ring_y1:ring_y2, ring_x1:ring_x2])
-
-                # Reject flat open crop field with no shadow presence
-                if min_ring_b > 80.0 and not has_shadow:
+                if not is_real_tree:
                     continue
 
                 # Sub-pixel Quadratic Apex Interpolation
@@ -482,6 +518,10 @@ def detect_and_classify_trees(
 
                 sub_cx = int(round(cand_x + dx_sub))
                 sub_cy = int(round(cand_y + dy_sub))
+
+                # Check if this tree is within boundary corridor if boundary_only mode is requested
+                if detection_mode == "boundary_only" and not corridor_mask[cand_y, cand_x]:
+                    continue
 
                 if not any(math.hypot(sub_cx - px, sub_cy - py) < min_sep_px for px, py in placed_centers):
                     placed_centers.append((sub_cx, sub_cy))

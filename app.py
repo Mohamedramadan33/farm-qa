@@ -818,13 +818,13 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             detect_filter = st.radio(
                 "🎯 نمط دقة الرصد البصري وعزل المحاصيل الحقلية والخضار:",
                 [
-                    "🛡️ مصدات الرياح وحزام الحدود فقط (أشجار الحدود ومصدات المزرعة - المعيار المعتمد)",
-                    "🎯 دقة فائقة: بساتين وأشجار حقيقية فقط (عزل تام للمحاصيل والمسطحات الخضراء)",
+                    "🎯 رصد الأشجار الحقيقية فائقة الدقة (عزل تام للمحاصيل والحدود العادية - المعتمد)",
+                    "🛡️ مصدات الرياح وأشجار حزام الحدود الحقيقية فقط",
                     "🌳 كامل مساحة المزرعة (أشجار وبساتين ومصدات)",
                 ],
                 index=0,
                 key=f"detect_filter_{farm_id}",
-                help="يقوم بفحص ملمس التيجان الخشن (Texture Roughness) والظلال ثلاثية الأبعاد وعزل المحاصيل الزراعية المسطحة لاستبعاد أي حقول خضار أو برسيم أو أرض زراعية."
+                help="يقوم بفحص التيجان الحقيقية بظلالها ثلاثية الأبعاد وعزل المحاصيل الزراعية والبرسيم وحواف الحقول والخطوط العادية."
             )
         with prec_c2:
             sens_val = st.slider(
@@ -843,13 +843,13 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             else:
                 st.caption("⚖️ **معيار متوازن (PGS Standard):** توازن مثالي بين عزل المسطحات الخضراء ورصد الأشجار الحقيقية.")
 
-        mode_code = "boundary_only"
+        mode_code = "high_precision"
         if "مصدات الرياح" in detect_filter:
             mode_code = "boundary_only"
-        elif "دقة فائقة" in detect_filter:
-            mode_code = "high_precision"
         elif "كامل مساحة" in detect_filter:
             mode_code = "all_trees"
+        else:
+            mode_code = "high_precision"
 
         # Compute full-parcel tree detection automatically with system fixed spacings & NDVI
         canopy_result = core.analyze_farm_satellite_canopy(
