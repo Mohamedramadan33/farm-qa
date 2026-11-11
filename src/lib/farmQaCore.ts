@@ -397,19 +397,12 @@ export function computeVerdict(params: {
 
 export function applyNdvi(
   verdictText: string,
-  ndvi: number | null,
-  veg: number | null,
-  imgAge: number | null
+  _ndvi: number | null,
+  _veg: number | null,
+  _imgAge: number | null
 ): string {
-  if (ndvi === null || !Number.isFinite(ndvi)) return verdictText;
-  const oldImg = imgAge !== null && Number.isFinite(imgAge) && imgAge > NDVI_OLD_IMG_YEARS;
-  const weakVeg = veg === null || !Number.isFinite(veg) || veg < 5;
-  if (oldImg && weakVeg && ndvi >= NDVI_GREEN) {
-    return `[Review - Recent Greening]: Recent Sentinel-2 NDVI is ${ndvi.toFixed(2)} while older satellite imagery shows low vegetation. Previous verdict may be outdated. — ${verdictText}`;
-  }
-  if (ndvi < NDVI_BARE) {
-    return `${verdictText} (Recent NDVI ${ndvi.toFixed(2)}: Bare soil currently, supporting imagery result)`;
-  }
+  // NDVI Heatmap and generic greenness must NOT change or override the audit decision.
+  // The decision is based strictly on real tree counts and physical geometry.
   return verdictText;
 }
 

@@ -653,9 +653,9 @@ function detectCanopyTrees(
       const apexRough = roughness[idx];
       const onBoundary = Boolean(boundaryMask[idx]);
       if (!onBoundary) {
-        if (apexRough < 8.0) continue;
+        if (apexRough < 9.0) continue;
       } else {
-        if (apexRough < 5.0) continue;
+        if (apexRough < 7.5) continue;
       }
 
       // Annular Contrast Drop & Multi-Directional Isolation (عزل المحاصيل والأراضي الزراعية المسطحة)
@@ -701,7 +701,7 @@ function detectCanopyTrees(
       if (!onBoundary) {
         if (ringRatio > 0.82 || dropRayCount < 4 || annularDrop < 0.065) continue;
       } else {
-        if (dropRayCount < 2 || annularDrop < 0.040) continue;
+        if (ringRatio > 0.84 || dropRayCount < 3 || annularDrop < 0.055) continue;
       }
 
       // Estimate local crown size
