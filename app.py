@@ -813,7 +813,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         kobo_trees = int(farm.get("tree_number", 0) or 0)
 
         # Precision & Crop Carpet Rejection Controls
-        prec_c1, prec_c2 = st.columns([2.5, 1.5])
+        prec_c1, prec_c2 = st.columns([2.2, 1.8])
         with prec_c1:
             detect_filter = st.radio(
                 "🎯 نمط دقة الرصد البصري وعزل المحاصيل الحقلية والخضار:",
@@ -827,7 +827,21 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                 help="يقوم بفحص التحويل الطوبولوجي (Top-Hat Transform) والتحدب الحلقي وعزل الأشعة ثمانية الاتجاهات (8-Ray Isolation) لاستبعاد أي حقول خضار أو برسيم أو محاصيل أرضية مسطحة."
             )
         with prec_c2:
-            st.info("🛡️ **عزل الخضار والمسطحات مفعل:** بفضل تحويل Top-Hat وفحص الأشعة الـ 8 واختبار الظل ثلاثي الأبعاد، يتم تجاهل المسطحات الخضراء المنبسطة (البرسيم، الخضروات) وحصر الرصد على قمم الأشجار المرتفعة فقط.")
+            sens_val = st.slider(
+                "🎚️ حساسية وتدقيق رصد التيجان (Detection Sensitivity):",
+                min_value=0.15,
+                max_value=0.90,
+                value=0.50,
+                step=0.05,
+                key=f"tree_sens_{farm_id}",
+                help="0.20-0.35: فائق الصرامة وعزل تام للمحاصيل والمسطحات | 0.50: المعيار الهندسي المتوازن | 0.65-0.85: زيادة الحساسية لرصد الشتلات والأشجار الصغيرة"
+            )
+            if sens_val < 0.40:
+                st.caption("🛡️ **فائق الصرامة:** يشترط ظلالاً عميقة وقمماً معزولة بقوة (أشجار كبيرة وبساتين فقط).")
+            elif sens_val > 0.65:
+                st.caption("🔍 **عالي الحساسية:** يرصد الشتلات الحديثة والتيجان الأصغر حجماً والمجموعات الشجرية الكثيفة.")
+            else:
+                st.caption("⚖️ **معيار متوازن (PGS Standard):** توازن مثالي بين عزل المسطحات الخضراء ورصد الأشجار الحقيقية.")
 
         mode_code = "high_precision"
         if "مصدات الرياح" in detect_filter:
@@ -843,6 +857,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             area_feddan=area_gps_feddan,
             recorded_kobo_count=kobo_trees,
             detection_mode=mode_code,
+            sensitivity=sens_val,
         )
 
         # Inject tree health metrics into farm record for PGS evaluation
@@ -1011,6 +1026,46 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                     safe_image(canopy_result["ndvi_heatmap_img"], caption="مؤشر حيوية الكلوروفيل والغطاء النباتي")
                 else:
                     st.info("الخريطة غير متاحة")
+
+        # Interactive Tree Audit & Inspection Inspector
+        t_points = canopy_result.get("tree_points") or []
+        if t_points and len(t_points) > 0:
+            with st.expander(f"📋 كشف وسجل تدقيق الأشجار المرصودة تفصيلياً ({len(t_points)} شجرة)", expanded=False):
+                st.caption("يمكنك استعراض بيانات كل شجرة مرصودة، تصنيف صحتها، ومتوسط مؤشر الغطاء النباتي (NDVI) الخاص بكل تاج.")
+
+                f_c1, f_c2 = st.columns([1.5, 1.5])
+                with f_c1:
+                    filter_status = st.selectbox(
+                        "تصفية حسب الحالة الصحية:",
+                        ["الكل", "سليمة فقط (🟢)", "مجهدة فقط (🟡)", "تالفة أو جافة (🔴)"],
+                        key=f"tree_filter_status_{farm_id}"
+                    )
+                with f_c2:
+                    st.metric("إجمالي الأشجار المرصودة", f"{len(t_points)} شجرة")
+
+                rows_to_show = []
+                for tp in t_points:
+                    st_code = tp.get("status", "healthy")
+                    if filter_status == "سليمة فقط (🟢)" and st_code != "healthy":
+                        continue
+                    if filter_status == "مجهدة فقط (🟡)" and st_code != "stressed":
+                        continue
+                    if filter_status == "تالفة أو جافة (🔴)" and st_code != "damaged":
+                        continue
+
+                    rows_to_show.append({
+                        "رقم الشجرة (#)": f"#{tp.get('tree_id')}",
+                        "الحالة الصحية": tp.get("status_ar", ""),
+                        "مؤشر NDVI للتاج": tp.get("mean_ndvi", 0.0),
+                        "أقصى حيوية خضرية": tp.get("max_ndvi", 0.0),
+                        "قطر التاج التقديري (بكسل)": tp.get("crown_radius", 4) * 2,
+                        "إحداثيات المركز بالصورة": f"X:{tp.get('center', (0,0))[0]}, Y:{tp.get('center', (0,0))[1]}",
+                    })
+
+                if rows_to_show:
+                    st.dataframe(rows_to_show, use_container_width=True, hide_index=True)
+                else:
+                    st.info("لا توجد أشجار مطابقة لشرط التصفية المحدد.")
 
         st.markdown("---")
         st.subheader("📐 مضلع GPS وخريطة المزرعة التفاعلية (مع نقاط الأشجار)")

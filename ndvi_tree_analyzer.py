@@ -193,6 +193,7 @@ def detect_and_classify_trees(
     stressed_ndvi_threshold: float = 0.07,
     detection_mode: str = "high_precision",
     tree_type_str: str = "",
+    sensitivity: float = 0.50,
 ) -> Dict[str, Any]:
     """
     High-Precision Visual Tree Detection & Flat Crop Rejection Engine:
@@ -321,6 +322,21 @@ def detect_and_classify_trees(
         k_tophat = max(5, int(pixel_spacing_px * 0.90))
         tophat_matrix = compute_morphological_tophat(ndvi_matrix, kernel_radius_px=k_tophat)
 
+        # Dynamic Calibration Factors based on Sensitivity Slider (0.15 to 0.90)
+        sens_clamp = float(np.clip(sensitivity, 0.15, 0.95))
+        # rigor_scale: at 0.50 -> 1.0; at 0.30 -> 1.66 (very strict); at 0.75 -> 0.66 (sensitive)
+        rigor_scale = float(0.50 / sens_clamp)
+
+        tophat_th = 0.050 * rigor_scale
+        dog_th = 6.0 * rigor_scale
+        drop_th = 0.060 * rigor_scale
+        min_drop_val = 0.055 * rigor_scale
+        ratio_th = min(0.88, 0.81 + (sens_clamp - 0.50) * 0.12)
+
+        # Sky-diffuse Blue Shadow Detection
+        blue_ratio = b / (r + g + b + 1e-5)
+        shadow_map = (blue_ratio > 0.32) & (brightness < 92.0)
+
         # Bounding box of parcel
         if parcel_poly_px:
             min_x = max(0, min(p[0] for p in parcel_poly_px))
@@ -375,7 +391,7 @@ def detect_and_classify_trees(
                     # 1. Top-Hat Crop Plateau Filter:
                     # In continuous vegetable/clover fields, Top-Hat is nearly ZERO because
                     # the morphological opening does NOT remove expansive field carpets!
-                    if cand_tophat < 0.045:
+                    if cand_tophat < (tophat_th * 0.75):
                         continue
 
                     # 2. Local variance / flatness test: 5x5 window
@@ -383,7 +399,7 @@ def detect_and_classify_trees(
                                             max(0, cand_x - 2):min(width_px, cand_x + 3)]
                     if sub_patch.size >= 9:
                         local_std = float(np.std(sub_patch))
-                        if local_std < 0.018:
+                        if local_std < 0.016:
                             # Uniform flat crop carpet -> reject!
                             continue
 
@@ -406,39 +422,39 @@ def detect_and_classify_trees(
                     # Discrete tree crown MUST drop in at least 4 of 8 directions
                     drop_rays = count_directional_drops(
                         ndvi_matrix, cand_x, cand_y, r_drop=r_ring, w=width_px, h=height_px,
-                        center_val=cand_ndvi, min_drop=0.065
+                        center_val=cand_ndvi, min_drop=min_drop_val
                     )
 
-                    # 5. Local 3D shadow or skirt contrast
+                    # 5. Local 3D shadow or skirt contrast (including Rayleigh Sky Blue Shading)
                     ring_bright = brightness[ring_y1:ring_y2, ring_x1:ring_x2]
                     core_bright = brightness[max(0, cand_y - r_core):min(height_px, cand_y + r_core + 1),
                                              max(0, cand_x - r_core):min(width_px, cand_x + r_core + 1)]
                     mean_core_b = float(np.mean(core_bright)) if core_bright.size > 0 else 100.0
                     min_ring_b = float(np.min(ring_bright)) if ring_bright.size > 0 else 100.0
-                    has_shadow_edge = (min_ring_b < mean_core_b * 0.82)
+                    has_shadow_edge = (min_ring_b < mean_core_b * 0.82) or np.any(shadow_map[ring_y1:ring_y2, ring_x1:ring_x2])
 
                     # STRICT DISCRIMINATION FILTER:
                     # In a crop field (برسيم، قمح، خضار):
-                    # - cand_tophat < 0.045 (already skipped)
+                    # - cand_tophat < tophat_th
                     # - drop_rays < 4 (surrounding field is all green!)
-                    # - ring_ratio > 0.85
+                    # - ring_ratio > ratio_th
                     # - has_shadow_edge is False
                     if detection_mode == "high_precision":
                         is_real_tree = (
-                            cand_tophat >= 0.055 and
+                            cand_tophat >= tophat_th and
                             drop_rays >= 4 and
-                            ring_ratio <= 0.82 and
-                            annular_drop >= 0.065 and
-                            dog_peak >= 6.5 and
-                            (has_shadow_edge or drop_rays >= 6 or cand_tophat >= 0.090)
+                            ring_ratio <= ratio_th and
+                            annular_drop >= drop_th and
+                            dog_peak >= dog_th and
+                            (has_shadow_edge or drop_rays >= 6 or cand_tophat >= (tophat_th * 1.5))
                         )
                     else:  # all_trees
                         is_real_tree = (
-                            cand_tophat >= 0.040 and
+                            cand_tophat >= (tophat_th * 0.75) and
                             drop_rays >= 3 and
-                            ring_ratio <= 0.86 and
-                            annular_drop >= 0.055 and
-                            dog_peak >= 5.5
+                            ring_ratio <= (ratio_th + 0.04) and
+                            annular_drop >= (drop_th * 0.80) and
+                            dog_peak >= (dog_th * 0.80)
                         )
 
                     if is_real_tree:
@@ -665,4 +681,5 @@ def detect_and_classify_trees(
         "engine_used": f"YOLOv8 Nano AI ({os.path.basename(active_yolo_path)})" if used_yolo else "OpenCV Precision Spectral Morphology",
         "yolo_model_loaded": used_yolo,
         "yolo_model_path": active_yolo_path if used_yolo else None,
+        "trees_classified": trees_classified,
     }

@@ -1029,22 +1029,20 @@ def analyze_farm_satellite_canopy(
     max_span_m = max(d_lat_m, d_lon_m)
 
     # High-Definition Adaptive Zoom (Super-Resolution Satellite Fetching):
-    # Zoom 19 gives ~0.30 m/pixel (sharp crown canopy architecture & clear branches).
-    if max_span_m > 1200:
-        zoom = 16  # Extra large farms (> 100 feddans)
-    elif max_span_m > 500:
-        zoom = 17  # Medium-large farms (30 - 100 feddans)
-    elif max_span_m > 220:
-        zoom = 18  # Small-medium parcels (6 - 30 feddans)
+    # Zoom 19 gives ~0.30 m/pixel, Zoom 18 gives ~0.60 m/pixel (sharp crown canopy & branches).
+    if max_span_m > 1800:
+        zoom = 17  # Mega farms (> 200 feddans)
+    elif max_span_m > 450:
+        zoom = 18  # Large and medium farms (15 - 150 feddans, such as EG/308)
     else:
-        zoom = 19  # High-definition small-medium parcels (< 6 feddans)
+        zoom = 19  # High-definition small-medium parcels (< 15 feddans)
 
     x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
     x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
 
-    # Clamp tile range to max 4x4 to balance speed and ultra-high resolution
-    if abs(x2 - x1) >= 5 or abs(y2 - y1) >= 5:
-        zoom = max(16, zoom - 1)
+    # Allow up to 8x8 tiles (2048x2048 px) for ultra-sharp crown resolution without blurry degradation
+    if abs(x2 - x1) >= 9 or abs(y2 - y1) >= 9:
+        zoom = max(17, zoom - 1)
         x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
         x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
 
@@ -1104,6 +1102,7 @@ def analyze_farm_satellite_canopy(
         pixel_spacing_px=spacing_px,
         detection_mode=detection_mode,
         tree_type_str=tree_type_str,
+        sensitivity=sensitivity,
     )
 
     final_ai_count = cv_res["total_trees"]
@@ -1117,6 +1116,7 @@ def analyze_farm_satellite_canopy(
     annotated_img = cv_res["annotated_image"]
     ndvi_heatmap_img = cv_res["ndvi_heatmap_image"]
     engine_used = cv_res.get("engine_used", "OpenCV Precision Spectral Morphology")
+    tree_points = cv_res.get("trees_classified", [])
 
     # Map tree pixel centers back to geographic coordinates
     tree_points_coords: List[Dict[str, Any]] = []
