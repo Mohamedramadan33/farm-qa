@@ -441,8 +441,8 @@ function detectCanopyTrees(
           }
         }
       }
-      // Annular Contrast Drop Test (عزل المحاصيل والأراضي الزراعية المسطحة)
-      // Flat agricultural crops (clover, wheat, alfalfa) have uniform greenness across the plot.
+      // Annular Contrast Drop & Multi-Directional Isolation (عزل المحاصيل والأراضي الزراعية المسطحة)
+      // Flat agricultural crops (clover, wheat, alfalfa, vegetables) have uniform greenness across the plot.
       // An upright tree crown dome drops sharply into soil / canopy edge / shadow.
       const rIn = Math.max(2, Math.round(crownRadiusPx * 0.75));
       const rOut = Math.max(rIn + 2, Math.round(crownRadiusPx * 2.0));
@@ -463,10 +463,32 @@ function detectCanopyTrees(
       }
       const ringMean = ringCnt > 0 ? ringAcc / ringCnt : val;
       const annularDrop = val - ringMean;
+      const ringRatio = ringMean / (val + 1e-5);
 
-      // Reject flat crop fields: require crown annular drop >= 0.055 (or boundary shelterbelt)
+      // 8-directional ray drop test: real tree crowns are isolated islands
+      let dropRayCount = 0;
+      const rRay = Math.max(4, Math.round(crownRadiusPx * 1.5));
+      for (let a = 0; a < 8; a++) {
+        const rad = (a * Math.PI) / 4;
+        const rx = Math.round(x + rRay * Math.cos(rad));
+        const ry = Math.round(y + rRay * Math.sin(rad));
+        if (rx >= 0 && rx < w && ry >= 0 && ry < h) {
+          const rayVal = canopyScore[ry * w + rx];
+          if (val - rayVal >= 0.065) {
+            dropRayCount++;
+          }
+        } else {
+          dropRayCount++;
+        }
+      }
+
+      // Reject flat crop fields: require crown annular drop >= 0.065, ratio <= 0.82, and dropRayCount >= 4
       const onBoundary = Boolean(boundaryMask[idx]);
-      if (!onBoundary && annularDrop < 0.055) continue;
+      if (!onBoundary) {
+        if (ringRatio > 0.82 || dropRayCount < 4 || annularDrop < 0.065) continue;
+      } else {
+        if (dropRayCount < 2 || annularDrop < 0.040) continue;
+      }
 
       // Estimate local crown size
       let rPx = crownRadiusPx * 1.35;

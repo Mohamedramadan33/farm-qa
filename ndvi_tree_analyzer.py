@@ -126,6 +126,64 @@ def generate_ndvi_colormap_image(ndvi_matrix: np.ndarray, mask: Optional[np.ndar
     return Image.fromarray(colored)
 
 
+def compute_morphological_tophat(
+    ndvi_matrix: np.ndarray,
+    kernel_radius_px: int,
+) -> np.ndarray:
+    """
+    Morphological White Top-Hat Transform: WTH(I) = I - Opening(I, B)
+    Flat agricultural crops (vegetables, clover, wheat) form expansive continuous plateaus.
+    When a morphological opening of radius B is performed, the broad crop plateau remains unchanged,
+    so WTH = Plateau - Plateau = 0.
+    In contrast, isolated 3D tree crowns are narrower than B, so opening removes them, leaving
+    a high positive response in WTH!
+    """
+    # Normalize NDVI from [-0.2, 0.8] to [0, 255]
+    norm_u8 = np.clip((ndvi_matrix + 0.2) / 1.0 * 255.0, 0, 255).astype(np.uint8)
+    k_size = max(5, int(kernel_radius_px * 2) | 1)
+
+    if HAS_OPENCV:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        tophat = cv2.morphologyEx(norm_u8, cv2.MORPH_TOPHAT, kernel)
+        return tophat.astype(np.float32) / 255.0
+    else:
+        pil_img = Image.fromarray(norm_u8, mode="L")
+        # Opening = MinFilter then MaxFilter
+        opened = pil_img.filter(ImageFilter.MinFilter(k_size)).filter(ImageFilter.MaxFilter(k_size))
+        diff = np.maximum(0, norm_u8.astype(np.int16) - np.array(opened, dtype=np.int16)).astype(np.uint8)
+        return diff.astype(np.float32) / 255.0
+
+
+def count_directional_drops(
+    ndvi_mat: np.ndarray,
+    cx: int,
+    cy: int,
+    r_drop: int,
+    w: int,
+    h: int,
+    center_val: float,
+    min_drop: float = 0.065,
+) -> int:
+    """
+    Tests 8 compass rays around (cx, cy) at distance r_drop.
+    Returns count of rays that drop by at least min_drop below center_val.
+    A discrete tree crown is an isolated island, so at least 4 to 5 of 8 rays drop into soil/shadow/skirt.
+    A continuous crop field (clover/vegetables) has green crops in all directions -> count is 0, 1, or 2!
+    """
+    angles = [0.0, 0.7854, 1.5708, 2.3562, 3.1416, 3.9270, 4.7124, 5.4978]
+    drop_count = 0
+    for a in angles:
+        rx = int(round(cx + r_drop * math.cos(a)))
+        ry = int(round(cy + r_drop * math.sin(a)))
+        if 0 <= rx < w and 0 <= ry < h:
+            val_at_ray = float(ndvi_mat[ry, rx])
+            if (center_val - val_at_ray) >= min_drop:
+                drop_count += 1
+        else:
+            drop_count += 1
+    return drop_count
+
+
 def detect_and_classify_trees(
     satellite_image: Image.Image,
     parcel_poly_px: Optional[List[Tuple[int, int]]] = None,
@@ -134,14 +192,16 @@ def detect_and_classify_trees(
     healthy_ndvi_threshold: float = 0.16,
     stressed_ndvi_threshold: float = 0.07,
     detection_mode: str = "high_precision",
+    tree_type_str: str = "",
 ) -> Dict[str, Any]:
     """
     High-Precision Visual Tree Detection & Flat Crop Rejection Engine:
-    - Strictly discriminates between actual 3D Tree Crowns (أشجار وبساتين ومصدات)
-      and flat ground crop carpets (محاصيل حقلية مسطحة مثل البرسيم، القمح، الخضار).
-    - Uses Multi-scale Difference of Gaussians (DoG) for 3D canopy dome response.
-    - Applies Annular Drop Test: real tree crowns drop sharply into soil/shadow/skirt,
-      whereas flat crops have zero annular drop (rejected!).
+    - Morphological White Top-Hat Transform for Total Crop Carpet Elimination (حقول البرسيم والخضار).
+    - Multi-Directional Radial Drop (8 compass rays) requiring discrete island isolation.
+    - Multi-Scale Gaussian Pyramid across 3 spatial frequency bands (Small 1.8-3.2m, Medium 3.2-5.5m, Large 5.5-9.0m).
+    - Species-aware scale weighting (Palms vs Casuarina vs Citrus vs Olive).
+    - Sub-Pixel Quadratic Apex Interpolation for finding the exact physical zenith of the tree dome.
+    - 3D Shadow / Relief Dipole Contrast Test.
     - Classifies health status:
         🟢 Healthy (أشجار سليمة مورقة): High NDVI / Vigorous green crown.
         🟡 Stressed (أشجار مجهدة / عطش أو نقص تغذية): Moderate NDVI / Pale green crown.
@@ -186,17 +246,19 @@ def detect_and_classify_trees(
                     bx1, by1, bx2, by2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
                     cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
                     if 0 <= cy < height_px and 0 <= cx < width_px and parcel_mask[cy, cx]:
+                        crown_rad = max(4, int(max(bx2 - bx1, by2 - by1) // 2))
                         detected_boxes.append({
                             "bbox": (bx1, by1, bx2, by2),
                             "center": (cx, cy),
                             "conf": float(b.conf[0].cpu().numpy()),
+                            "crown_radius": crown_rad,
                         })
                 if detected_boxes:
                     used_yolo = True
         except Exception:
             used_yolo = False
 
-    # High-Precision Computer Vision Scale-Space & Annular Drop Engine
+    # High-Precision Multi-Scale Computer Vision & Annular Drop Engine
     if not detected_boxes:
         arr = np.array(orig_img, dtype=np.float32)
         r = arr[:, :, 0]
@@ -205,17 +267,59 @@ def detect_and_classify_trees(
         exg = 2.0 * g - r - b
         brightness = (r + g + b) / 3.0
 
-        # Scale-Space Difference of Gaussians (DoG) for 3D Canopy Dome Prominence
-        # Flat agricultural fields have zero / near-zero spatial frequency at tree crown scale!
+        # Species detection and scale band weighting
+        t_low = (tree_type_str or "").lower()
+        is_palm = any(k in t_low for k in ["نخيل", "نخل", "palm", "date", "بلح"])
+        is_casuarina = any(k in t_low for k in ["جازورين", "كافور", "سرو", "أكاسيا", "casuarina", "eucalyptus", "cypress", "acacia", "مصدات"])
+        is_citrus_olive = any(k in t_low for k in ["موالح", "برتقال", "ليمون", "يوسفي", "زيتون", "رمّان", "رمان", "مانجو", "citrus", "orange", "lemon", "olive", "pomegranate", "mango"])
+
+        # Weights across 3 spatial frequency bands:
+        # Band 1: Small crowns (1.8m - 3.2m)
+        # Band 2: Medium crowns (3.2m - 5.5m)
+        # Band 3: Large crowns (5.5m - 9.0m)
+        if is_palm:
+            w1, w2, w3 = 0.80, 1.10, 1.45
+        elif is_casuarina:
+            w1, w2, w3 = 1.45, 1.05, 0.70
+        elif is_citrus_olive:
+            w1, w2, w3 = 0.95, 1.40, 1.05
+        else:
+            w1, w2, w3 = 1.05, 1.20, 1.00
+
+        # Multi-scale Gaussian Pyramid of NDVI
         ndvi_u8 = ((np.clip(ndvi_matrix, -0.2, 0.8) + 0.2) / 1.0 * 255.0).astype(np.uint8)
         ndvi_pil = Image.fromarray(ndvi_u8, mode="L")
 
-        sigma_fine = max(1.0, pixel_spacing_px * 0.16)
-        sigma_coarse = max(2.8, pixel_spacing_px * 0.58)
+        # Scale 1: Small crowns
+        sig_fine1 = max(0.9, pixel_spacing_px * 0.12)
+        sig_coarse1 = max(1.9, pixel_spacing_px * 0.28)
+        b_fine1 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_fine1)), dtype=np.float32)
+        b_coarse1 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_coarse1)), dtype=np.float32)
+        dog1 = (b_fine1 - b_coarse1) * w1
 
-        fine_blur = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sigma_fine)), dtype=np.float32)
-        coarse_blur = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sigma_coarse)), dtype=np.float32)
-        dog_canopy = fine_blur - coarse_blur
+        # Scale 2: Medium crowns
+        sig_fine2 = max(1.7, pixel_spacing_px * 0.22)
+        sig_coarse2 = max(3.5, pixel_spacing_px * 0.52)
+        b_fine2 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_fine2)), dtype=np.float32)
+        b_coarse2 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_coarse2)), dtype=np.float32)
+        dog2 = (b_fine2 - b_coarse2) * w2
+
+        # Scale 3: Large crowns
+        sig_fine3 = max(2.8, pixel_spacing_px * 0.35)
+        sig_coarse3 = max(5.5, pixel_spacing_px * 0.78)
+        b_fine3 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_fine3)), dtype=np.float32)
+        b_coarse3 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_coarse3)), dtype=np.float32)
+        dog3 = (b_fine3 - b_coarse3) * w3
+
+        # Stack and find peak response scale
+        dogs_stacked = np.stack([dog1, dog2, dog3], axis=0)
+        best_scale_idx = np.argmax(dogs_stacked, axis=0)  # 0, 1, or 2
+        dog_canopy = np.max(dogs_stacked, axis=0)
+
+        # Morphological White Top-Hat Transform for Total Crop Carpet Elimination
+        # Removes expansive flat green fields (clover, wheat, alfalfa, vegetables)
+        k_tophat = max(5, int(pixel_spacing_px * 0.90))
+        tophat_matrix = compute_morphological_tophat(ndvi_matrix, kernel_radius_px=k_tophat)
 
         # Bounding box of parcel
         if parcel_poly_px:
@@ -233,7 +337,7 @@ def detect_and_classify_trees(
         min_sep_px = pixel_spacing_px * 0.70
 
         # Step size adapted for tree searching
-        step_px = max(5, int(pixel_spacing_px * 0.65))
+        step_px = max(5, int(pixel_spacing_px * 0.60))
 
         # A. Interior Orchard & Parcel Tree Crowns (Skipped if boundary_only mode)
         if detection_mode != "boundary_only":
@@ -266,8 +370,24 @@ def detect_and_classify_trees(
                     if cand_ndvi < 0.10 and cand_exg < 6.0:
                         continue
 
-                    # Radial Annular Drop Test (اختبار التحدب الحلقي لعزل المحاصيل المسطحة)
-                    # In flat crop fields (برسيم، قمح، خضروات), ring_ndvi ~= core_ndvi -> drop is near zero!
+                    cand_tophat = float(tophat_matrix[cand_y, cand_x])
+
+                    # 1. Top-Hat Crop Plateau Filter:
+                    # In continuous vegetable/clover fields, Top-Hat is nearly ZERO because
+                    # the morphological opening does NOT remove expansive field carpets!
+                    if cand_tophat < 0.045:
+                        continue
+
+                    # 2. Local variance / flatness test: 5x5 window
+                    sub_patch = ndvi_matrix[max(0, cand_y - 2):min(height_px, cand_y + 3),
+                                            max(0, cand_x - 2):min(width_px, cand_x + 3)]
+                    if sub_patch.size >= 9:
+                        local_std = float(np.std(sub_patch))
+                        if local_std < 0.018:
+                            # Uniform flat crop carpet -> reject!
+                            continue
+
+                    # 3. Radial Annular Drop & Ratio Test
                     ring_y1 = max(0, cand_y - r_ring)
                     ring_y2 = min(height_px, cand_y + r_ring + 1)
                     ring_x1 = max(0, cand_x - r_ring)
@@ -280,8 +400,16 @@ def detect_and_classify_trees(
                     mean_core = float(np.mean(core_ndvi_crop)) if core_ndvi_crop.size > 0 else cand_ndvi
                     mean_ring = float(np.mean(ring_ndvi_crop)) if ring_ndvi_crop.size > 0 else mean_core
                     annular_drop = mean_core - mean_ring
+                    ring_ratio = mean_ring / (mean_core + 1e-5)
 
-                    # Check local 3D shadow or skirt contrast
+                    # 4. Multi-directional isolation (8 compass rays)
+                    # Discrete tree crown MUST drop in at least 4 of 8 directions
+                    drop_rays = count_directional_drops(
+                        ndvi_matrix, cand_x, cand_y, r_drop=r_ring, w=width_px, h=height_px,
+                        center_val=cand_ndvi, min_drop=0.065
+                    )
+
+                    # 5. Local 3D shadow or skirt contrast
                     ring_bright = brightness[ring_y1:ring_y2, ring_x1:ring_x2]
                     core_bright = brightness[max(0, cand_y - r_core):min(height_px, cand_y + r_core + 1),
                                              max(0, cand_x - r_core):min(width_px, cand_x + r_core + 1)]
@@ -290,27 +418,68 @@ def detect_and_classify_trees(
                     has_shadow_edge = (min_ring_b < mean_core_b * 0.82)
 
                     # STRICT DISCRIMINATION FILTER:
-                    # Flat field crops have annular_drop < 0.05 and dog_peak < 6.0!
-                    # A genuine tree crown MUST have:
-                    # (High 3D dome DoG >= 7.5 AND annular drop >= 0.065) OR
-                    # (Strong annular drop >= 0.090 with shadow contrast)
-                    is_real_tree = (
-                        (dog_peak >= 7.5 and annular_drop >= 0.065) or
-                        (annular_drop >= 0.090 and (has_shadow_edge or cand_ndvi >= 0.20))
-                    )
+                    # In a crop field (برسيم، قمح، خضار):
+                    # - cand_tophat < 0.045 (already skipped)
+                    # - drop_rays < 4 (surrounding field is all green!)
+                    # - ring_ratio > 0.85
+                    # - has_shadow_edge is False
+                    if detection_mode == "high_precision":
+                        is_real_tree = (
+                            cand_tophat >= 0.055 and
+                            drop_rays >= 4 and
+                            ring_ratio <= 0.82 and
+                            annular_drop >= 0.065 and
+                            dog_peak >= 6.5 and
+                            (has_shadow_edge or drop_rays >= 6 or cand_tophat >= 0.090)
+                        )
+                    else:  # all_trees
+                        is_real_tree = (
+                            cand_tophat >= 0.040 and
+                            drop_rays >= 3 and
+                            ring_ratio <= 0.86 and
+                            annular_drop >= 0.055 and
+                            dog_peak >= 5.5
+                        )
 
                     if is_real_tree:
-                        if not any(math.hypot(cand_x - px, cand_y - py) < min_sep_px for px, py in placed_centers):
-                            placed_centers.append((cand_x, cand_y))
-                            r_box = max(4, int(pixel_spacing_px * 0.40))
+                        # Sub-pixel Quadratic Apex Interpolation
+                        dx_sub, dy_sub = 0.0, 0.0
+                        if 1 <= cand_x < width_px - 1 and 1 <= cand_y < height_px - 1:
+                            dx1 = float(dog_canopy[cand_y, cand_x - 1])
+                            dx2 = float(dog_canopy[cand_y, cand_x])
+                            dx3 = float(dog_canopy[cand_y, cand_x + 1])
+                            denom_x = 2.0 * (2.0 * dx2 - dx1 - dx3)
+                            if abs(denom_x) > 1e-4:
+                                dx_sub = float(np.clip((dx3 - dx1) / denom_x, -0.45, 0.45))
+
+                            dy1 = float(dog_canopy[cand_y - 1, cand_x])
+                            dy2 = float(dog_canopy[cand_y, cand_x])
+                            dy3 = float(dog_canopy[cand_y + 1, cand_x])
+                            denom_y = 2.0 * (2.0 * dy2 - dy1 - dy3)
+                            if abs(denom_y) > 1e-4:
+                                dy_sub = float(np.clip((dy3 - dy1) / denom_y, -0.45, 0.45))
+
+                        sub_cx = int(round(cand_x + dx_sub))
+                        sub_cy = int(round(cand_y + dy_sub))
+
+                        if not any(math.hypot(sub_cx - px, sub_cy - py) < min_sep_px for px, py in placed_centers):
+                            placed_centers.append((sub_cx, sub_cy))
+                            win_scale = int(best_scale_idx[cand_y, cand_x])
+                            if win_scale == 0:
+                                crown_radius = max(3, int(pixel_spacing_px * 0.24))
+                            elif win_scale == 1:
+                                crown_radius = max(5, int(pixel_spacing_px * 0.38))
+                            else:
+                                crown_radius = max(7, int(pixel_spacing_px * 0.54))
+
                             detected_boxes.append({
-                                "bbox": (cand_x - r_box, cand_y - r_box, cand_x + r_box, cand_y + r_box),
-                                "center": (cand_x, cand_y),
-                                "conf": min(1.0, float(max(annular_drop * 6.0, dog_peak / 20.0))),
+                                "bbox": (sub_cx - crown_radius, sub_cy - crown_radius, sub_cx + crown_radius, sub_cy + crown_radius),
+                                "center": (sub_cx, sub_cy),
+                                "conf": min(1.0, float(max(annular_drop * 6.0, cand_tophat * 8.0, dog_peak / 20.0))),
+                                "crown_radius": crown_radius,
                             })
 
         # B. Boundary Pass for Shelterbelts (مصدات الرياح على حدود المزرعة)
-        # Trees along the boundary must also have discrete crown domes and contrast with border edge
         if parcel_poly_px:
             for i in range(len(parcel_poly_px) - 1):
                 pA, pB = parcel_poly_px[i], parcel_poly_px[i + 1]
@@ -334,16 +503,22 @@ def detect_and_classify_trees(
                         cand_x = w_x1 + int(max_pos[1])
                         dog_val = float(sub_dog[max_pos])
                         cand_ndvi = float(ndvi_matrix[cand_y, cand_x])
+                        cand_tophat = float(tophat_matrix[cand_y, cand_x])
 
-                        # Boundary crown must be green and have contrast with fence/road
-                        if cand_ndvi >= 0.12 and (dog_val >= 6.0 or exg[cand_y, cand_x] >= 12.0):
-                            if not any(math.hypot(cand_x - px, cand_y - py) < (min_sep_px * 0.85) for px, py in placed_centers):
+                        drop_rays = count_directional_drops(
+                            ndvi_matrix, cand_x, cand_y, r_drop=r_ring, w=width_px, h=height_px,
+                            center_val=cand_ndvi, min_drop=0.060
+                        )
+
+                        if cand_ndvi >= 0.12 and (cand_tophat >= 0.035 or dog_val >= 5.5 or exg[cand_y, cand_x] >= 11.0) and drop_rays >= 3:
+                            if not any(math.hypot(cand_x - px, cand_y - py) < (min_sep_px * 0.80) for px, py in placed_centers):
                                 placed_centers.append((cand_x, cand_y))
-                                r_box = max(4, int(pixel_spacing_px * 0.40))
+                                crown_radius = max(4, int(pixel_spacing_px * 0.32))
                                 detected_boxes.append({
-                                    "bbox": (cand_x - r_box, cand_y - r_box, cand_x + r_box, cand_y + r_box),
+                                    "bbox": (cand_x - crown_radius, cand_y - crown_radius, cand_x + crown_radius, cand_y + crown_radius),
                                     "center": (cand_x, cand_y),
                                     "conf": 0.90,
+                                    "crown_radius": crown_radius,
                                 })
 
     # 4. Classify Health (Healthy vs Stressed vs Dead/Damaged) for each detected tree
@@ -355,6 +530,7 @@ def detect_and_classify_trees(
     for idx, item in enumerate(detected_boxes):
         bx1, by1, bx2, by2 = item["bbox"]
         cx, cy = item["center"]
+        crown_rad = item.get("crown_radius", max(4, int((bx2 - bx1) // 2)))
 
         # Clamp box to image limits
         cx1 = max(0, min(width_px - 1, bx1))
@@ -392,6 +568,7 @@ def detect_and_classify_trees(
             "tree_id": idx + 1,
             "center": (cx, cy),
             "bbox": (cx1, cy1, cx2, cy2),
+            "crown_radius": crown_rad,
             "mean_ndvi": round(mean_ndvi, 3),
             "max_ndvi": round(max_ndvi, 3),
             "status": status,
@@ -404,7 +581,7 @@ def detect_and_classify_trees(
     stressed_pct = round((stressed_count / max(1, total_trees)) * 100.0, 1) if total_trees > 0 else 0.0
     damaged_pct = round((damaged_count / max(1, total_trees)) * 100.0, 1) if total_trees > 0 else 0.0
 
-    # 5. Render Visual Detection Image (Green for Healthy, Red for Damaged, Yellow for Stressed)
+    # 5. Render High-Definition Visual Detection Image with True-Radius Halos & Reticles
     annotated_img = orig_img.copy()
     draw_ann = ImageDraw.Draw(annotated_img)
 
@@ -412,27 +589,49 @@ def detect_and_classify_trees(
     if parcel_poly_px and len(parcel_poly_px) >= 3:
         draw_ann.line(parcel_poly_px + [parcel_poly_px[0]], fill=(0, 255, 200), width=3)
 
-    # Draw bounding boxes and crown circles
-    badge_interval = max(5, total_trees // 12) if total_trees > 15 else 1
+    # Draw bounding boxes and crown halos
+    badge_interval = max(6, total_trees // 14) if total_trees > 18 else 1
 
     for t in trees_classified:
         bx1, by1, bx2, by2 = t["bbox"]
         cx, cy = t["center"]
         col = t["color_rgb"]
+        cr = t.get("crown_radius", max(4, int((bx2 - bx1) // 2)))
 
-        # Box outline
-        draw_ann.rectangle([bx1, by1, bx2, by2], outline=col, width=2)
-        # Center crown dot
-        r_c = 3
-        draw_ann.ellipse([cx - r_c, cy - r_c, cx + r_c, cy + r_c], fill=col, outline=(0, 0, 0))
+        # 1. Subtle glowing outer halo matching physical tree canopy
+        draw_ann.ellipse([cx - cr, cy - cr, cx + cr, cy + cr], outline=col, width=2)
+        # Inner accent ring at 0.5x radius
+        r_mid = max(2, cr // 2)
+        draw_ann.ellipse([cx - r_mid, cy - r_mid, cx + r_mid, cy + r_mid], outline=(255, 255, 255), width=1)
 
-        # Serial ID and health indicator badge
+        # 2. Precision Center Pinpoint with high-contrast dual outline
+        draw_ann.ellipse([cx - 3, cy - 3, cx + 3, cy + 3], fill=(0, 0, 0))
+        draw_ann.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=col)
+
+        # 3. Corner reticle brackets for high-precision GIS inspection
+        bracket_len = max(2, cr // 3)
+        # Top-left
+        draw_ann.line([(bx1, by1 + bracket_len), (bx1, by1), (bx1 + bracket_len, by1)], fill=col, width=1)
+        # Top-right
+        draw_ann.line([(bx2 - bracket_len, by1), (bx2, by1), (bx2, by1 + bracket_len)], fill=col, width=1)
+        # Bottom-left
+        draw_ann.line([(bx1, by2 - bracket_len), (bx1, by2), (bx1 + bracket_len, by2)], fill=col, width=1)
+        # Bottom-right
+        draw_ann.line([(bx2 - bracket_len, by2), (bx2, by2), (bx2, by2 - bracket_len)], fill=col, width=1)
+
+        # 4. Serial ID and health indicator badge
         tid = t["tree_id"]
         if tid == 1 or tid % badge_interval == 0 or t["status"] == "damaged":
-            label_text = f"#{tid}" if t["status"] != "damaged" else f"#{tid} [تالف]"
+            if t["status"] == "healthy":
+                label_text = f"#{tid}"
+            elif t["status"] == "stressed":
+                label_text = f"#{tid} 🟡"
+            else:
+                label_text = f"#{tid} [تالف] 🔴"
+
             tw = len(label_text) * 8
-            draw_ann.rectangle([cx + 3, cy - 9, cx + 3 + tw, cy + 7], fill=(15, 23, 42), outline=col)
-            draw_ann.text((cx + 5, cy - 8), label_text, fill=(255, 255, 255))
+            draw_ann.rectangle([cx + 4, cy - 10, cx + 4 + tw, cy + 8], fill=(15, 23, 42), outline=col)
+            draw_ann.text((cx + 6, cy - 8), label_text, fill=(255, 255, 255))
 
     # Top Statistical Banner
     banner_h = 38

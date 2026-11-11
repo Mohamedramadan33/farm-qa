@@ -13,7 +13,7 @@ from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from pyproj import Transformer
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.validation import make_valid
@@ -1028,20 +1028,23 @@ def analyze_farm_satellite_canopy(
     d_lon_m = abs(max_lon - min_lon) * 111139.0 * math.cos(math.radians(center_lat))
     max_span_m = max(d_lat_m, d_lon_m)
 
-    # Adaptive Zoom based on footprint
-    if max_span_m > 1100:
-        zoom = 16  # Large farms (> 80 feddans)
-    elif max_span_m > 380:
-        zoom = 17  # Medium-large farms (15 - 80 feddans)
+    # High-Definition Adaptive Zoom (Super-Resolution Satellite Fetching):
+    # Zoom 19 gives ~0.30 m/pixel (sharp crown canopy architecture & clear branches).
+    if max_span_m > 1200:
+        zoom = 16  # Extra large farms (> 100 feddans)
+    elif max_span_m > 500:
+        zoom = 17  # Medium-large farms (30 - 100 feddans)
+    elif max_span_m > 220:
+        zoom = 18  # Small-medium parcels (6 - 30 feddans)
     else:
-        zoom = 18  # Small-medium parcels (< 15 feddans)
+        zoom = 19  # High-definition small-medium parcels (< 6 feddans)
 
     x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
     x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
 
-    # Clamp tile range to max 3x3
-    if abs(x2 - x1) >= 4 or abs(y2 - y1) >= 4:
-        zoom = max(15, zoom - 1)
+    # Clamp tile range to max 4x4 to balance speed and ultra-high resolution
+    if abs(x2 - x1) >= 5 or abs(y2 - y1) >= 5:
+        zoom = max(16, zoom - 1)
         x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
         x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
 
@@ -1061,6 +1064,13 @@ def analyze_farm_satellite_canopy(
                 has_tile = True
                 stitched.paste(tile_img, ((x - x_min) * 256, (y - y_min) * 256))
 
+    # Apply High-Pass Foliage Unsharp Masking to restore crisp crown edges & micro-texture
+    if has_tile:
+        try:
+            stitched = stitched.filter(ImageFilter.UnsharpMask(radius=1.5, percent=140, threshold=3))
+        except Exception:
+            pass
+
     def to_px(lon: float, lat: float) -> Tuple[int, int]:
         lat_rad = math.radians(lat)
         n = 2.0 ** zoom
@@ -1079,12 +1089,12 @@ def analyze_farm_satellite_canopy(
     px_per_m = total_px_len / max(perimeter_m, 1.0)
     spacing_px = max(6.0, spacing_m * px_per_m)
 
-    # 1. CLEAN SATELLITE IMAGE (صورة طبيعية نقية مع مضلع المزرعة وبدون علامات الأشجار)
+    # 1. CLEAN SATELLITE IMAGE (صورة طبيعية نقية فائقة الوضوح مع مضلع المزرعة وبدون علامات الأشجار)
     clean_img = stitched.copy()
     draw_clean = ImageDraw.Draw(clean_img)
     draw_clean.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
     draw_clean.rectangle([0, 0, width_px, 32], fill=(15, 23, 42))
-    header_clean = f"SATELLITE VIEW (CLEAN) | Farm Boundary GPS | Date: {imagery_date or 'Recent'}"
+    header_clean = f"SATELLITE VIEW (HD RESOLUTION) | Farm Boundary GPS | Date: {imagery_date or 'Recent'}"
     draw_clean.text((12, 9), header_clean, fill=(0, 255, 200))
 
     # 2. RUN INTEGRATED CV & NDVI DETECTION MODULE
@@ -1093,6 +1103,7 @@ def analyze_farm_satellite_canopy(
         parcel_poly_px=poly_px,
         pixel_spacing_px=spacing_px,
         detection_mode=detection_mode,
+        tree_type_str=tree_type_str,
     )
 
     final_ai_count = cv_res["total_trees"]
