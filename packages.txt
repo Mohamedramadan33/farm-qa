@@ -1,1 +1,0 @@
-# No system apt packages required; shapely, pyproj, and opencv-python-headless bundle binary dependencies.
