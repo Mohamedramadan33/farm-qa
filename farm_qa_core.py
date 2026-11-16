@@ -553,12 +553,15 @@ def extract_farm_record(
                     pass
 
     # Extract all photos with intelligent human Arabic titles
-    attachments = raw_sub.get("_attachments", [])
+    raw_attachments = raw_sub.get("_attachments")
+    attachments = raw_attachments if isinstance(raw_attachments, list) else []
     photos: List[Dict[str, Any]] = []
     seen_clean_files = set()
 
     # 1. From _attachments
     for att in attachments:
+        if not isinstance(att, dict):
+            continue
         fn = str(att.get("filename", "")).strip()
         url = att.get("download_url") or att.get("download_medium_url") or att.get("download_small_url") or ""
         mime = str(att.get("mimetype", "")).lower()
@@ -896,7 +899,8 @@ def fetch_satellite_tile(
         try:
             resp = client.get(url, headers=_TILE_HEADERS, timeout=7)
             if resp.ok and len(resp.content) > 600:
-                img = Image.open(BytesIO(resp.content)).convert("RGB")
+                with Image.open(BytesIO(resp.content)) as im:
+                    img = im.convert("RGB")
                 if _is_valid_tile_image(img):
                     return img
                 if fallback_img is None:
@@ -1138,11 +1142,11 @@ def analyze_farm_satellite_canopy(
     else:
         zoom = 19
 
-    # Step down zoom if tile grid exceeds 8x8 (max 64 tiles) for speed & stability
-    while zoom > 14:
+    # Step down zoom if tile grid exceeds 6x6 (max 36 tiles = 1536x1536 px) to keep memory safe on Cloud
+    while zoom > 13:
         tx1, ty1 = lon_lat_to_tile(min_lon, max_lat, zoom)
         tx2, ty2 = lon_lat_to_tile(max_lon, min_lat, zoom)
-        if abs(tx2 - tx1) < 8 and abs(ty2 - ty1) < 8 and ((abs(tx2 - tx1) + 1) * (abs(ty2 - ty1) + 1) <= 49):
+        if abs(tx2 - tx1) < 6 and abs(ty2 - ty1) < 6 and ((abs(tx2 - tx1) + 1) * (abs(ty2 - ty1) + 1) <= 36):
             break
         zoom -= 1
 
@@ -1212,6 +1216,7 @@ def analyze_farm_satellite_canopy(
         detection_mode=detection_mode,
         tree_type_str=tree_type_str,
         sensitivity=sensitivity,
+        generate_heatmap=False,
     )
 
     final_ai_count = cv_res["total_trees"]

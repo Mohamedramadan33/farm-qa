@@ -261,8 +261,8 @@ def evaluate_pgs_rules(
             })
 
     # 5. Farm Area Consistency (Entered Area vs GPS Polygon Area)
-    area_ent = farm_record.get("area_entered")
-    area_gps = farm_record.get("area_gps")
+    area_ent = to_float(farm_record.get("area_entered") or farm_record.get("farm_area"))
+    area_gps = to_float(farm_record.get("area_gps"))
     if area_ent and area_gps:
         diff_pct = abs(area_ent - area_gps) / max(area_ent, 0.01) * 100
         if diff_pct <= 15:
@@ -281,9 +281,12 @@ def evaluate_pgs_rules(
             })
 
     # 6. Tree Health & Windbreak Condition (NDVI Healthy vs Damaged Ratio)
-    tree_damaged_pct = farm_record.get("tree_damaged_pct")
-    tree_healthy_pct = farm_record.get("tree_healthy_pct", 100.0 - (tree_damaged_pct or 0.0))
+    tree_damaged_pct = to_float(farm_record.get("tree_damaged_pct"))
+    tree_healthy_pct = to_float(farm_record.get("tree_healthy_pct"))
+    if tree_healthy_pct is None and tree_damaged_pct is not None:
+        tree_healthy_pct = 100.0 - tree_damaged_pct
     if tree_damaged_pct is not None:
+        safe_healthy = tree_healthy_pct if tree_healthy_pct is not None else 0.0
         if tree_damaged_pct > 15.0:
             findings.append({
                 "rule": "الحالة الصحية للأشجار والمصدات (NDVI)",
@@ -296,13 +299,13 @@ def evaluate_pgs_rules(
                 "rule": "الحالة الصحية للأشجار والمصدات (NDVI)",
                 "passed": True,
                 "severity": "info",
-                "message": f"الحالة الصحية لأشجار المزرعة ممتازة ({tree_healthy_pct:.1f}% سليمة خضراء) ونسبة التلف منخفضة ({tree_damaged_pct:.1f}%).",
+                "message": f"الحالة الصحية لأشجار المزرعة ممتازة ({safe_healthy:.1f}% سليمة خضراء) ونسبة التلف منخفضة ({tree_damaged_pct:.1f}%).",
             })
 
     # 7. Vegetative Canopy Green Coverage (نسبة الغطاء النباتي الفضائي)
-    veg_cov_pct = farm_record.get("parcel_veg_coverage_pct") or farm_record.get("veg_pct")
+    veg_cov_pct = to_float(farm_record.get("parcel_veg_coverage_pct") or farm_record.get("veg_pct"))
     if veg_cov_pct is not None:
-        if float(veg_cov_pct) < 25.0:
+        if veg_cov_pct < 25.0:
             findings.append({
                 "rule": "كثافة الغطاء النباتي للمزرعة",
                 "passed": False,

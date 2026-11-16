@@ -22,12 +22,8 @@ try:
 except ImportError:
     HAS_OPENCV = False
 
-# Optional Ultralytics YOLO
-try:
-    from ultralytics import YOLO
-    HAS_YOLO = True
-except ImportError:
-    HAS_YOLO = False
+# Optional Ultralytics YOLO (lazy-imported only when validating a custom tree model)
+HAS_YOLO = False
 
 _YOLO_MODEL_CACHE: Dict[str, Any] = {}
 _TREE_CLASS_KEYWORDS = {
@@ -38,11 +34,18 @@ _TREE_CLASS_KEYWORDS = {
 
 def _get_validated_tree_yolo(model_path: str) -> Tuple[Optional[Any], str]:
     """
-    Loads YOLO model (cached) and verifies it actually defines tree/canopy classes.
-    Prevents misusing unrelated weights (e.g. wildlife/vehicle security models) as tree detectors.
+    Loads YOLO model (cached & lazy-imported) and verifies it actually defines tree/canopy classes.
+    Prevents importing torch/ultralytics on startup or misusing unrelated models as tree detectors.
     """
-    if not HAS_YOLO or not model_path or not os.path.exists(model_path):
+    global HAS_YOLO
+    if not model_path or not os.path.exists(model_path):
         return None, "no_model"
+    try:
+        from ultralytics import YOLO
+        HAS_YOLO = True
+    except ImportError:
+        HAS_YOLO = False
+        return None, "ultralytics_not_installed"
     try:
         model = _YOLO_MODEL_CACHE.get(model_path)
         if model is None:
@@ -63,6 +66,7 @@ def _get_validated_tree_yolo(model_path: str) -> Tuple[Optional[Any], str]:
         return model, ""
     except Exception as exc:
         return None, f"load_error:{exc}"
+
 
 
 def compute_ndvi_or_vari(
@@ -229,6 +233,7 @@ def detect_and_classify_trees(
     detection_mode: str = "high_precision",
     tree_type_str: str = "",
     sensitivity: float = 0.50,
+    generate_heatmap: bool = False,
 ) -> Dict[str, Any]:
     """
     High-Precision Visual Tree Detection & Flat Crop Rejection Engine:
@@ -273,7 +278,7 @@ def detect_and_classify_trees(
 
     # Attempt YOLO deep learning detection ONLY if model defines tree/canopy classes
     yolo_skipped_reason = ""
-    if HAS_YOLO and active_yolo_path:
+    if active_yolo_path:
         yolo_model, skip_reason = _get_validated_tree_yolo(active_yolo_path)
         if yolo_model is not None:
             try:
@@ -579,6 +584,9 @@ def detect_and_classify_trees(
                         "crown_radius": crown_radius,
                     })
 
+        # Explicitly release large intermediate arrays before image rendering
+        del arr, r, g, b, exg, brightness, dogs_stacked, dog1, dog2, dog3, dog_canopy, best_scale_idx, tophat_matrix, shadow_map, gray_arr
+
     # 4. Classify Health (Healthy vs Stressed vs Dead/Damaged) for each detected tree
     trees_classified: List[Dict[str, Any]] = []
     healthy_count = 0
@@ -702,8 +710,8 @@ def detect_and_classify_trees(
     )
     draw_ann.text((12, 11), header_txt, fill=(0, 255, 200))
 
-    # Generate NDVI heatmap image
-    ndvi_heatmap = generate_ndvi_colormap_image(ndvi_matrix, mask=parcel_mask)
+    # Generate optional NDVI heatmap image only when explicitly requested
+    ndvi_heatmap = generate_ndvi_colormap_image(ndvi_matrix, mask=parcel_mask) if generate_heatmap else None
 
     # Compute overall vegetation coverage percentage
     veg_pixels = (ndvi_matrix > 0.12) & parcel_mask

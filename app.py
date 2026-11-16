@@ -15,6 +15,7 @@ Full Feature Set:
 """
 
 import os
+import re
 import datetime
 from io import BytesIO
 from typing import Dict, List, Any, Optional
@@ -38,6 +39,18 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _st_version_tuple() -> tuple:
+    try:
+        parts = str(getattr(st, "__version__", "1.41.0")).split(".")
+        return tuple(int(re.sub(r"\D.*", "", p) or 0) for p in parts[:2])
+    except Exception:
+        return (1, 41)
+
+
+_USE_NEW_WIDTH_API = _st_version_tuple() >= (1, 50)
+_STRETCH_KW: Dict[str, Any] = {"width": "stretch"} if _USE_NEW_WIDTH_API else {"use_container_width": True}
 
 # Custom RTL & Modern Arabic Typography Styling
 st.markdown(
@@ -77,20 +90,20 @@ st.markdown(
 
 def safe_image(img_or_url: Any, caption: Optional[str] = None):
     """
-    Safely renders image in Streamlit across all versions (supports both
-    use_container_width and use_column_width without throwing TypeError).
+    Safely renders image in Streamlit across all versions without throwing
+    TypeError on deprecated width kwargs or UnidentifiedImageError on corrupt payloads.
     """
     if img_or_url is None:
         return
     try:
-        st.image(img_or_url, caption=caption, use_column_width=True)
+        st.image(img_or_url, caption=caption, **_STRETCH_KW)
     except TypeError:
         try:
-            st.image(img_or_url, caption=caption, use_container_width=True)
-        except Exception:
             st.image(img_or_url, caption=caption)
+        except Exception as e:
+            st.caption(f"تعذر عرض الصورة: {e}")
     except Exception as e:
-        st.caption(f"الصورة: {e}")
+        st.caption(f"تعذر عرض الصورة: {e}")
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -249,14 +262,21 @@ DEMO_FARMS = [
 ]
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, max_entries=4)
 def load_kobo_data(token: str, server_url: str, asset_uid: str) -> List[Dict[str, Any]]:
     if not token:
         return []
-    raw_list = store.fetch_kobo_submissions(server_url, asset_uid, token)
+    try:
+        raw_list = store.fetch_kobo_submissions(server_url, asset_uid, token)
+    except Exception as e:
+        print(f"Kobo submissions fetch error: {e}")
+        return []
     if not raw_list:
         return []
-    schema_labels = store.fetch_kobo_asset_schema(server_url, asset_uid, token)
+    try:
+        schema_labels = store.fetch_kobo_asset_schema(server_url, asset_uid, token)
+    except Exception:
+        schema_labels = {}
     records: List[Dict[str, Any]] = []
     for idx, r in enumerate(raw_list):
         if not r or not isinstance(r, dict):
@@ -271,7 +291,7 @@ def load_kobo_data(token: str, server_url: str, asset_uid: str) -> List[Dict[str
     return records
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, max_entries=80)
 def fetch_authenticated_kobo_image(url: str, token: str) -> Optional[bytes]:
     """
     Downloads private KoboToolbox images using the Authorization header.
@@ -290,7 +310,7 @@ def fetch_authenticated_kobo_image(url: str, token: str) -> Optional[bytes]:
     return None
 
 
-@st.cache_data(ttl=180)
+@st.cache_data(ttl=180, max_entries=10)
 def load_cached_airtable_reviews(key: str, base: str, table: str) -> Dict[str, Any]:
     if not key or not base or not table:
         return {}
@@ -300,7 +320,7 @@ def load_cached_airtable_reviews(key: str, base: str, table: str) -> Dict[str, A
         return {}
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=24, show_spinner=False)
 def run_cached_satellite_canopy(
     farm_id: str,
     coords_tuple: tuple,
@@ -327,7 +347,7 @@ def run_cached_satellite_canopy(
         pil_img = out.get(img_key)
         if pil_img is not None:
             buf = BytesIO()
-            pil_img.save(buf, format="JPEG", quality=92)
+            pil_img.save(buf, format="JPEG", quality=90)
             out[f"{img_key}_bytes"] = buf.getvalue()
         else:
             out[f"{img_key}_bytes"] = None
@@ -346,8 +366,13 @@ if "authenticated" not in st.session_state:
 if "current_user" not in st.session_state:
     st.session_state.current_user = "mohamed"
 
-if "all_reviews" not in st.session_state:
+if "all_reviews" not in st.session_state or not isinstance(st.session_state.all_reviews, dict):
     local_reviews = store.get_all_reviews()
+    if not isinstance(local_reviews, dict):
+        local_reviews = {}
+    local_reviews.setdefault("master", {})
+    local_reviews.setdefault("fields", {})
+    local_reviews.setdefault("photos", {})
     if SECRET_AIRTABLE_KEY and SECRET_AIRTABLE_BASE and SECRET_AIRTABLE_TABLE:
         try:
             airtable_master = load_cached_airtable_reviews(
@@ -359,7 +384,7 @@ if "all_reviews" not in st.session_state:
             pass
     st.session_state.all_reviews = local_reviews
 
-if "assignments" not in st.session_state:
+if "assignments" not in st.session_state or not isinstance(st.session_state.assignments, dict):
     st.session_state.assignments = store.get_assignments()
 
 
@@ -393,7 +418,7 @@ if not st.session_state.authenticated:
                 type="password",
                 placeholder="أدخل كلمة المرور (الافتراضية: 000000)",
             )
-            submit_login = st.form_submit_button("تسجيل الدخول", type="primary", use_container_width=True)
+            submit_login = st.form_submit_button("تسجيل الدخول", type="primary", **_STRETCH_KW)
 
             if submit_login:
                 verified = store.verify_user(user_choice, user_pass)
@@ -461,22 +486,26 @@ with st.sidebar:
     st.write(f"المستخدم: **{wd.display_name(st.session_state.current_user)}**")
     st.caption(f"حالة المصدر: {data_source_badge}")
 
-    if st.button("🚪 تسجيل الخروج", use_container_width=True):
+    if st.button("🚪 تسجيل الخروج", **_STRETCH_KW):
         st.session_state.authenticated = False
         st.rerun()
 
     st.markdown("---")
     st.subheader("⚙️ إجراءات سريعة")
 
-    if st.button("🔄 تحديث من Kobo و Airtable", use_container_width=True):
+    if st.button("🔄 تحديث من Kobo و Airtable", **_STRETCH_KW):
         st.cache_data.clear()
         st.rerun()
 
     # Fair distribution button
-    if st.button("⚡ تقسيم الشغل العادل على الفريق", type="primary", use_container_width=True):
+    if st.button("⚡ تقسيم الشغل العادل على الفريق", type="primary", **_STRETCH_KW):
         unval = [
-            {"subId": str(f.get("_id")), "farmCode": f.get("farm_id"), "governorate": f.get("governorate")}
-            for f in raw_farms
+            {
+                "subId": str(f.get("_id") or idx + 1),
+                "farmCode": str(f.get("farm_id") or ""),
+                "governorate": str(f.get("governorate") or "غير محدد"),
+            }
+            for idx, f in enumerate(raw_farms)
         ]
         div_res = wd.divide_work_fairly(unval, wd.TEAM_KEYS, max_gov_ratio=1.4)
         for worker, items in div_res["worker_farms"].items():
@@ -556,7 +585,7 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
             format_func=lambda k: "جميع المراجعين" if k == "الكل" else wd.display_name(k),
         )
     with f_col3:
-        govs = sorted(list(set(f.get("governorate", "غير محدد") for f in raw_farms)))
+        govs = sorted(list(set(str(f.get("governorate") or "غير محدد") for f in raw_farms)))
         filter_gov = st.selectbox("المحافظة:", options=["الكل"] + govs)
     with f_col4:
         val_filter_choices = [
@@ -652,17 +681,17 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
         display_data = []
         for m in matched_farms:
             display_data.append({
-                "كود المزرعة": m["farm_id"],
-                "اسم المزرعة": m["farm_name"],
-                "المزارع": m["farmer"],
-                "المهندس": m["engineer"],
-                "المحافظة": m["gov"],
-                "المساحة (فدان)": m["area"],
-                "المراجع المسند": wd.display_name(m["assigned_to"]),
-                "قرار المراجعة": m["status"],
-                "Validation (اعتماد Kobo)": m["val_status"],
+                "كود المزرعة": str(m.get("farm_id") or "—"),
+                "اسم المزرعة": str(m.get("farm_name") or "—"),
+                "المزارع": str(m.get("farmer") or "—"),
+                "المهندس": str(m.get("engineer") or "—"),
+                "المحافظة": str(m.get("gov") or "—"),
+                "المساحة (فدان)": float(core.to_float(m.get("area")) or 0.0),
+                "المراجع المسند": str(wd.display_name(m.get("assigned_to"))),
+                "قرار المراجعة": str(m.get("status") or "Pending Review"),
+                "Validation (اعتماد Kobo)": str(m.get("val_status") or "-"),
             })
-        st.dataframe(pd.DataFrame(display_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(display_data), **_STRETCH_KW, hide_index=True)
 
         st.markdown("---")
         st.subheader("⚡ إسناد وتغيير مسؤول المزرعة يدوياً")
@@ -682,7 +711,7 @@ if nav_choice == "📋 قائمة وبحث وتوزيع المزارع":
             )
         with assign_col3:
             st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            if st.button("تحديث الإسناد", use_container_width=True, type="primary"):
+            if st.button("تحديث الإسناد", **_STRETCH_KW, type="primary"):
                 target_m = next((m for m in matched_farms if m["farm_id"] == farm_to_reassign), None)
                 if target_m:
                     store.set_assignment(
@@ -757,10 +786,10 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
 
     # Construct farm choices with clear Validation status in every option
     farm_keys = {}
-    for f in search_results:
-        fid = str(f.get("farm_id", "—"))
-        fname = str(f.get("farm_name", "—"))
-        gov = str(f.get("governorate", "—"))
+    for f_idx, f in enumerate(search_results):
+        fid = str(f.get("farm_id") or "—")
+        fname = str(f.get("farm_name") or "—")
+        gov = str(f.get("governorate") or "—")
         v_info = core.normalize_kobo_validation_status(f.get("_validation_status"))
         if v_info["code"] == "approved":
             v_badge = "[Approved ✅]"
@@ -772,6 +801,8 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             v_badge = "[- ⚪]"
 
         display_label = f"{fid} — {fname} — {v_badge} ({gov})"
+        if display_label in farm_keys:
+            display_label = f"{display_label} #{f.get('_id', f_idx + 1)}"
         farm_keys[display_label] = f
 
     selected_farm_label = st.selectbox(
@@ -779,7 +810,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         options=list(farm_keys.keys()),
         help="تظهر حالة Validation المعتمدة في Kobo لكل مزرعة بجانب الكود والاسم.",
     )
-    farm = farm_keys[selected_farm_label]
+    farm = farm_keys.get(selected_farm_label) or search_results[0]
 
     sub_id = str(farm.get("_id", ""))
     farm_id = farm.get("farm_id", "")
@@ -819,7 +850,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             )
         with r_c2:
             st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            if st.button("حفظ التعيين", key=f"btn_reassign_{farm_id}", use_container_width=True):
+            if st.button("حفظ التعيين", key=f"btn_reassign_{farm_id}", **_STRETCH_KW):
                 store.set_assignment(sub_id, new_assignee, by_user=st.session_state.current_user, farm_id=farm_id)
                 st.session_state.assignments = store.get_assignments()
                 st.success(f"تم إسناد المزرعة إلى {wd.display_name(new_assignee)}")
@@ -828,9 +859,11 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
     # Geometry & Polygon
     poly_coords, is_repaired = core.parse_polygon_coords(farm.get("gps_polygon", ""))
     utm_metrics = core.calculate_utm_metrics(poly_coords) if poly_coords else {}
-    area_gps_feddan = utm_metrics.get("area_feddan", 0.0)
-    perimeter_m = utm_metrics.get("perimeter_m", 0.0)
+    area_gps_feddan = float(utm_metrics.get("area_feddan", 0.0) or 0.0)
+    perimeter_m = float(utm_metrics.get("perimeter_m", 0.0) or 0.0)
     gps_quality = core.evaluate_gps_quality(poly_coords, utm_metrics.get("poly_utm"))
+    farm["area_entered"] = float(core.to_float(farm.get("farm_area")) or 0.0)
+    farm["area_gps"] = area_gps_feddan
 
     # Tabs for consolidated view
     # Tabs for consolidated view
@@ -1104,7 +1137,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                     })
 
                 if rows_to_show:
-                    st.dataframe(rows_to_show, use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(rows_to_show), **_STRETCH_KW, hide_index=True)
                 else:
                     st.info("لا توجد أشجار مطابقة لشرط التصفية المحدد.")
 
@@ -1129,56 +1162,59 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             st.warning("⚠️ تم إصلاح وفك تقاطع ذاتي (Bowtie) في تسلسل نقاط GPS تلقائياً.")
 
         if poly_coords and len(poly_coords) >= 3:
-            mean_lat = sum(p[1] for p in poly_coords) / len(poly_coords)
-            mean_lon = sum(p[0] for p in poly_coords) / len(poly_coords)
+            try:
+                mean_lat = sum(p[1] for p in poly_coords) / len(poly_coords)
+                mean_lon = sum(p[0] for p in poly_coords) / len(poly_coords)
 
-            m = Map(location=[mean_lat, mean_lon], zoom_start=17, tiles=None)
-            TileLayer(
-                tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-                attr="Google Satellite",
-                name="Google Earth Satellite",
-                overlay=False,
-                control=True,
-            ).add_to(m)
-            TileLayer(
-                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                attr="Esri World Imagery",
-                name="ArcGIS Satellite",
-                overlay=False,
-                control=True,
-            ).add_to(m)
-
-            folium_coords = [[p[1], p[0]] for p in poly_coords]
-            FoliumPolygon(
-                locations=folium_coords,
-                color="#10b981",
-                weight=3,
-                fill=True,
-                fill_color="#10b981",
-                fill_opacity=0.25,
-                tooltip=f"مزرعة {farm.get('farm_name')}",
-            ).add_to(m)
-
-            # Add each individual detected tree point as an interactive green CircleMarker
-            for tp in canopy_result.get("tree_points", []):
-                CircleMarker(
-                    location=[tp["lat"], tp["lon"]],
-                    radius=4,
-                    color="#047857",
-                    fill=True,
-                    fill_color="#10b981",
-                    fill_opacity=0.9,
-                    tooltip=f"شجرة #{tp.get('id') or tp.get('tree_id')}",
+                m = Map(location=[mean_lat, mean_lon], zoom_start=17, tiles=None)
+                TileLayer(
+                    tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+                    attr="Google Satellite",
+                    name="Google Earth Satellite",
+                    overlay=False,
+                    control=True,
+                ).add_to(m)
+                TileLayer(
+                    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                    attr="Esri World Imagery",
+                    name="ArcGIS Satellite",
+                    overlay=False,
+                    control=True,
                 ).add_to(m)
 
-            Marker([mean_lat, mean_lon], tooltip=f"مركز {farm.get('farm_id')}").add_to(m)
-            st_folium(
-                m,
-                height=420,
-                use_container_width=True,
-                key=f"farm_folium_map_{farm_id}",
-                returned_objects=[],
-            )
+                folium_coords = [[p[1], p[0]] for p in poly_coords]
+                FoliumPolygon(
+                    locations=folium_coords,
+                    color="#10b981",
+                    weight=3,
+                    fill=True,
+                    fill_color="#10b981",
+                    fill_opacity=0.25,
+                    tooltip=f"مزرعة {farm.get('farm_name')}",
+                ).add_to(m)
+
+                # Add each individual detected tree point as an interactive green CircleMarker
+                for tp in canopy_result.get("tree_points", []):
+                    CircleMarker(
+                        location=[tp["lat"], tp["lon"]],
+                        radius=4,
+                        color="#047857",
+                        fill=True,
+                        fill_color="#10b981",
+                        fill_opacity=0.9,
+                        tooltip=f"شجرة #{tp.get('id') or tp.get('tree_id')}",
+                    ).add_to(m)
+
+                Marker([mean_lat, mean_lon], tooltip=f"مركز {farm.get('farm_id')}").add_to(m)
+                st_folium(
+                    m,
+                    height=420,
+                    use_container_width=True,
+                    key=f"farm_folium_map_{farm_id}",
+                    returned_objects=[],
+                )
+            except Exception as map_err:
+                st.warning(f"⚠️ تعذر تحميل الخريطة التفاعلية لهذه المزرعة: {map_err}")
 
         # GPS Coordinates Table for Detected Trees
         tree_pts = canopy_result.get("tree_points", [])
@@ -1186,13 +1222,13 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             with st.expander(f"📋 جدول إحداثيات كل شجرة مرصودة ({len(tree_pts)} شجرة)", expanded=False):
                 pts_df = pd.DataFrame([
                     {
-                        "رقم الشجرة": p["id"],
-                        "خط العرض (Latitude)": f"{p['lat']:.6f}",
-                        "خط الطول (Longitude)": f"{p['lon']:.6f}",
+                        "رقم الشجرة": int(p.get("id") or p.get("tree_id") or (p_i + 1)),
+                        "خط العرض (Latitude)": f"{float(p.get('lat', 0.0)):.6f}",
+                        "خط الطول (Longitude)": f"{float(p.get('lon', 0.0)):.6f}",
                     }
-                    for p in tree_pts
+                    for p_i, p in enumerate(tree_pts)
                 ])
-                st.dataframe(pts_df, use_container_width=True, height=220)
+                st.dataframe(pts_df, **_STRETCH_KW, height=220, hide_index=True)
                 csv_bytes = pts_df.to_csv(index=False).encode("utf-8-sig")
                 st.download_button(
                     label="📥 تحميل إحداثيات الأشجار بصيغة CSV",
@@ -1250,7 +1286,13 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                         if "kobotoolbox" in url or "kf.kobo" in url:
                             img_bytes = fetch_authenticated_kobo_image(url, token_to_use)
                             if img_bytes:
-                                safe_image(Image.open(BytesIO(img_bytes)), caption=f"{title}")
+                                try:
+                                    with Image.open(BytesIO(img_bytes)) as im_check:
+                                        im_check.verify()
+                                    safe_image(img_bytes, caption=f"{title}")
+                                except Exception:
+                                    st.caption("تعذر فك تشفير الصورة من Kobo. اضغط للفتح بالمتصفح:")
+                                    st.markdown(f"[🔗 فتح الصورة ({clean_fn})]({url})")
                             else:
                                 st.caption("تعذر تحميل الصورة مباشرة من Kobo. اضغط للفتح بالمتصفح:")
                                 st.markdown(f"[🔗 فتح الصورة ({clean_fn})]({url})")
@@ -1295,7 +1337,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         with qa_search_col1:
             qa_search = st.text_input("🔍 بحث في الأسئلة أو الأجوبة:", placeholder="اكتب للبحث في نص السؤال أو الإجابة...").strip().lower()
 
-        sections = sorted(list(set(item["section"] for item in all_qa_items)))
+        sections = sorted(list(set(str(item.get("section") or "عام") for item in all_qa_items)))
         with qa_search_col2:
             section_filter = st.selectbox("تصفية حسب القسم / المحور:", options=["جميع الأقسام"] + sections)
 
@@ -1340,10 +1382,15 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
 
 
     # 4. PGS Rules
+    rule_findings = []
     with tab_pgs:
         st.subheader("📜 تقرير محرك قواعد PGS الزراعية المصرية")
         flat_payload = farm.get("flat") or farm
-        rule_findings = pgs.evaluate_pgs_rules(farm, flat_payload, poly_coords)
+        try:
+            rule_findings = pgs.evaluate_pgs_rules(farm, flat_payload, poly_coords)
+        except Exception as pgs_err:
+            st.warning(f"⚠️ تعذر تقييم بعض قواعد PGS لهذه الاستمارة: {pgs_err}")
+            rule_findings = []
 
         for finding in rule_findings:
             if finding["passed"]:
@@ -1388,20 +1435,20 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         btn_c1, btn_c2, btn_c3 = st.columns([1, 1, 1])
 
         with btn_c1:
-            if st.button("💾 حفظ القرار محلياً", type="primary", use_container_width=True):
+            if st.button("💾 حفظ القرار محلياً", type="primary", **_STRETCH_KW):
                 new_record = {
                     "Form_Status": selected_status,
                     "General_Auditor_Note": auditor_notes,
                     "Auditor_Name": wd.display_name(st.session_state.current_user),
                     "Rejected_Items_Count": 0,
-                    "Consolidated_Comments": "; ".join(f["message"] for f in rule_findings if not f["passed"]),
+                    "Consolidated_Comments": "; ".join(f["message"] for f in rule_findings if not f.get("passed")),
                 }
                 store.save_master_review(farm_id, sub_id, new_record)
                 st.session_state.all_reviews["master"][farm_id] = new_record
                 st.success("تم حفظ قرار المراجعة محلياً بنجاح!")
 
         with btn_c2:
-            if SECRET_AIRTABLE_KEY and st.button("☁️ إرسال ومزامنة مع Airtable", use_container_width=True):
+            if SECRET_AIRTABLE_KEY and st.button("☁️ إرسال ومزامنة مع Airtable", **_STRETCH_KW):
                 new_record = {
                     "farm_id": farm_id,
                     "submission_id": sub_id,
@@ -1409,7 +1456,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                     "General_Auditor_Note": auditor_notes,
                     "Auditor_Name": wd.display_name(st.session_state.current_user),
                     "Rejected_Items_Count": 0,
-                    "Consolidated_Comments": "; ".join(f["message"] for f in rule_findings if not f["passed"]),
+                    "Consolidated_Comments": "; ".join(f["message"] for f in rule_findings if not f.get("passed")),
                     "Reviewed_At": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                 }
                 air_res = store.sync_to_airtable(
@@ -1424,7 +1471,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                     st.error(air_res.get("message"))
 
         with btn_c3:
-            if token_to_use and st.button("🌐 تحديث حالة استمارة Kobo", use_container_width=True):
+            if token_to_use and st.button("🌐 تحديث حالة استمارة Kobo", **_STRETCH_KW):
                 status_map = {
                     "Approved Entire Form": "validation_status_approved",
                     "Conditional (Modifications Required)": "validation_status_on_hold",
@@ -1454,8 +1501,12 @@ elif nav_choice == "📊 التقرير النهائي وتصدير Excel":
     all_photo_decs = st.session_state.all_reviews.get("photos", {})
     report_rows = []
 
+    def _clean_excel_str(val: Any) -> str:
+        s = str(val if val is not None else "—")
+        return re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]", " ", s)
+
     for f in raw_farms:
-        fid = f.get("farm_id")
+        fid = str(f.get("farm_id") or "")
         rev = reviews_master.get(fid, {})
         assign = st.session_state.assignments.get(str(f.get("_id")), {})
         f_photos = all_photo_decs.get(fid, {})
@@ -1468,35 +1519,44 @@ elif nav_choice == "📊 التقرير النهائي وتصدير Excel":
 
         report_rows.append(
             {
-                "كود المزرعة": fid,
-                "اسم المزرعة": f.get("farm_name", "—"),
-                "المحافظة": f.get("governorate", "—"),
-                "المساحة المسجلة": f.get("farm_area", 0.0),
-                "المهندس المراجع": f.get("engineer_name", "—"),
-                "المراجع المسند": wd.display_name(assign.get("to")),
-                "قرار الاستمارة": rev.get("Form_Status", "Pending Review"),
-                "اسم المراجع المعتمد": rev.get("Auditor_Name", "—"),
-                "تاريخ المراجعة": rev.get("Reviewed_At", "—"),
-                "ملاحظات المراجع": rev.get("General_Auditor_Note", "—"),
-                "تعليقات الصور المرفقة": " | ".join(photo_summary) if photo_summary else "كافة الصور مقبولة",
+                "كود المزرعة": _clean_excel_str(fid),
+                "اسم المزرعة": _clean_excel_str(f.get("farm_name", "—")),
+                "المحافظة": _clean_excel_str(f.get("governorate", "—")),
+                "المساحة المسجلة": float(core.to_float(f.get("farm_area")) or 0.0),
+                "المهندس المراجع": _clean_excel_str(f.get("engineer_name", "—")),
+                "المراجع المسند": _clean_excel_str(wd.display_name(assign.get("to"))),
+                "قرار الاستمارة": _clean_excel_str(rev.get("Form_Status", "Pending Review")),
+                "اسم المراجع المعتمد": _clean_excel_str(rev.get("Auditor_Name", "—")),
+                "تاريخ المراجعة": _clean_excel_str(rev.get("Reviewed_At", "—")),
+                "ملاحظات المراجع": _clean_excel_str(rev.get("General_Auditor_Note", "—")),
+                "تعليقات الصور المرفقة": _clean_excel_str(" | ".join(photo_summary) if photo_summary else "كافة الصور مقبولة"),
             }
         )
 
     df_report = pd.DataFrame(report_rows)
-    st.dataframe(df_report, use_container_width=True, hide_index=True)
+    st.dataframe(df_report, **_STRETCH_KW, hide_index=True)
 
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_report.to_excel(writer, index=False, sheet_name="EBDA_Farm_Audit_Report")
-    excel_data = output.getvalue()
+    try:
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df_report.to_excel(writer, index=False, sheet_name="EBDA_Farm_Audit_Report")
+        excel_data = output.getvalue()
 
-    st.download_button(
-        label="📥 تنزيل تقرير التدقيق بصيغة Excel (.xlsx)",
-        data=excel_data,
-        file_name=f"EBDA_Farm_QA_Report_{datetime.date.today()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
+        st.download_button(
+            label="📥 تنزيل تقرير التدقيق بصيغة Excel (.xlsx)",
+            data=excel_data,
+            file_name=f"EBDA_Farm_QA_Report_{datetime.date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+    except Exception as xl_err:
+        st.warning(f"⚠️ تعذر إنشاء ملف Excel، يمكنك التحميل كـ CSV: {xl_err}")
+        st.download_button(
+            label="📥 تحميل التقرير بصيغة CSV",
+            data=df_report.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"EBDA_Farm_QA_Report_{datetime.date.today()}.csv",
+            mime="text/csv",
+        )
 
 
 # -------------------------------------------------------------------
@@ -1510,11 +1570,11 @@ elif nav_choice == "⚖️ موازنة محافظات الفريق":
 
     unval_items = [
         {
-            "subId": str(f.get("_id")),
-            "farmCode": f.get("farm_id"),
-            "governorate": f.get("governorate"),
+            "subId": str(f.get("_id") or idx + 1),
+            "farmCode": str(f.get("farm_id") or ""),
+            "governorate": str(f.get("governorate") or "غير محدد"),
         }
-        for f in raw_farms
+        for idx, f in enumerate(raw_farms)
     ]
 
     div_result = wd.divide_work_fairly(unval_items, wd.TEAM_KEYS, max_gov_ratio=1.4)

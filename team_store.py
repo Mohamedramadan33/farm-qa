@@ -5,36 +5,61 @@ team_store.py — Team authentication, review states, and remote sync (Airtable 
 
 import json
 import os
+import tempfile
 import datetime
 from typing import Dict, Any, Optional, List
 import requests
 
 from work_divider import TEAM, TEAM_KEYS, DEFAULT_PASSWORD, display_name
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), ".data")
+_DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".data")
+
+
+def _resolve_data_dir() -> str:
+    try:
+        os.makedirs(_DEFAULT_DATA_DIR, exist_ok=True)
+        probe = os.path.join(_DEFAULT_DATA_DIR, ".write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return _DEFAULT_DATA_DIR
+    except Exception:
+        fallback = os.path.join(tempfile.gettempdir(), "ebda_farm_qa_data")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+DATA_DIR = _resolve_data_dir()
 REVIEWS_FILE = os.path.join(DATA_DIR, "reviews.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 ASSIGNMENTS_FILE = os.path.join(DATA_DIR, "assignments.json")
 
 
 def _ensure_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 
 def _load_json(path: str, default: Any) -> Any:
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                return data if data is not None else default
         except Exception:
             return default
     return default
 
 
 def _save_json(path: str, data: Any):
-    _ensure_dir()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        _ensure_dir()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Warning: could not persist {path}: {e}")
 
 
 def get_users_db() -> Dict[str, Dict[str, Any]]:
