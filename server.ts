@@ -292,10 +292,57 @@ async function startServer() {
     }
   });
 
-  // 4. CORS-Safe Satellite Tile Proxy (ESRI World Imagery & Google Earth)
+  // 4. CORS-Safe Satellite Tile Proxy (Google Earth & ESRI World Imagery with auto-fallback)
+  async function fetchUpstreamTile(
+    prov: 'google' | 'esri',
+    zn: number,
+    xn: number,
+    yn: number
+  ): Promise<{ buf: Buffer; contentType: string; isLikelyBlank: boolean } | null> {
+    const shard = Math.abs(xn + yn) % 4;
+    const tileUrl =
+      prov === 'google'
+        ? `https://mt${shard}.google.com/vt/lyrs=s&hl=en&x=${xn}&y=${yn}&z=${zn}`
+        : `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zn}/${yn}/${xn}`;
+
+    try {
+      const upstream = await fetch(tileUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        },
+        signal: AbortSignal.timeout(9000),
+      });
+      if (!upstream.ok) return null;
+      const arrBuf = await upstream.arrayBuffer();
+      const buf = Buffer.from(arrBuf);
+      if (buf.length < 400) return null;
+      const contentType = upstream.headers.get('content-type') || 'image/jpeg';
+      if (!contentType.startsWith('image/')) return null;
+      // ESRI "Map data not yet available" grey tiles in rural Egypt are consistently ~2.4KB-2.7KB JPEGs
+      const isLikelyBlank = prov === 'esri' && buf.length <= 2750;
+      return { buf, contentType, isLikelyBlank };
+    } catch {
+      return null;
+    }
+  }
+
   app.get('/api/satellite/tile/:provider/:z/:x/:y', async (req, res) => {
     const { provider, z, x, y } = req.params;
-    const cacheKey = `${provider}:${z}:${x}:${y}`;
+    const zn = Number(z);
+    const xn = Number(x);
+    const yn = Number(y);
+    if (!Number.isInteger(zn) || !Number.isInteger(xn) || !Number.isInteger(yn) || zn < 0 || zn > 22) {
+      res.status(400).end();
+      return;
+    }
+
+    const allowFallback = req.query.fallback !== '0';
+    const primary: 'google' | 'esri' = provider === 'esri' ? 'esri' : 'google';
+    const secondary: 'google' | 'esri' = primary === 'google' ? 'esri' : 'google';
+    const cacheKey = `${primary}:${zn}:${xn}:${yn}`;
+
     const hit = tileCache.get(cacheKey);
     if (hit) {
       res.setHeader('Content-Type', hit.contentType);
@@ -304,41 +351,27 @@ async function startServer() {
       return;
     }
 
-    const tileUrl =
-      provider === 'google'
-        ? `https://mt1.google.com/vt/lyrs=s&x=${encodeURIComponent(x)}&y=${encodeURIComponent(y)}&z=${encodeURIComponent(z)}`
-        : `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${encodeURIComponent(z)}/${encodeURIComponent(y)}/${encodeURIComponent(x)}`;
-
-    try {
-      const upstream = await fetch(tileUrl, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!upstream.ok) {
-        res.status(upstream.status).end();
-        return;
+    let result = await fetchUpstreamTile(primary, zn, xn, yn);
+    if ((!result || result.isLikelyBlank) && allowFallback) {
+      const fb = await fetchUpstreamTile(secondary, zn, xn, yn);
+      if (fb && (!result || !fb.isLikelyBlank)) {
+        result = fb;
       }
-      const arrBuf = await upstream.arrayBuffer();
-      const buf = Buffer.from(arrBuf);
-      if (buf.length < 400) {
-        res.status(404).end();
-        return;
-      }
-      const contentType = upstream.headers.get('content-type') || 'image/jpeg';
-      if (tileCache.size > 600) {
-        const oldest = tileCache.keys().next().value;
-        if (oldest) tileCache.delete(oldest);
-      }
-      tileCache.set(cacheKey, { buf, contentType });
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      res.send(buf);
-    } catch {
-      res.status(502).end();
     }
+
+    if (!result) {
+      res.status(404).end();
+      return;
+    }
+
+    if (tileCache.size > 1500) {
+      const oldest = tileCache.keys().next().value;
+      if (oldest) tileCache.delete(oldest);
+    }
+    tileCache.set(cacheKey, { buf: result.buf, contentType: result.contentType });
+    res.setHeader('Content-Type', result.contentType);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(result.buf);
   });
 
   // 5. Satellite Capture Date (ArcGIS SRC_DATE2) & Recent Sentinel-2 STAC NDVI Metadata

@@ -30,16 +30,21 @@ function lonLatToWorldPx(lon: number, lat: number, z: number): [number, number] 
   return [x, y];
 }
 
-function loadTileImage(url: string): Promise<HTMLImageElement | null> {
+function loadTileImage(url: string, timeoutMs = 11000): Promise<HTMLImageElement | null> {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     const timer = window.setTimeout(() => {
+      img.src = '';
       resolve(null);
-    }, 9000);
+    }, timeoutMs);
     img.onload = () => {
       window.clearTimeout(timer);
-      resolve(img);
+      if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+        resolve(img);
+      } else {
+        resolve(null);
+      }
     };
     img.onerror = () => {
       window.clearTimeout(timer);
@@ -47,6 +52,38 @@ function loadTileImage(url: string): Promise<HTMLImageElement | null> {
     };
     img.src = url;
   });
+}
+
+function isValidTileCanvas(img: HTMLImageElement): boolean {
+  try {
+    const c = document.createElement('canvas');
+    c.width = 64;
+    c.height = 64;
+    const ctx = c.getContext('2d');
+    if (!ctx) return true;
+    ctx.drawImage(img, 0, 0, 64, 64);
+    const data = ctx.getImageData(0, 0, 64, 64).data;
+    let lumSum = 0;
+    let lumSqSum = 0;
+    let diffSum = 0;
+    const n = 64 * 64;
+    for (let i = 0; i < n; i++) {
+      const idx = i * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const lum = (r + g + b) / 3;
+      lumSum += lum;
+      lumSqSum += lum * lum;
+      diffSum += Math.abs(r - g) + Math.abs(g - b);
+    }
+    const mean = lumSum / n;
+    const stdVal = Math.sqrt(Math.max(0, lumSqSum / n - mean * mean));
+    const colorSpread = diffSum / n;
+    return !(colorSpread < 3.0 && stdVal < 5.0);
+  } catch {
+    return true;
+  }
 }
 
 function isValidSatelliteCanvas(ctx: CanvasRenderingContext2D, w: number, h: number): boolean {
@@ -81,87 +118,43 @@ function isValidSatelliteCanvas(ctx: CanvasRenderingContext2D, w: number, h: num
   const variance = Math.max(0, lumSqSum / samples - mean * mean);
   const stdVal = Math.sqrt(variance);
 
-  return !(colorSpread < 3.0 && stdVal < 25.0);
+  return !(colorSpread < 3.0 && stdVal < 8.0);
 }
 
 /**
- * Deterministic fallback aerial render if external tile servers are temporarily unreachable
+ * Concurrency-limited tile downloader so browser HTTP/1.1 connection pool (6 per host)
+ * never starves trailing tiles into premature client-side timeouts.
  */
-function drawFallbackAerialCanvas(
-  ctx: CanvasRenderingContext2D,
-  w: number,
-  h: number,
-  ring: Array<[number, number]>,
-  seedStr: string
-): void {
-  let hash = 2166136261;
-  for (let i = 0; i < seedStr.length; i++) {
-    hash ^= seedStr.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  const rand = () => {
-    hash ^= hash << 13;
-    hash ^= hash >>> 17;
-    hash ^= hash << 5;
-    return ((hash >>> 0) % 10000) / 10000;
-  };
+async function fetchTilesPooled(
+  coords: Array<[number, number]>,
+  z: number,
+  primary: 'google' | 'esri',
+  secondary: 'google' | 'esri',
+  concurrency = 6
+): Promise<Array<{ tx: number; ty: number; img: HTMLImageElement | null }>> {
+  const results: Array<{ tx: number; ty: number; img: HTMLImageElement | null }> = new Array(coords.length);
+  let cursor = 0;
 
-  // Surrounding arid soil / canal texture
-  ctx.fillStyle = '#9c8b6e';
-  ctx.fillRect(0, 0, w, h);
+  async function worker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= coords.length) break;
+      const [tx, ty] = coords[idx];
 
-  // Subtle field texture outside
-  for (let i = 0; i < 650; i++) {
-    const x = rand() * w;
-    const y = rand() * h;
-    ctx.fillStyle = rand() > 0.5 ? 'rgba(130, 114, 86, 0.35)' : 'rgba(172, 155, 124, 0.3)';
-    ctx.fillRect(x, y, 6 + rand() * 14, 4 + rand() * 10);
-  }
-
-  // Cultivated farm interior rows
-  ctx.save();
-  ctx.beginPath();
-  ring.forEach(([x, y], idx) => {
-    if (idx === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.closePath();
-  ctx.clip();
-
-  ctx.fillStyle = '#3f6a34';
-  ctx.fillRect(0, 0, w, h);
-
-  for (let y = 0; y < h; y += 9) {
-    ctx.fillStyle = y % 18 === 0 ? 'rgba(48, 86, 38, 0.55)' : 'rgba(78, 116, 62, 0.45)';
-    ctx.fillRect(0, y, w, 4);
-  }
-  ctx.restore();
-
-  // Plant windbreak tree crowns along perimeter
-  for (let i = 0; i < ring.length - 1; i++) {
-    const [x1, y1] = ring[i];
-    const [x2, y2] = ring[i + 1];
-    const segLen = Math.hypot(x2 - x1, y2 - y1);
-    const stepPx = 14;
-    const count = Math.max(1, Math.floor(segLen / stepPx));
-    for (let k = 0; k < count; k++) {
-      if (rand() < 0.08) continue;
-      const t = (k + 0.5) / count;
-      const tx = x1 + (x2 - x1) * t + (rand() - 0.5) * 3;
-      const ty = y1 + (y2 - y1) * t + (rand() - 0.5) * 3;
-      const r = 4.5 + rand() * 2.8;
-      // Canopy shadow
-      ctx.fillStyle = 'rgba(18, 30, 16, 0.65)';
-      ctx.beginPath();
-      ctx.arc(tx + 2.2, ty + 2.2, r, 0, Math.PI * 2);
-      ctx.fill();
-      // Canopy green crown
-      ctx.fillStyle = rand() > 0.35 ? '#265828' : '#316b32';
-      ctx.beginPath();
-      ctx.arc(tx, ty, r, 0, Math.PI * 2);
-      ctx.fill();
+      let img = await loadTileImage(`/api/satellite/tile/${primary}/${z}/${tx}/${ty}?fallback=0`, 10000);
+      if (!img || !isValidTileCanvas(img)) {
+        const fbImg = await loadTileImage(`/api/satellite/tile/${secondary}/${z}/${tx}/${ty}?fallback=1`, 10000);
+        if (fbImg && (!img || isValidTileCanvas(fbImg))) {
+          img = fbImg;
+        }
+      }
+      results[idx] = { tx, ty, img };
     }
   }
+
+  const workers = Array.from({ length: Math.min(concurrency, coords.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 async function fetchFarmMosaic(poly: PointLonLat[]): Promise<{
@@ -171,26 +164,34 @@ async function fetchFarmMosaic(poly: PointLonLat[]): Promise<{
   provider: string;
 }> {
   const [minx, miny, maxx, maxy] = polygonBounds(poly);
-  const dx = Math.max((maxx - minx) * 0.2, 0.00022);
-  const dy = Math.max((maxy - miny) * 0.2, 0.00022);
+  const dx = Math.max((maxx - minx) * 0.18, 0.00022);
+  const dy = Math.max((maxy - miny) * 0.18, 0.00022);
   const bMinx = minx - dx;
   const bMiny = miny - dy;
   const bMaxx = maxx + dx;
   const bMaxy = maxy + dy;
 
-  const providers: Array<{ id: 'esri' | 'google'; label: string }> = [
-    { id: 'google', label: 'Google Earth' },
-    { id: 'esri', label: 'ESRI World Imagery' },
+  const providers: Array<{ id: 'esri' | 'google'; alt: 'esri' | 'google'; label: string }> = [
+    { id: 'google', alt: 'esri', label: 'Google Earth' },
+    { id: 'esri', alt: 'google', label: 'ESRI World Imagery' },
   ];
 
-  let fallbackCandidate: {
+  type MosaicCandidate = {
     canvas: HTMLCanvasElement;
     ring: Array<[number, number]>;
     zoom: number;
     provider: string;
-  } | null = null;
+    loadedRatio: number;
+  };
 
-  for (let z = 19; z >= 16; z--) {
+  let bestCandidate: MosaicCandidate | null = null;
+  const setBest = (cand: MosaicCandidate) => {
+    bestCandidate = cand;
+  };
+  const getBest = (): MosaicCandidate | null => bestCandidate;
+
+  // Support zoom 19 down to 13 so even massive >400 feddan farms fetch real satellite tiles
+  for (let z = 19; z >= 13; z--) {
     const [x0, y1] = lonLatToWorldPx(bMinx, bMiny, z);
     const [x1, y0] = lonLatToWorldPx(bMaxx, bMaxy, z);
     const tx0 = Math.floor(x0 / 256);
@@ -199,7 +200,7 @@ async function fetchFarmMosaic(poly: PointLonLat[]): Promise<{
     const ty1 = Math.floor(y1 / 256);
 
     const tilesCount = (tx1 - tx0 + 1) * (ty1 - ty0 + 1);
-    if (tilesCount > 64) continue;
+    if (tilesCount > 49 || tilesCount <= 0) continue;
 
     const coords: Array<[number, number]> = [];
     for (let ty = ty0; ty <= ty1; ty++) {
@@ -209,22 +210,20 @@ async function fetchFarmMosaic(poly: PointLonLat[]): Promise<{
     }
 
     for (const prov of providers) {
-      const loaded = await Promise.all(
-        coords.map(async ([tx, ty]) => {
-          const img = await loadTileImage(`/api/satellite/tile/${prov.id}/${z}/${tx}/${ty}`);
-          return { tx, ty, img };
-        })
-      );
+      const loaded = await fetchTilesPooled(coords, z, prov.id, prov.alt, 6);
+      const validTiles = loaded.filter((item) => item.img !== null);
+      const loadedRatio = validTiles.length / Math.max(1, coords.length);
 
-      if (loaded.some((item) => item.img === null)) {
-        continue;
-      }
+      if (validTiles.length === 0) continue;
 
       const mosaic = document.createElement('canvas');
       mosaic.width = (tx1 - tx0 + 1) * 256;
       mosaic.height = (ty1 - ty0 + 1) * 256;
       const mCtx = mosaic.getContext('2d');
       if (!mCtx) continue;
+
+      mCtx.fillStyle = '#243124';
+      mCtx.fillRect(0, 0, mosaic.width, mosaic.height);
 
       for (const { tx, ty, img } of loaded) {
         if (img) {
@@ -251,40 +250,53 @@ async function fetchFarmMosaic(poly: PointLonLat[]): Promise<{
         return [px - ox - cropX, py - oy - cropY];
       });
 
-      fallbackCandidate = { canvas: cropped, ring, zoom: z, provider: prov.label };
-      if (isValidSatelliteCanvas(cCtx, cropW, cropH)) {
-        return fallbackCandidate;
+      const isGood = isValidSatelliteCanvas(cCtx, cropW, cropH);
+      const candidate: MosaicCandidate = {
+        canvas: cropped,
+        ring,
+        zoom: z,
+        provider: prov.label,
+        loadedRatio,
+      };
+
+      if (loadedRatio >= 0.9 && isGood) {
+        return {
+          canvas: candidate.canvas,
+          ring: candidate.ring,
+          zoom: candidate.zoom,
+          provider: candidate.provider,
+        };
       }
+      const prevBest = getBest();
+      if (!prevBest || (isGood && loadedRatio > prevBest.loadedRatio)) {
+        setBest(candidate);
+      }
+    }
+
+    const roundBest = getBest();
+    if (roundBest && roundBest.loadedRatio >= 0.7) {
+      return {
+        canvas: roundBest.canvas,
+        ring: roundBest.ring,
+        zoom: roundBest.zoom,
+        provider: roundBest.provider,
+      };
     }
   }
 
-  if (fallbackCandidate) return fallbackCandidate;
+  const finalBest = getBest();
+  if (finalBest) {
+    return {
+      canvas: finalBest.canvas,
+      ring: finalBest.ring,
+      zoom: finalBest.zoom,
+      provider: finalBest.provider,
+    };
+  }
 
-  // Offline / sandbox fallback aerial synthesis
-  const z = 18;
-  const [x0, y1] = lonLatToWorldPx(bMinx, bMiny, z);
-  const [x1, y0] = lonLatToWorldPx(bMaxx, bMaxy, z);
-  const cropW = Math.min(960, Math.max(420, Math.round(x1 - x0)));
-  const cropH = Math.min(960, Math.max(420, Math.round(y1 - y0)));
-  const scaleX = cropW / Math.max(1, x1 - x0);
-  const scaleY = cropH / Math.max(1, y1 - y0);
-
-  const ring: Array<[number, number]> = poly.map(([lo, la]) => {
-    const [px, py] = lonLatToWorldPx(lo, la, z);
-    return [(px - x0) * scaleX, (py - y0) * scaleY];
-  });
-
-  const synth = document.createElement('canvas');
-  synth.width = cropW;
-  synth.height = cropH;
-  const sCtx = synth.getContext('2d')!;
-  drawFallbackAerialCanvas(sCtx, cropW, cropH, ring, JSON.stringify(poly[0]));
-  return {
-    canvas: synth,
-    ring,
-    zoom: z,
-    provider: 'ESRI World Imagery',
-  };
+  throw new Error(
+    'تعذّر تحميل صور القمر الصناعي الحية (Google Earth / ESRI) لهذه الإحداثيات. تأكد من الاتصال بالإنترنت ثم أعد المحاولة.'
+  );
 }
 
 function createPolygonMask(w: number, h: number, ring: Array<[number, number]>): Uint8Array {

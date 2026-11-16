@@ -300,6 +300,43 @@ def load_cached_airtable_reviews(key: str, base: str, table: str) -> Dict[str, A
         return {}
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def run_cached_satellite_canopy(
+    farm_id: str,
+    coords_tuple: tuple,
+    perimeter_m: float,
+    tree_type_str: str,
+    area_feddan: float,
+    kobo_trees: int,
+    detection_mode: str,
+    sensitivity: float,
+) -> Dict[str, Any]:
+    """Caches heavy satellite downloading & CV analysis per farm/mode to prevent Streamlit rerun stalls."""
+    coords_list = [tuple(pt) for pt in coords_tuple] if coords_tuple else None
+    res = core.analyze_farm_satellite_canopy(
+        coords_list,
+        perimeter_m,
+        tree_type_str=tree_type_str,
+        area_feddan=area_feddan,
+        recorded_kobo_count=kobo_trees,
+        detection_mode=detection_mode,
+        sensitivity=round(float(sensitivity), 2),
+    )
+    out = dict(res)
+    for img_key in ("annotated_img", "clean_img"):
+        pil_img = out.get(img_key)
+        if pil_img is not None:
+            buf = BytesIO()
+            pil_img.save(buf, format="JPEG", quality=92)
+            out[f"{img_key}_bytes"] = buf.getvalue()
+        else:
+            out[f"{img_key}_bytes"] = None
+        out.pop(img_key, None)
+    out.pop("ndvi_heatmap_img", None)
+    return out
+
+
+
 # -------------------------------------------------------------------
 # Session State Initialization
 # -------------------------------------------------------------------
@@ -851,40 +888,55 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         else:
             mode_code = "high_precision"
 
-        # Compute full-parcel tree detection automatically with system fixed spacings & NDVI
-        canopy_result = core.analyze_farm_satellite_canopy(
-            poly_coords,
-            perimeter_m,
-            tree_type_str=farm.get("tree_type", ""),
-            area_feddan=area_gps_feddan,
-            recorded_kobo_count=kobo_trees,
-            detection_mode=mode_code,
-            sensitivity=sens_val,
-        )
+        # Compute full-parcel tree detection with Streamlit cache (prevents blocking UI WebSocket)
+        coords_cache_key = tuple(tuple(p) for p in poly_coords) if poly_coords else ()
+        with st.spinner("🛰️ جاري تحميل صور القمر الصناعي وتحليل الأشجار بدقة عالية..."):
+            canopy_result = run_cached_satellite_canopy(
+                farm_id=str(farm_id),
+                coords_tuple=coords_cache_key,
+                perimeter_m=float(perimeter_m),
+                tree_type_str=str(farm.get("tree_type", "")),
+                area_feddan=float(area_gps_feddan),
+                kobo_trees=kobo_trees,
+                detection_mode=mode_code,
+                sensitivity=float(sens_val),
+            )
 
         # Inject tree health metrics into farm record for PGS evaluation
         farm["tree_damaged_pct"] = canopy_result.get("damaged_pct", 0.0)
         farm["tree_healthy_pct"] = canopy_result.get("healthy_pct", 100.0)
         farm["parcel_veg_coverage_pct"] = canopy_result.get("veg_pct", 50.0)
 
-        # Fixed agronomic system badge & YOLO AI Status
+        # Fixed agronomic system badge & satellite / AI Status
         tree_type_display = farm.get("tree_type", "بساتين عامة / شجر حدود")
         engine_name = canopy_result.get("engine_used", "OpenCV Precision Spectral Morphology")
-        has_best_pt = os.path.exists("best.pt") or os.path.exists("models/best.pt")
+        yolo_active = bool(canopy_result.get("yolo_model_loaded", False))
+        has_sat_img = bool(canopy_result.get("has_satellite_imagery", True))
+        tile_err = canopy_result.get("tile_error", "")
 
-        if has_best_pt:
+        if not poly_coords or len(poly_coords) < 3:
+            st.warning("⚠️ لا توجد إحداثيات مضلع GPS صالحة في هذه الاستمارة لجلب صورة القمر الصناعي.")
+        elif not has_sat_img:
+            st.error(f"🛰️ تعذّر جلب صور القمر الصناعي: {tile_err or 'تحقق من اتصال الإنترنت ثم أعد المحاولة.'}")
+            if st.button("🔄 إعادة محاولة جلب القمر الصناعي", key=f"retry_sat_{farm_id}"):
+                run_cached_satellite_canopy.clear()
+                st.rerun()
+        elif tile_err:
+            st.warning(f"⚠️ ملاحظة تحميل الأقمار الصناعية: {tile_err}")
+
+        if yolo_active:
             st.success(
-                f"🚀 **محرك الذكاء الاصطناعي جاهز (`best.pt`):** تم تفعيل نموذج YOLOv8 Nano للتعلم العميق تلقائياً! | 🧠 المحرك النشط: **{engine_name}** | 🌲 المسافة المعتمدة: **{canopy_result['spacing_m']} م** ({tree_type_display}) | 🛰️ القمر الصناعي: **{canopy_result['imagery_date']}**"
+                f"🚀 **محرك الذكاء الاصطناعي YOLO جاهز:** تم تفعيل نموذج الأشجار تلقائياً! | 🧠 المحرك النشط: **{engine_name}** | 🌲 المسافة المعتمدة: **{canopy_result['spacing_m']} م** ({tree_type_display}) | 🛰️ القمر الصناعي: **{canopy_result['imagery_date']}**"
             )
         else:
             st.info(
-                f"🌲 **نظام الرصد التلقائي:** يتم حساب كامل مساحة المزرعة بمسافة ثابتة معتمدة هندسياً **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ التقاط القمر الصناعي: **{canopy_result['imagery_date']}** | 🧠 محرك الرصد: **{engine_name}**"
+                f"🌲 **نظام الرصد البصري الدقيق:** يتم تحليل كامل المزرعة بمسافة معتمدة **{canopy_result['spacing_m']} متر** لنوع ({tree_type_display}) | 🛰️ تاريخ القمر الصناعي: **{canopy_result['imagery_date']}** | 🔍 Zoom: **Z{canopy_result.get('zoom_used', 18)}** | 🧠 المحرك: **{engine_name}**"
             )
 
         with st.expander("🛠️ حقيبة تدريب وتخصيص نموذج الذكاء الاصطناعي YOLOv8 Nano (Google Colab & Scripts)", expanded=False):
             st.markdown("""
             **تم تجهيز خطة وبيئة التدريب بالكامل داخل مجلد التطبيق:**
-            1. 📦 **ملف الأوزان النشط `best.pt`:** موجود الآن مباشرة داخل مجلد التطبيق ويقرأه النظام فوراً وبدون أي تدخل يدوي.
+            1. 📦 **ملف الأوزان المخصص (`tree` class):** يجب أن يحتوي ملف `best.pt` على فئة `tree` أو `palm` ليتم تفعيله للأشجار تلقائياً (وإلا يستخدم النظام محرك الرؤية الحاسوبية OpenCV عالي الدقة تلقائياً).
             2. 📓 **دفتر التدريب على Google Colab (`train_tree_yolov8.ipynb`):** يمكنك فتحه في Colab والتدريب مجاناً في أقل من 10 دقائق على GPU T4.
             3. 🐍 **سكريبت التدريب السريع (`train_yolo_tree_model.py`):** لتشغيل التدريب مباشرة عبر تيرمينال بضغطة زر.
             4. 📋 **ملف تعريف البيانات (`dataset/data.yaml`):** مجهز بفئة الأشجار `tree` والمجلدات الجاهزة للتوسيم والتدريب.
@@ -974,13 +1026,15 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             key=f"img_view_mode_{farm_id}",
         )
 
-        has_annotated = canopy_result.get("annotated_img") is not None
-        has_clean = canopy_result.get("clean_img") is not None
+        ann_bytes = canopy_result.get("annotated_img_bytes")
+        clean_bytes = canopy_result.get("clean_img_bytes")
+        has_annotated = ann_bytes is not None
+        has_clean = clean_bytes is not None
 
         if img_view_mode == "🌲 صورة القمر الصناعي مع رصد وترقيم وتصنيف الأشجار الحقيقي (AI)":
             if has_annotated:
                 safe_image(
-                    canopy_result["annotated_img"],
+                    ann_bytes,
                     caption=f"🌲 صورة القمر الصناعي مع رصد {canopy_result['ai_count']} شجرة حقيقية مرصودة (أخضر: سليمة 🟢 | أصفر: مجهدة 🟡 | أحمر: تالفة 🔴) مع الترقيم الدقيق وعزل كامل للمحاصيل والأراضي الزراعية",
                 )
             else:
@@ -989,11 +1043,11 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         elif img_view_mode == "🛰️ صورة القمر الصناعي الطبيعية النقية (حدود المزرعة فقط بدون علامات)":
             if has_clean:
                 safe_image(
-                    canopy_result["clean_img"],
+                    clean_bytes,
                     caption="🛰️ صورة القمر الصناعي الطبيعية النقية — حدود مضلع المزرعة فقط بدون أي علامات شجر لفحص المعالم الطبيعية والأحواض بالعين المجردة",
                 )
             elif has_annotated:
-                safe_image(canopy_result["annotated_img"])
+                safe_image(ann_bytes)
             else:
                 st.info("جاري تجهيز الصورة الفضائية للمزرعة...")
 
@@ -1002,13 +1056,13 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
             with c_img1:
                 st.markdown("**🛰️ الصورة الطبيعية النقية (حدود المزرعة فقط):**")
                 if has_clean:
-                    safe_image(canopy_result["clean_img"], caption="الصورة الأصلية مع حدود المزرعة فقط لفحص المعالم بالعين المجردة")
+                    safe_image(clean_bytes, caption="الصورة الأصلية مع حدود المزرعة فقط لفحص المعالم بالعين المجردة")
                 else:
                     st.info("الصورة غير متاحة")
             with c_img2:
                 st.markdown(f"**🌲 رصد وتصنيف الأشجار الحقيقي ({canopy_result['ai_count']} شجرة):**")
                 if has_annotated:
-                    safe_image(canopy_result["annotated_img"], caption="رصد الأشجار الحقيقية وتصنيف التيجان (🟢 🟡 🔴) بدون تشويش المحاصيل")
+                    safe_image(ann_bytes, caption="رصد الأشجار الحقيقية وتصنيف التيجان (🟢 🟡 🔴) بدون تشويش المحاصيل")
                 else:
                     st.info("الصورة غير متاحة")
 
@@ -1020,7 +1074,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
 
                 f_c1, f_c2 = st.columns([1.5, 1.5])
                 with f_c1:
-                    filter_status = st.selectbox(
+                    tree_filter_status = st.selectbox(
                         "تصفية حسب الحالة الصحية:",
                         ["الكل", "سليمة فقط (🟢)", "مجهدة فقط (🟡)", "تالفة أو جافة (🔴)"],
                         key=f"tree_filter_status_{farm_id}"
@@ -1031,20 +1085,22 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                 rows_to_show = []
                 for tp in t_points:
                     st_code = tp.get("status", "healthy")
-                    if filter_status == "سليمة فقط (🟢)" and st_code != "healthy":
+                    if tree_filter_status == "سليمة فقط (🟢)" and st_code != "healthy":
                         continue
-                    if filter_status == "مجهدة فقط (🟡)" and st_code != "stressed":
+                    if tree_filter_status == "مجهدة فقط (🟡)" and st_code != "stressed":
                         continue
-                    if filter_status == "تالفة أو جافة (🔴)" and st_code != "damaged":
+                    if tree_filter_status == "تالفة أو جافة (🔴)" and st_code != "damaged":
                         continue
 
+                    tid_val = tp.get("tree_id") or tp.get("id")
+                    center_xy = tp.get("center") or tp.get("px") or (0, 0)
                     rows_to_show.append({
-                        "رقم الشجرة (#)": f"#{tp.get('tree_id')}",
+                        "رقم الشجرة (#)": f"#{tid_val}",
                         "الحالة الصحية": tp.get("status_ar", ""),
                         "مؤشر NDVI للتاج": tp.get("mean_ndvi", 0.0),
-                        "أقصى حيوية خضرية": tp.get("max_ndvi", 0.0),
+                        "أقصى حيوية خضرية": tp.get("max_ndvi", tp.get("mean_ndvi", 0.0)),
                         "قطر التاج التقديري (بكسل)": tp.get("crown_radius", 4) * 2,
-                        "إحداثيات المركز بالصورة": f"X:{tp.get('center', (0,0))[0]}, Y:{tp.get('center', (0,0))[1]}",
+                        "إحداثيات المركز بالصورة": f"X:{center_xy[0]}, Y:{center_xy[1]}",
                     })
 
                 if rows_to_show:
@@ -1078,6 +1134,13 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
 
             m = Map(location=[mean_lat, mean_lon], zoom_start=17, tiles=None)
             TileLayer(
+                tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+                attr="Google Satellite",
+                name="Google Earth Satellite",
+                overlay=False,
+                control=True,
+            ).add_to(m)
+            TileLayer(
                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                 attr="Esri World Imagery",
                 name="ArcGIS Satellite",
@@ -1105,11 +1168,17 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                     fill=True,
                     fill_color="#10b981",
                     fill_opacity=0.9,
-                    tooltip=f"شجرة #{tp['id']}",
+                    tooltip=f"شجرة #{tp.get('id') or tp.get('tree_id')}",
                 ).add_to(m)
 
             Marker([mean_lat, mean_lon], tooltip=f"مركز {farm.get('farm_id')}").add_to(m)
-            st_folium(m, height=420, use_container_width=True)
+            st_folium(
+                m,
+                height=420,
+                use_container_width=True,
+                key=f"farm_folium_map_{farm_id}",
+                returned_objects=[],
+            )
 
         # GPS Coordinates Table for Detected Trees
         tree_pts = canopy_result.get("tree_points", [])

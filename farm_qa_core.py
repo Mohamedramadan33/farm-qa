@@ -8,6 +8,7 @@ and Kobo survey flattening & record extraction.
 import math
 import re
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -703,25 +704,46 @@ def get_form_qa_items(
 def parse_polygon_coords(poly_str: Any) -> Tuple[Optional[List[Tuple[float, float]]], bool]:
     """
     Parses Kobo polygon text: 'lat1 lon1 alt acc; lat2 lon2 alt acc; ...'
+    Supports Arabic digits, brackets, commas, pipes, newlines, and swapped (lon, lat) pairs.
     Returns (coords_lon_lat, is_repaired)
     """
-    if not poly_str or not isinstance(poly_str, str):
+    if not poly_str:
         return None, False
 
-    clean_str = poly_str.replace(";", "\n").replace(",", " ")
+    raw_text = normalize_digits(str(poly_str)).replace("٫", ".")
+    if not raw_text.strip():
+        return None, False
+
     points_lon_lat: List[Tuple[float, float]] = []
 
-    for line in clean_str.split("\n"):
-        parts = line.strip().split()
-        if len(parts) >= 2:
+    for chunk in re.split(r"[;|\nP]+", raw_text):
+        nums = re.findall(r"-?\d+\.\d+", chunk)
+        if len(nums) >= 2:
             try:
-                lat = float(parts[0])
-                lon = float(parts[1])
-                # Filter out invalid 0,0 coordinates
-                if abs(lat) > 1.0 and abs(lon) > 1.0:
-                    points_lon_lat.append((lon, lat))
+                lat = float(nums[0])
+                lon = float(nums[1])
+                if abs(lat) > 90.0 and abs(lon) <= 90.0:
+                    lat, lon = lon, lat
+                if -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0 and (abs(lat) > 0.5 or abs(lon) > 0.5):
+                    pt = (lon, lat)
+                    if not points_lon_lat or points_lon_lat[-1] != pt:
+                        points_lon_lat.append(pt)
             except ValueError:
                 continue
+
+    if len(points_lon_lat) < 3:
+        all_nums = [float(x) for x in re.findall(r"-?\d+\.\d+", raw_text)]
+        step = 4 if (len(all_nums) >= 12 and len(all_nums) % 4 == 0) else 2
+        points_lon_lat = []
+        for i in range(0, len(all_nums) - 1, step):
+            lat = all_nums[i]
+            lon = all_nums[i + 1]
+            if abs(lat) > 90.0 and abs(lon) <= 90.0:
+                lat, lon = lon, lat
+            if -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0 and (abs(lat) > 0.5 or abs(lon) > 0.5):
+                pt = (lon, lat)
+                if not points_lon_lat or points_lon_lat[-1] != pt:
+                    points_lon_lat.append(pt)
 
     if len(points_lon_lat) < 3:
         return None, False
@@ -827,28 +849,102 @@ def lon_lat_to_tile(lon: float, lat: float, zoom: int) -> Tuple[int, int]:
     return xtile, ytile
 
 
-def fetch_satellite_tile(x: int, y: int, z: int) -> Optional[Image.Image]:
-    url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            timeout=8
-        )
-        if resp.ok and len(resp.content) > 500:
-            return Image.open(BytesIO(resp.content)).convert("RGB")
-    except Exception:
-        pass
+_TILE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
 
-    try:
-        gurl = f"https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
-        resp = requests.get(gurl, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        if resp.ok and len(resp.content) > 500:
-            return Image.open(BytesIO(resp.content)).convert("RGB")
-    except Exception:
-        pass
 
-    return None
+def _is_valid_tile_image(img: Image.Image) -> bool:
+    """Rejects ArcGIS 'Map data not yet available' uniform grey tiles and empty placeholder frames."""
+    try:
+        arr = np.asarray(img.convert("RGB"), dtype=np.float32)
+        if arr.size == 0:
+            return False
+        lum_std = float(np.std(arr))
+        rg_diff = float(np.mean(np.abs(arr[:, :, 0] - arr[:, :, 1])))
+        gb_diff = float(np.mean(np.abs(arr[:, :, 1] - arr[:, :, 2])))
+        if lum_std < 4.5 and (rg_diff + gb_diff) < 3.5:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def fetch_satellite_tile(
+    x: int,
+    y: int,
+    z: int,
+    session: Optional[requests.Session] = None,
+) -> Optional[Image.Image]:
+    """
+    Fetches a 256x256 satellite tile with automatic Google Earth shard rotation & ESRI fallback.
+    Rejects blank/placeholder 'Map data not yet available' tiles and tries the alternate provider.
+    """
+    client = session or requests
+    shard = (abs(x) + abs(y)) % 4
+    urls = [
+        f"https://mt{shard}.google.com/vt/lyrs=s&hl=en&x={x}&y={y}&z={z}",
+        f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    ]
+
+    fallback_img: Optional[Image.Image] = None
+    for url in urls:
+        try:
+            resp = client.get(url, headers=_TILE_HEADERS, timeout=7)
+            if resp.ok and len(resp.content) > 600:
+                img = Image.open(BytesIO(resp.content)).convert("RGB")
+                if _is_valid_tile_image(img):
+                    return img
+                if fallback_img is None:
+                    fallback_img = img
+        except Exception:
+            continue
+
+    return fallback_img
+
+
+def _download_tile_mosaic(
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    zoom: int,
+) -> Tuple[Image.Image, int, int, int, int, int]:
+    """Downloads and stitches all satellite tiles for a polygon bbox concurrently."""
+    x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
+    x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
+    x_min, x_max = min(x1, x2), max(x1, x2)
+    y_min, y_max = min(y1, y2), max(y1, y2)
+
+    width_px = (x_max - x_min + 1) * 256
+    height_px = (y_max - y_min + 1) * 256
+    stitched = Image.new("RGB", (width_px, height_px), color=(40, 50, 40))
+
+    coords = [(tx, ty) for tx in range(x_min, x_max + 1) for ty in range(y_min, y_max + 1)]
+    loaded_count = 0
+
+    with requests.Session() as sess:
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            fut_map = {pool.submit(fetch_satellite_tile, tx, ty, zoom, sess): (tx, ty) for tx, ty in coords}
+            for fut in as_completed(fut_map):
+                tx, ty = fut_map[fut]
+                try:
+                    tile_img = fut.result()
+                    if tile_img is not None:
+                        loaded_count += 1
+                        stitched.paste(tile_img, ((tx - x_min) * 256, (ty - y_min) * 256))
+                except Exception:
+                    pass
+
+    return stitched, x_min, y_min, loaded_count, len(coords), zoom
 
 
 def fetch_satellite_capture_date(lon: float, lat: float) -> Optional[str]:
@@ -1010,6 +1106,12 @@ def analyze_farm_satellite_canopy(
             "damaged_count": 0,
             "damaged_pct": 0.0,
             "engine_used": "OpenCV / Computer Vision",
+            "yolo_model_loaded": False,
+            "yolo_skipped_reason": "",
+            "has_satellite_imagery": False,
+            "tile_error": "لا توجد إحداثيات مضلع GPS صالحة لهذه المزرعة.",
+            "tiles_loaded": 0,
+            "tiles_total": 0,
             "logistic_analysis": logistic_empty,
         }
 
@@ -1029,38 +1131,45 @@ def analyze_farm_satellite_canopy(
     max_span_m = max(d_lat_m, d_lon_m)
 
     # High-Definition Adaptive Zoom (Super-Resolution Satellite Fetching):
-    # Zoom 19 gives ~0.30 m/pixel, Zoom 18 gives ~0.60 m/pixel (sharp crown canopy & branches).
     if max_span_m > 1800:
-        zoom = 17  # Mega farms (> 200 feddans)
+        zoom = 17
     elif max_span_m > 450:
-        zoom = 18  # Large and medium farms (15 - 150 feddans, such as EG/308)
+        zoom = 18
     else:
-        zoom = 19  # High-definition small-medium parcels (< 15 feddans)
+        zoom = 19
 
-    x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
-    x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
+    # Step down zoom if tile grid exceeds 8x8 (max 64 tiles) for speed & stability
+    while zoom > 14:
+        tx1, ty1 = lon_lat_to_tile(min_lon, max_lat, zoom)
+        tx2, ty2 = lon_lat_to_tile(max_lon, min_lat, zoom)
+        if abs(tx2 - tx1) < 8 and abs(ty2 - ty1) < 8 and ((abs(tx2 - tx1) + 1) * (abs(ty2 - ty1) + 1) <= 49):
+            break
+        zoom -= 1
 
-    # Allow up to 8x8 tiles (2048x2048 px) for ultra-sharp crown resolution without blurry degradation
-    if abs(x2 - x1) >= 9 or abs(y2 - y1) >= 9:
-        zoom = max(17, zoom - 1)
-        x1, y1 = lon_lat_to_tile(min_lon, max_lat, zoom)
-        x2, y2 = lon_lat_to_tile(max_lon, min_lat, zoom)
+    stitched, x_min, y_min, tiles_loaded, tiles_total, zoom = _download_tile_mosaic(
+        min_lon, min_lat, max_lon, max_lat, zoom
+    )
 
-    x_min, x_max = min(x1, x2), max(x1, x2)
-    y_min, y_max = min(y1, y2), max(y1, y2)
+    # Fallback: if < 50% of tiles downloaded at selected zoom (e.g. z=19 missing rural tiles), retry zoom - 1
+    if (tiles_loaded == 0 or tiles_loaded * 2 < tiles_total) and zoom > 15:
+        stitched_fb, xmin_fb, ymin_fb, loaded_fb, total_fb, zoom_fb = _download_tile_mosaic(
+            min_lon, min_lat, max_lon, max_lat, zoom - 1
+        )
+        if loaded_fb > tiles_loaded:
+            stitched = stitched_fb
+            x_min = xmin_fb
+            y_min = ymin_fb
+            tiles_loaded = loaded_fb
+            tiles_total = total_fb
+            zoom = zoom_fb
 
-    width_px = (x_max - x_min + 1) * 256
-    height_px = (y_max - y_min + 1) * 256
-
-    stitched = Image.new("RGB", (width_px, height_px), color=(40, 50, 40))
-
-    has_tile = False
-    for x in range(x_min, x_max + 1):
-        for y in range(y_min, y_max + 1):
-            tile_img = fetch_satellite_tile(x, y, zoom)
-            if tile_img:
-                has_tile = True
-                stitched.paste(tile_img, ((x - x_min) * 256, (y - y_min) * 256))
+    width_px, height_px = stitched.size
+    has_tile = tiles_loaded > 0
+    tile_error = ""
+    if not has_tile:
+        tile_error = "تعذّر تحميل مربعات القمر الصناعي من خوادم Google Earth و ESRI World Imagery."
+    elif tiles_loaded < tiles_total:
+        tile_error = f"تم تحميل {tiles_loaded} من أصل {tiles_total} مربع قمر صناعي فقط."
 
     # Apply High-Pass Foliage Unsharp Masking to restore crisp crown edges & micro-texture
     if has_tile:
@@ -1092,7 +1201,7 @@ def analyze_farm_satellite_canopy(
     draw_clean = ImageDraw.Draw(clean_img)
     draw_clean.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
     draw_clean.rectangle([0, 0, width_px, 32], fill=(15, 23, 42))
-    header_clean = f"SATELLITE VIEW (HD RESOLUTION) | Farm Boundary GPS | Date: {imagery_date or 'Recent'}"
+    header_clean = f"SATELLITE VIEW (HD RESOLUTION | Z{zoom}) | Farm Boundary GPS | Date: {imagery_date or 'Recent'}"
     draw_clean.text((12, 9), header_clean, fill=(0, 255, 200))
 
     # 2. RUN INTEGRATED CV & NDVI DETECTION MODULE
@@ -1116,23 +1225,27 @@ def analyze_farm_satellite_canopy(
     annotated_img = cv_res["annotated_image"]
     ndvi_heatmap_img = cv_res["ndvi_heatmap_image"]
     engine_used = cv_res.get("engine_used", "OpenCV Precision Spectral Morphology")
-    tree_points = cv_res.get("trees_classified", [])
+    trees_classified = cv_res.get("trees_classified", [])
 
-    # Map tree pixel centers back to geographic coordinates
+    # Map tree pixel centers back to geographic coordinates (fixing previous trees_data key mismatch)
     tree_points_coords: List[Dict[str, Any]] = []
-    for t in cv_res.get("trees_data", []):
+    for t in trees_classified:
         cx, cy = t["center"]
         lat_rad_t = math.atan(math.sinh(math.pi * (1 - 2 * (y_min + cy / 256.0) / (2.0 ** zoom))))
         lat_deg_t = math.degrees(lat_rad_t)
         lon_deg_t = (x_min + cx / 256.0) / (2.0 ** zoom) * 360.0 - 180.0
         tree_points_coords.append({
             "id": t["tree_id"],
+            "tree_id": t["tree_id"],
             "lat": lat_deg_t,
             "lon": lon_deg_t,
             "px": (cx, cy),
+            "center": (cx, cy),
+            "crown_radius": t.get("crown_radius", 4),
             "status": t["status"],
             "status_ar": t["status_ar"],
             "mean_ndvi": t["mean_ndvi"],
+            "max_ndvi": t.get("max_ndvi", t["mean_ndvi"]),
         })
 
     # 3. RUN LOGISTIC TREE REQUIREMENT CALCULATION
@@ -1166,6 +1279,13 @@ def analyze_farm_satellite_canopy(
         "damaged_count": damaged_count,
         "damaged_pct": damaged_pct,
         "engine_used": engine_used,
+        "yolo_model_loaded": bool(cv_res.get("yolo_model_loaded", False)),
+        "yolo_skipped_reason": cv_res.get("yolo_skipped_reason", ""),
+        "has_satellite_imagery": has_tile,
+        "tile_error": tile_error,
+        "tiles_loaded": tiles_loaded,
+        "tiles_total": tiles_total,
+        "zoom_used": zoom,
         "logistic_analysis": logistic_res,
     }
 

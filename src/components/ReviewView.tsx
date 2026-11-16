@@ -841,6 +841,22 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                     No valid GPS polygon recorded in Kobo for this farm to fetch satellite imagery.
                   </p>
                 </div>
+              ) : auditRec.ai_error && !isRunningSat ? (
+                <div className="h-full min-h-[260px] flex flex-col items-center justify-center text-center p-6 bg-red-50/70 rounded-lg border border-red-200 space-y-3">
+                  <AlertTriangle className="w-6 h-6 text-red-600" />
+                  <div className="space-y-1">
+                    <p className="text-xs font-semibold text-red-950">تعذّر جلب صورة القمر الصناعي</p>
+                    <p className="text-[11px] text-red-800 max-w-xs">{auditRec.ai_error}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onRunSatelliteAi(auditRec.farm_id)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white text-xs font-medium rounded-md transition-colors cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>إعادة المحاولة</span>
+                  </button>
+                </div>
               ) : (
                 <div className="h-full min-h-[260px] flex flex-col items-center justify-center text-center p-6 bg-slate-50 rounded-lg border border-slate-200">
                   <RefreshCw

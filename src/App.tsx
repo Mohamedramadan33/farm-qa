@@ -264,6 +264,9 @@ export function App() {
       const target = loadedRecords.find((r) => r.farm_id === farmId);
       if (!target || !target._poly) return;
 
+      setLoadedRecords((prev) =>
+        prev.map((rec) => (rec.farm_id === farmId ? { ...rec, ai_error: '' } : rec))
+      );
       setRunningSatelliteFarmId(farmId);
       try {
         const res = await analyzeFarmSatellite({
@@ -313,7 +316,10 @@ export function App() {
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        pushToast('warn', `Satellite AI warning: ${msg}`);
+        setLoadedRecords((prev) =>
+          prev.map((rec) => (rec.farm_id === farmId ? { ...rec, ai_error: msg } : rec))
+        );
+        pushToast('warn', `Satellite AI: ${msg}`);
       } finally {
         setRunningSatelliteFarmId(null);
       }
@@ -321,13 +327,14 @@ export function App() {
     [loadedRecords, useNdvi, pushToast]
   );
 
-  // Auto-run satellite AI when opening a farm if enabled and not yet analyzed
+  // Auto-run satellite AI when opening a farm if enabled and not yet analyzed/errored
   useEffect(() => {
     if (view !== 'review' || !autoSat || !selectedFarmId || runningSatelliteFarmId) return;
     const rec = loadedRecords.find((r) => r.farm_id === selectedFarmId);
     if (!rec || !rec._poly) return;
-    const alreadyRan = Boolean(satelliteImages[selectedFarmId]) || rec.ai_count !== null;
-    if (!alreadyRan) {
+    const alreadyAttempted =
+      Boolean(satelliteImages[selectedFarmId]) || rec.ai_count !== null || Boolean(rec.ai_error);
+    if (!alreadyAttempted) {
       handleRunSatelliteAi(selectedFarmId);
     }
   }, [

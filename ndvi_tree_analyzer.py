@@ -29,6 +29,41 @@ try:
 except ImportError:
     HAS_YOLO = False
 
+_YOLO_MODEL_CACHE: Dict[str, Any] = {}
+_TREE_CLASS_KEYWORDS = {
+    "tree", "trees", "palm", "palms", "canopy", "crown",
+    "orchard", "shrub", "sapling", "wood", "شجرة", "أشجار", "نخيل",
+}
+
+
+def _get_validated_tree_yolo(model_path: str) -> Tuple[Optional[Any], str]:
+    """
+    Loads YOLO model (cached) and verifies it actually defines tree/canopy classes.
+    Prevents misusing unrelated weights (e.g. wildlife/vehicle security models) as tree detectors.
+    """
+    if not HAS_YOLO or not model_path or not os.path.exists(model_path):
+        return None, "no_model"
+    try:
+        model = _YOLO_MODEL_CACHE.get(model_path)
+        if model is None:
+            model = YOLO(model_path)
+            _YOLO_MODEL_CACHE[model_path] = model
+
+        names_raw = getattr(model, "names", {}) or {}
+        if isinstance(names_raw, dict):
+            cls_names = [str(v).strip().lower() for v in names_raw.values()]
+        elif isinstance(names_raw, (list, tuple)):
+            cls_names = [str(v).strip().lower() for v in names_raw]
+        else:
+            cls_names = []
+
+        has_tree_cls = any(any(kw in cname for kw in _TREE_CLASS_KEYWORDS) for cname in cls_names)
+        if not has_tree_cls:
+            return None, f"incompatible_classes:{','.join(cls_names)}"
+        return model, ""
+    except Exception as exc:
+        return None, f"load_error:{exc}"
+
 
 def compute_ndvi_or_vari(
     image_input: Union[np.ndarray, Image.Image],
@@ -236,28 +271,32 @@ def detect_and_classify_trees(
                 active_yolo_path = cand
                 break
 
-    # Attempt YOLO deep learning detection if available
+    # Attempt YOLO deep learning detection ONLY if model defines tree/canopy classes
+    yolo_skipped_reason = ""
     if HAS_YOLO and active_yolo_path:
-        try:
-            model = YOLO(active_yolo_path)
-            yolo_res = model.predict(source=np.array(orig_img), conf=0.18, verbose=False)
-            if yolo_res and len(yolo_res) > 0 and len(yolo_res[0].boxes) > 0:
-                for b in yolo_res[0].boxes:
-                    xyxy = b.xyxy[0].cpu().numpy()
-                    bx1, by1, bx2, by2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
-                    cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-                    if 0 <= cy < height_px and 0 <= cx < width_px and parcel_mask[cy, cx]:
-                        crown_rad = max(4, int(max(bx2 - bx1, by2 - by1) // 2))
-                        detected_boxes.append({
-                            "bbox": (bx1, by1, bx2, by2),
-                            "center": (cx, cy),
-                            "conf": float(b.conf[0].cpu().numpy()),
-                            "crown_radius": crown_rad,
-                        })
-                if detected_boxes:
-                    used_yolo = True
-        except Exception:
-            used_yolo = False
+        yolo_model, skip_reason = _get_validated_tree_yolo(active_yolo_path)
+        if yolo_model is not None:
+            try:
+                yolo_res = yolo_model.predict(source=np.array(orig_img), conf=0.18, verbose=False)
+                if yolo_res and len(yolo_res) > 0 and len(yolo_res[0].boxes) > 0:
+                    for b in yolo_res[0].boxes:
+                        xyxy = b.xyxy[0].cpu().numpy()
+                        bx1, by1, bx2, by2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
+                        cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+                        if 0 <= cy < height_px and 0 <= cx < width_px and parcel_mask[cy, cx]:
+                            crown_rad = max(4, int(max(bx2 - bx1, by2 - by1) // 2))
+                            detected_boxes.append({
+                                "bbox": (bx1, by1, bx2, by2),
+                                "center": (cx, cy),
+                                "conf": float(b.conf[0].cpu().numpy()),
+                                "crown_radius": crown_rad,
+                            })
+                    if detected_boxes:
+                        used_yolo = True
+            except Exception:
+                used_yolo = False
+        elif skip_reason:
+            yolo_skipped_reason = skip_reason
 
     # High-Precision Multi-Scale Computer Vision & Annular Drop Engine
     if not detected_boxes:
@@ -684,5 +723,6 @@ def detect_and_classify_trees(
         "engine_used": f"YOLOv8 Nano AI ({os.path.basename(active_yolo_path)})" if used_yolo else "OpenCV Precision Spectral Morphology",
         "yolo_model_loaded": used_yolo,
         "yolo_model_path": active_yolo_path if used_yolo else None,
+        "yolo_skipped_reason": yolo_skipped_reason,
         "trees_classified": trees_classified,
     }
