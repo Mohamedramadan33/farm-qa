@@ -1,7 +1,23 @@
+import * as ort from 'onnxruntime-web';
 import { normAr, present } from './arabicNorm';
-import { BOUNDARY_BUFFER_M, polygonBounds, polygonCentroid } from './geometry';
+import {
+  BOUNDARY_BUFFER_M,
+  bufferPolygonMeters,
+  polygonBounds,
+  polygonCentroid,
+  shiftPolygonMeters,
+} from './geometry';
 import { AI_BAND, VEG_EXG } from './farmQaCore';
-import type { PointLonLat, SatelliteAnalysisResult, TreeDetectionBox } from '../types/qa';
+import type {
+  BasemapProvider,
+  BasemapViewMode,
+  PointLonLat,
+  SatelliteAnalysisResult,
+  TreeClassName,
+  TreeDetectionBox,
+} from '../types/qa';
+
+const TREE_CLASSES: TreeClassName[] = ['orchard_tree', 'palm_tree', 'windbreak_tree'];
 
 const CALIB_SPECIES: Record<string, number> = {
   جازورين: 1.05,
@@ -20,6 +36,25 @@ function calibFactor(species: string): number {
     if (s && s.includes(normAr(k))) return v;
   }
   return 1.0;
+}
+
+function inferFallbackTreeClass(species: string, onBoundary: boolean, radiusM: number): {
+  classId: 0 | 1 | 2;
+  className: TreeClassName;
+} {
+  const s = present(species) ? normAr(species) : '';
+  const isPalm = ['نخيل', 'نخل', 'بلح', 'تمر', 'palm', 'date'].some((k) => s.includes(normAr(k)));
+  const isWindbreak = ['جازورين', 'كازورينا', 'كافور', 'سرو', 'فيكس', 'ماهوجني', 'casuarina', 'eucalyptus', 'مصدات'].some((k) =>
+    s.includes(normAr(k))
+  );
+
+  if (isPalm || (!onBoundary && radiusM >= 2.7)) {
+    return { classId: 1, className: 'palm_tree' };
+  }
+  if (onBoundary || isWindbreak) {
+    return { classId: 2, className: 'windbreak_tree' };
+  }
+  return { classId: 0, className: 'orchard_tree' };
 }
 
 function lonLatToWorldPx(lon: number, lat: number, z: number): [number, number] {
@@ -121,31 +156,38 @@ function isValidSatelliteCanvas(ctx: CanvasRenderingContext2D, w: number, h: num
   return !(colorSpread < 3.0 && stdVal < 8.0);
 }
 
-/**
- * Concurrency-limited tile downloader so browser HTTP/1.1 connection pool (6 per host)
- * never starves trailing tiles into premature client-side timeouts.
- */
 async function fetchTilesPooled(
   coords: Array<[number, number]>,
   z: number,
-  primary: 'google' | 'esri',
-  secondary: 'google' | 'esri',
+  provider: BasemapProvider,
+  strictProvider: boolean,
   concurrency = 6
 ): Promise<Array<{ tx: number; ty: number; img: HTMLImageElement | null }>> {
-  const results: Array<{ tx: number; ty: number; img: HTMLImageElement | null }> = new Array(coords.length);
+  const results: Array<{ tx: number; ty: number; img: HTMLImageElement | null }> = new Array(
+    coords.length
+  );
   let cursor = 0;
+  const fallbackFlag = strictProvider ? '0' : '1';
 
   async function worker() {
     while (true) {
       const idx = cursor++;
       if (idx >= coords.length) break;
       const [tx, ty] = coords[idx];
-
-      let img = await loadTileImage(`/api/satellite/tile/${primary}/${z}/${tx}/${ty}?fallback=0`, 10000);
-      if (!img || !isValidTileCanvas(img)) {
-        const fbImg = await loadTileImage(`/api/satellite/tile/${secondary}/${z}/${tx}/${ty}?fallback=1`, 10000);
-        if (fbImg && (!img || isValidTileCanvas(fbImg))) {
-          img = fbImg;
+      let img = await loadTileImage(
+        `/api/satellite/tile/${provider}/${z}/${tx}/${ty}?fallback=${fallbackFlag}`,
+        10000
+      );
+      if (img && !isValidTileCanvas(img)) {
+        if (!strictProvider) {
+          const alt: BasemapProvider = provider === 'google' ? 'esri' : 'google';
+          const altImg = await loadTileImage(
+            `/api/satellite/tile/${alt}/${z}/${tx}/${ty}?fallback=0`,
+            10000
+          );
+          img = altImg && isValidTileCanvas(altImg) ? altImg : null;
+        } else {
+          img = null;
         }
       }
       results[idx] = { tx, ty, img };
@@ -157,41 +199,41 @@ async function fetchTilesPooled(
   return results;
 }
 
-async function fetchFarmMosaic(poly: PointLonLat[]): Promise<{
+interface FetchedMosaic {
   canvas: HTMLCanvasElement;
   ring: Array<[number, number]>;
+  clippedRing: Array<[number, number]>;
   zoom: number;
   provider: string;
-}> {
-  const [minx, miny, maxx, maxy] = polygonBounds(poly);
-  const dx = Math.max((maxx - minx) * 0.18, 0.00022);
-  const dy = Math.max((maxy - miny) * 0.18, 0.00022);
+  providerId: BasemapProvider;
+  mpp: number;
+}
+
+async function fetchProviderMosaic(
+  rawPoly: PointLonLat[],
+  calibratedPoly: PointLonLat[],
+  clippedPoly: PointLonLat[],
+  provider: BasemapProvider,
+  strictOnly: boolean
+): Promise<FetchedMosaic | null> {
+  const [minx, miny, maxx, maxy] = polygonBounds(calibratedPoly);
+  const dx = Math.max((maxx - minx) * 0.16, 0.00018);
+  const dy = Math.max((maxy - miny) * 0.16, 0.00018);
   const bMinx = minx - dx;
   const bMiny = miny - dy;
   const bMaxx = maxx + dx;
   const bMaxy = maxy + dy;
 
-  const providers: Array<{ id: 'esri' | 'google'; alt: 'esri' | 'google'; label: string }> = [
-    { id: 'google', alt: 'esri', label: 'Google Earth' },
-    { id: 'esri', alt: 'google', label: 'ESRI World Imagery' },
-  ];
+  // Native high-resolution target zoom per provider:
+  // Google Satellite: Zoom 19–20 (~0.15–0.30 m/px)
+  // Esri World Imagery: Zoom 18–19 (~0.30–0.60 m/px)
+  const startZoom = provider === 'google' ? 20 : 19;
+  const minPrefZoom = provider === 'google' ? 19 : 18;
+  const providerLabel = provider === 'google' ? 'Google Satellite' : 'Esri World Imagery';
 
-  type MosaicCandidate = {
-    canvas: HTMLCanvasElement;
-    ring: Array<[number, number]>;
-    zoom: number;
-    provider: string;
-    loadedRatio: number;
-  };
+  let bestCandidate: (FetchedMosaic & { loadedRatio: number }) | null = null;
 
-  let bestCandidate: MosaicCandidate | null = null;
-  const setBest = (cand: MosaicCandidate) => {
-    bestCandidate = cand;
-  };
-  const getBest = (): MosaicCandidate | null => bestCandidate;
-
-  // Support zoom 19 down to 13 so even massive >400 feddan farms fetch real satellite tiles
-  for (let z = 19; z >= 13; z--) {
+  for (let z = startZoom; z >= 13; z--) {
     const [x0, y1] = lonLatToWorldPx(bMinx, bMiny, z);
     const [x1, y0] = lonLatToWorldPx(bMaxx, bMaxy, z);
     const tx0 = Math.floor(x0 / 256);
@@ -200,7 +242,9 @@ async function fetchFarmMosaic(poly: PointLonLat[]): Promise<{
     const ty1 = Math.floor(y1 / 256);
 
     const tilesCount = (tx1 - tx0 + 1) * (ty1 - ty0 + 1);
-    if (tilesCount > 49 || tilesCount <= 0) continue;
+    // Allow up to 64 tiles (8x8 = 2048x2048 px) at Z18-Z20 for native crisp resolution
+    const maxAllowed = z >= minPrefZoom ? 64 : 49;
+    if (tilesCount > maxAllowed || tilesCount <= 0) continue;
 
     const coords: Array<[number, number]> = [];
     for (let ty = ty0; ty <= ty1; ty++) {
@@ -209,94 +253,72 @@ async function fetchFarmMosaic(poly: PointLonLat[]): Promise<{
       }
     }
 
-    for (const prov of providers) {
-      const loaded = await fetchTilesPooled(coords, z, prov.id, prov.alt, 6);
-      const validTiles = loaded.filter((item) => item.img !== null);
-      const loadedRatio = validTiles.length / Math.max(1, coords.length);
+    const loaded = await fetchTilesPooled(coords, z, provider, strictOnly, 6);
+    const validTiles = loaded.filter((item) => item.img !== null);
+    const loadedRatio = validTiles.length / Math.max(1, coords.length);
+    if (validTiles.length === 0) continue;
 
-      if (validTiles.length === 0) continue;
+    const mosaic = document.createElement('canvas');
+    mosaic.width = (tx1 - tx0 + 1) * 256;
+    mosaic.height = (ty1 - ty0 + 1) * 256;
+    const mCtx = mosaic.getContext('2d');
+    if (!mCtx) continue;
 
-      const mosaic = document.createElement('canvas');
-      mosaic.width = (tx1 - tx0 + 1) * 256;
-      mosaic.height = (ty1 - ty0 + 1) * 256;
-      const mCtx = mosaic.getContext('2d');
-      if (!mCtx) continue;
-
-      mCtx.fillStyle = '#243124';
-      mCtx.fillRect(0, 0, mosaic.width, mosaic.height);
-
-      for (const { tx, ty, img } of loaded) {
-        if (img) {
-          mCtx.drawImage(img, (tx - tx0) * 256, (ty - ty0) * 256, 256, 256);
-        }
+    mCtx.fillStyle = '#1e293b';
+    mCtx.fillRect(0, 0, mosaic.width, mosaic.height);
+    for (const { tx, ty, img } of loaded) {
+      if (img) {
+        mCtx.drawImage(img, (tx - tx0) * 256, (ty - ty0) * 256, 256, 256);
       }
+    }
 
-      const ox = tx0 * 256;
-      const oy = ty0 * 256;
-      const cropX = Math.floor(x0 - ox);
-      const cropY = Math.floor(y0 - oy);
-      const cropW = Math.max(64, Math.ceil(x1 - ox) - cropX);
-      const cropH = Math.max(64, Math.ceil(y1 - oy) - cropY);
+    const ox = tx0 * 256;
+    const oy = ty0 * 256;
+    const cropX = Math.floor(x0 - ox);
+    const cropY = Math.floor(y0 - oy);
+    const cropW = Math.max(64, Math.ceil(x1 - ox) - cropX);
+    const cropH = Math.max(64, Math.ceil(y1 - oy) - cropY);
 
-      const cropped = document.createElement('canvas');
-      cropped.width = cropW;
-      cropped.height = cropH;
-      const cCtx = cropped.getContext('2d');
-      if (!cCtx) continue;
-      cCtx.drawImage(mosaic, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+    const cropped = document.createElement('canvas');
+    cropped.width = cropW;
+    cropped.height = cropH;
+    const cCtx = cropped.getContext('2d');
+    if (!cCtx) continue;
+    cCtx.drawImage(mosaic, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
 
-      const ring: Array<[number, number]> = poly.map(([lo, la]) => {
+    const projectRing = (pList: PointLonLat[]): Array<[number, number]> =>
+      pList.map(([lo, la]) => {
         const [px, py] = lonLatToWorldPx(lo, la, z);
         return [px - ox - cropX, py - oy - cropY];
       });
 
-      const isGood = isValidSatelliteCanvas(cCtx, cropW, cropH);
-      const candidate: MosaicCandidate = {
-        canvas: cropped,
-        ring,
-        zoom: z,
-        provider: prov.label,
-        loadedRatio,
-      };
+    const [, cLat] = polygonCentroid(calibratedPoly);
+    const mpp = (156543.03392 * Math.cos((cLat * Math.PI) / 180)) / Math.pow(2, z);
+    const isGood = isValidSatelliteCanvas(cCtx, cropW, cropH);
 
-      if (loadedRatio >= 0.9 && isGood) {
-        return {
-          canvas: candidate.canvas,
-          ring: candidate.ring,
-          zoom: candidate.zoom,
-          provider: candidate.provider,
-        };
-      }
-      const prevBest = getBest();
-      if (!prevBest || (isGood && loadedRatio > prevBest.loadedRatio)) {
-        setBest(candidate);
-      }
-    }
-
-    const roundBest = getBest();
-    if (roundBest && roundBest.loadedRatio >= 0.7) {
-      return {
-        canvas: roundBest.canvas,
-        ring: roundBest.ring,
-        zoom: roundBest.zoom,
-        provider: roundBest.provider,
-      };
-    }
-  }
-
-  const finalBest = getBest();
-  if (finalBest) {
-    return {
-      canvas: finalBest.canvas,
-      ring: finalBest.ring,
-      zoom: finalBest.zoom,
-      provider: finalBest.provider,
+    const candidate: FetchedMosaic & { loadedRatio: number } = {
+      canvas: cropped,
+      ring: projectRing(calibratedPoly.length >= 3 ? calibratedPoly : rawPoly),
+      clippedRing: projectRing(clippedPoly),
+      zoom: z,
+      provider: providerLabel,
+      providerId: provider,
+      mpp,
+      loadedRatio,
     };
+
+    if (loadedRatio >= 0.85 && isGood) {
+      return candidate;
+    }
+    if (!bestCandidate || (isGood && loadedRatio > bestCandidate.loadedRatio)) {
+      bestCandidate = candidate;
+    }
+    if (bestCandidate && bestCandidate.loadedRatio >= 0.7 && z <= minPrefZoom) {
+      return bestCandidate;
+    }
   }
 
-  throw new Error(
-    'تعذّر تحميل صور القمر الصناعي الحية (Google Earth / ESRI) لهذه الإحداثيات. تأكد من الاتصال بالإنترنت ثم أعد المحاولة.'
-  );
+  return bestCandidate;
 }
 
 function createPolygonMask(w: number, h: number, ring: Array<[number, number]>): Uint8Array {
@@ -306,14 +328,16 @@ function createPolygonMask(w: number, h: number, ring: Array<[number, number]>):
   const ctx = c.getContext('2d')!;
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, w, h);
-  ctx.fillStyle = '#fff';
-  ctx.beginPath();
-  ring.forEach(([x, y], i) => {
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.closePath();
-  ctx.fill();
+  if (ring.length >= 3) {
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ring.forEach(([x, y], i) => {
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fill();
+  }
 
   const data = ctx.getImageData(0, 0, w, h).data;
   const mask = new Uint8Array(w * h);
@@ -327,30 +351,29 @@ function createBoundaryCorridorMask(
   w: number,
   h: number,
   ring: Array<[number, number]>,
-  lat: number,
-  zoom: number,
+  mpp: number,
   bufferM = BOUNDARY_BUFFER_M
 ): { mask: Uint8Array; strokePx: number } {
-  const mpp = (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
   const strokePx = Math.max(8, Math.round((bufferM * 2.0) / Math.max(mpp, 0.05)));
-
   const c = document.createElement('canvas');
   c.width = w;
   c.height = h;
   const ctx = c.getContext('2d')!;
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, w, h);
-  ctx.strokeStyle = '#fff';
-  ctx.lineWidth = strokePx;
-  ctx.lineJoin = 'round';
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  ring.forEach(([x, y], i) => {
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.closePath();
-  ctx.stroke();
+  if (ring.length >= 3) {
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = strokePx;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ring.forEach(([x, y], i) => {
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.stroke();
+  }
 
   const data = ctx.getImageData(0, 0, w, h).data;
   const mask = new Uint8Array(w * h);
@@ -361,10 +384,36 @@ function createBoundaryCorridorMask(
 }
 
 /**
- * High-Definition Satellite Image Enhancer (توضيح وتحسين جودة صور الأقمار الصناعية)
- * - Auto-Contrast & De-Haze via dynamic range percentile stretching
- * - Foliage Unsharp Mask (High-pass sharpening of leaf clusters and crown facets)
- * - Subtle chlorophyll saturation enhancement to clearly distinguish vegetation from soil
+ * Strictly clips the canvas to pixels inside `strictMask`, setting exterior pixels to zero.
+ */
+function buildStrictlyMaskedCanvas(
+  srcCanvas: HTMLCanvasElement,
+  strictMask: Uint8Array
+): HTMLCanvasElement {
+  const w = srcCanvas.width;
+  const h = srcCanvas.height;
+  const masked = document.createElement('canvas');
+  masked.width = w;
+  masked.height = h;
+  const ctx = masked.getContext('2d')!;
+  ctx.drawImage(srcCanvas, 0, 0);
+  const frame = ctx.getImageData(0, 0, w, h);
+  const px = frame.data;
+  for (let i = 0; i < w * h; i++) {
+    if (!strictMask[i]) {
+      const o = i * 4;
+      px[o] = 0;
+      px[o + 1] = 0;
+      px[o + 2] = 0;
+      px[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(frame, 0, 0);
+  return masked;
+}
+
+/**
+ * Subtle contrast & edge preservation on imagery without digital upscaling.
  */
 function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement {
   const w = srcCanvas.width;
@@ -381,7 +430,6 @@ function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement
   const totalPx = w * h;
   if (totalPx === 0) return out;
 
-  // 1. Calculate luminance histogram for percentile stretching (2% - 98%)
   const hist = new Int32Array(256);
   for (let i = 0; i < totalPx; i++) {
     const idx = i * 4;
@@ -396,9 +444,7 @@ function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement
   let pHigh = 255;
   for (let l = 0; l < 256; l++) {
     accum += hist[l];
-    if (pLow === 0 && accum >= p2Count) {
-      pLow = l;
-    }
+    if (pLow === 0 && accum >= p2Count) pLow = l;
     if (accum >= p98Count) {
       pHigh = l;
       break;
@@ -410,7 +456,6 @@ function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement
   }
   const scale = 255 / (pHigh - pLow);
 
-  // 2. Contrast stretching + foliage vibrancy enhancement
   const stretched = new Uint8ClampedArray(data.length);
   for (let i = 0; i < totalPx; i++) {
     const idx = i * 4;
@@ -418,11 +463,10 @@ function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement
     let g = Math.min(255, Math.max(0, (data[idx + 1] - pLow) * scale));
     let b = Math.min(255, Math.max(0, (data[idx + 2] - pLow) * scale));
 
-    // Slight saturation boost for chlorophyll differentiation
     const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-    r = Math.min(255, Math.max(0, gray + (r - gray) * 1.15));
-    g = Math.min(255, Math.max(0, gray + (g - gray) * 1.15));
-    b = Math.min(255, Math.max(0, gray + (b - gray) * 1.15));
+    r = Math.min(255, Math.max(0, gray + (r - gray) * 1.12));
+    g = Math.min(255, Math.max(0, gray + (g - gray) * 1.12));
+    b = Math.min(255, Math.max(0, gray + (b - gray) * 1.12));
 
     stretched[idx] = r;
     stretched[idx + 1] = g;
@@ -430,7 +474,7 @@ function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement
     stretched[idx + 3] = 255;
   }
 
-  // 3. Unsharp Masking (High-pass foliage sharpening kernel)
+  // Mild 3x3 unsharp mask
   const sharpData = new Uint8ClampedArray(data.length);
   for (let y = 0; y < h; y++) {
     const yMin = Math.max(0, y - 1);
@@ -440,10 +484,10 @@ function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement
       const xMax = Math.min(w - 1, x + 1);
       const idx = (y * w + x) * 4;
 
-      let bR = 0,
-        bG = 0,
-        bB = 0,
-        cnt = 0;
+      let bR = 0;
+      let bG = 0;
+      let bB = 0;
+      let cnt = 0;
       for (let ny = yMin; ny <= yMax; ny++) {
         const rowOff = ny * w;
         for (let nx = xMin; nx <= xMax; nx++) {
@@ -461,8 +505,7 @@ function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement
       const origR = stretched[idx];
       const origG = stretched[idx + 1];
       const origB = stretched[idx + 2];
-
-      const amount = 0.85;
+      const amount = 0.65;
       sharpData[idx] = Math.min(255, Math.max(0, origR + (origR - bR) * amount));
       sharpData[idx + 1] = Math.min(255, Math.max(0, origG + (origG - bG) * amount));
       sharpData[idx + 2] = Math.min(255, Math.max(0, origB + (origB - bB) * amount));
@@ -475,183 +518,357 @@ function enhanceSatelliteCanvas(srcCanvas: HTMLCanvasElement): HTMLCanvasElement
   return out;
 }
 
-/**
- * Texture Analysis (تحليل الملمس والنسيج الورقي)
- * Differentiates tree crowns from flat crop beds (clover, wheat, alfalfa, vegetables):
- * - Tree foliage has high spatial micro-roughness (leaves, clumping, shadows, 3D facets)
- * - Flat crops have uniform, smooth laminar reflectance with minimal local variance
- */
-function computeTextureRoughnessMap(
-  data: Uint8ClampedArray,
-  w: number,
-  h: number,
-  mask: Uint8Array
-): {
-  roughness: Float32Array;
-  normScore: Float32Array;
-} {
-  const roughness = new Float32Array(w * h);
-  const normScore = new Float32Array(w * h);
+// ---------------------------------------------------------------------------
+// Stage 1: SAHI 512x512 Overlapping Sliding-Window Generator + IoU NMS (0.45)
+// ---------------------------------------------------------------------------
 
-  // Compute grayscale luminance buffer
-  const lum = new Float32Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const idx = i * 4;
-    lum[i] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+interface SahiSlice {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+function generateSahiSlices(
+  imgW: number,
+  imgH: number,
+  mask: Uint8Array,
+  sliceSize = 512,
+  overlap = 0.2
+): SahiSlice[] {
+  const sW = Math.min(sliceSize, imgW);
+  const sH = Math.min(sliceSize, imgH);
+  const strideX = Math.max(64, Math.round(sliceSize * (1 - overlap)));
+  const strideY = Math.max(64, Math.round(sliceSize * (1 - overlap)));
+
+  const xs: number[] = [];
+  for (let x = 0; x < imgW; x += strideX) {
+    const clamped = Math.max(0, Math.min(x, imgW - sW));
+    if (xs.length === 0 || xs[xs.length - 1] !== clamped) xs.push(clamped);
+    if (clamped + sW >= imgW) break;
+  }
+  const ys: number[] = [];
+  for (let y = 0; y < imgH; y += strideY) {
+    const clamped = Math.max(0, Math.min(y, imgH - sH));
+    if (ys.length === 0 || ys[ys.length - 1] !== clamped) ys.push(clamped);
+    if (clamped + sH >= imgH) break;
   }
 
-  // 5x5 window local standard deviation + gradient magnitude energy
-  const rad = 2;
-  for (let y = rad; y < h - rad; y++) {
-    for (let x = rad; x < w - rad; x++) {
-      const idx = y * w + x;
-      if (!mask[idx]) continue;
-
-      let sum = 0;
-      let sumSq = 0;
-      let cnt = 0;
-
-      for (let dy = -rad; dy <= rad; dy++) {
-        const row = (y + dy) * w;
-        for (let dx = -rad; dx <= rad; dx++) {
-          const l = lum[row + (x + dx)];
-          sum += l;
-          sumSq += l * l;
-          cnt++;
+  const slices: SahiSlice[] = [];
+  for (const sy of ys) {
+    for (const sx of xs) {
+      let hasActive = false;
+      for (let py = sy; py < sy + sH && !hasActive; py += 4) {
+        const rowOff = py * imgW;
+        for (let px = sx; px < sx + sW; px += 4) {
+          if (mask[rowOff + px]) {
+            hasActive = true;
+            break;
+          }
         }
       }
-
-      const mean = sum / cnt;
-      const variance = Math.max(0, sumSq / cnt - mean * mean);
-      const stdVal = Math.sqrt(variance);
-
-      // Gradient magnitude (central difference)
-      const gx = lum[y * w + (x + 1)] - lum[y * w + (x - 1)];
-      const gy = lum[(y + 1) * w + x] - lum[(y - 1) * w + x];
-      const gradMag = Math.sqrt(gx * gx + gy * gy);
-
-      // Composite micro-roughness score:
-      // Trees have stdVal >= 10.0 and gradMag >= 12.0
-      // Smooth crops have stdVal < 6.0 and gradMag < 6.0
-      const rough = 0.55 * stdVal + 0.45 * gradMag;
-      roughness[idx] = rough;
-
-      // Normalization: 5.5 (smooth crop threshold) -> 0.0, 18.0 (dense crown foliage) -> 1.0
-      normScore[idx] = Math.max(0, Math.min(1, (rough - 5.5) / 12.5));
+      if (hasActive) {
+        slices.push({ x: sx, y: sy, w: sW, h: sH });
+      }
     }
   }
+  return slices;
+}
 
-  return { roughness, normScore };
+interface RawCandidate {
+  xmin: number;
+  ymin: number;
+  xmax: number;
+  ymax: number;
+  score: number;
+  classId: 0 | 1 | 2;
+}
+
+function boxIoU(a: RawCandidate, b: RawCandidate): number {
+  const ix1 = Math.max(a.xmin, b.xmin);
+  const iy1 = Math.max(a.ymin, b.ymin);
+  const ix2 = Math.min(a.xmax, b.xmax);
+  const iy2 = Math.min(a.ymax, b.ymax);
+  if (ix2 <= ix1 || iy2 <= iy1) return 0;
+  const inter = (ix2 - ix1) * (iy2 - iy1);
+  const areaA = Math.max(1, (a.xmax - a.xmin) * (a.ymax - a.ymin));
+  const areaB = Math.max(1, (b.xmax - b.xmin) * (b.ymax - b.ymin));
+  return inter / (areaA + areaB - inter);
+}
+
+function mergeDetectionsNMS(
+  candidates: RawCandidate[],
+  iouThresh = 0.45,
+  minCenterDistPx = 5
+): RawCandidate[] {
+  const ordered = [...candidates].sort((a, b) => b.score - a.score);
+  const kept: RawCandidate[] = [];
+  for (const cand of ordered) {
+    const cx = (cand.xmin + cand.xmax) / 2;
+    const cy = (cand.ymin + cand.ymax) / 2;
+    const overlaps = kept.some((prev) => {
+      if (boxIoU(cand, prev) >= iouThresh) return true;
+      const pcx = (prev.xmin + prev.xmax) / 2;
+      const pcy = (prev.ymin + prev.ymax) / 2;
+      return Math.hypot(cx - pcx, cy - pcy) < minCenterDistPx;
+    });
+    if (!overlaps) {
+      kept.push(cand);
+      if (kept.length >= 900) break;
+    }
+  }
+  return kept;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: Real AI Inference (ONNX Runtime Web + Backend YOLO + Multi-Scale CV)
+// ---------------------------------------------------------------------------
+
+interface ModelStatusInfo {
+  onnxReady: boolean;
+  onnxUrl: string | null;
+  backendYoloReady: boolean;
+}
+
+let cachedModelStatus: ModelStatusInfo | null = null;
+let cachedOrtSession: ort.InferenceSession | null = null;
+let ortLoadAttempted = false;
+
+async function getModelStatus(): Promise<ModelStatusInfo> {
+  if (cachedModelStatus) return cachedModelStatus;
+  try {
+    const resp = await fetch('/api/satellite/model-status');
+    if (resp.ok) {
+      const data = (await resp.json()) as Partial<ModelStatusInfo>;
+      cachedModelStatus = {
+        onnxReady: Boolean(data.onnxReady),
+        onnxUrl: data.onnxUrl || null,
+        backendYoloReady: Boolean(data.backendYoloReady),
+      };
+      return cachedModelStatus;
+    }
+  } catch {
+    // ignore
+  }
+  cachedModelStatus = { onnxReady: false, onnxUrl: null, backendYoloReady: false };
+  return cachedModelStatus;
+}
+
+async function getOnnxSession(onnxUrl: string): Promise<ort.InferenceSession | null> {
+  if (cachedOrtSession) return cachedOrtSession;
+  if (ortLoadAttempted) return null;
+  ortLoadAttempted = true;
+  try {
+    ort.env.wasm.numThreads = 1;
+    cachedOrtSession = await ort.InferenceSession.create(onnxUrl, {
+      executionProviders: ['wasm'],
+    });
+    return cachedOrtSession;
+  } catch {
+    return null;
+  }
+}
+
+function runOnnxTileInference(
+  session: ort.InferenceSession,
+  tileCanvas: HTMLCanvasElement,
+  sliceX: number,
+  sliceY: number,
+  confThresh = 0.22
+): Promise<RawCandidate[]> {
+  return (async () => {
+    const inputSize = 512;
+    const resized = document.createElement('canvas');
+    resized.width = inputSize;
+    resized.height = inputSize;
+    const rCtx = resized.getContext('2d')!;
+    rCtx.drawImage(tileCanvas, 0, 0, tileCanvas.width, tileCanvas.height, 0, 0, inputSize, inputSize);
+    const { data } = rCtx.getImageData(0, 0, inputSize, inputSize);
+
+    const floatData = new Float32Array(3 * inputSize * inputSize);
+    const plane = inputSize * inputSize;
+    for (let i = 0; i < plane; i++) {
+      const o = i * 4;
+      floatData[i] = data[o] / 255.0;
+      floatData[plane + i] = data[o + 1] / 255.0;
+      floatData[2 * plane + i] = data[o + 2] / 255.0;
+    }
+
+    const inputName = session.inputNames[0] || 'images';
+    const tensor = new ort.Tensor('float32', floatData, [1, 3, inputSize, inputSize]);
+    const results = await session.run({ [inputName]: tensor });
+    const outName = session.outputNames[0];
+    const output = results[outName];
+    const dims = output.dims; // YOLOv8 typically [1, 4+C, N]
+    const raw = output.data as Float32Array;
+    const scaleX = tileCanvas.width / inputSize;
+    const scaleY = tileCanvas.height / inputSize;
+
+    const cands: RawCandidate[] = [];
+    if (dims.length === 3 && dims[1] >= 5 && dims[2] > dims[1]) {
+      const channels = dims[1];
+      const numBoxes = dims[2];
+      const numClasses = channels - 4;
+      for (let i = 0; i < numBoxes; i++) {
+        let bestCls = 0;
+        let bestConf = 0;
+        for (let c = 0; c < numClasses; c++) {
+          const score = raw[(4 + c) * numBoxes + i];
+          if (score > bestConf) {
+            bestConf = score;
+            bestCls = c;
+          }
+        }
+        if (bestConf < confThresh) continue;
+        const cx = raw[0 * numBoxes + i] * scaleX;
+        const cy = raw[1 * numBoxes + i] * scaleY;
+        const bw = raw[2 * numBoxes + i] * scaleX;
+        const bh = raw[3 * numBoxes + i] * scaleY;
+        const clsId = (bestCls <= 2 ? bestCls : 0) as 0 | 1 | 2;
+        cands.push({
+          xmin: sliceX + cx - bw / 2,
+          ymin: sliceY + cy - bh / 2,
+          xmax: sliceX + cx + bw / 2,
+          ymax: sliceY + cy + bh / 2,
+          score: bestConf,
+          classId: clsId,
+        });
+      }
+    } else if (dims.length === 3 && dims[2] >= 5) {
+      const numBoxes = dims[1];
+      const channels = dims[2];
+      const numClasses = channels - 4;
+      for (let i = 0; i < numBoxes; i++) {
+        const base = i * channels;
+        let bestCls = 0;
+        let bestConf = 0;
+        for (let c = 0; c < numClasses; c++) {
+          const score = raw[base + 4 + c];
+          if (score > bestConf) {
+            bestConf = score;
+            bestCls = c;
+          }
+        }
+        if (bestConf < confThresh) continue;
+        const cx = raw[base] * scaleX;
+        const cy = raw[base + 1] * scaleY;
+        const bw = raw[base + 2] * scaleX;
+        const bh = raw[base + 3] * scaleY;
+        const clsId = (bestCls <= 2 ? bestCls : 0) as 0 | 1 | 2;
+        cands.push({
+          xmin: sliceX + cx - bw / 2,
+          ymin: sliceY + cy - bh / 2,
+          xmax: sliceX + cx + bw / 2,
+          ymax: sliceY + cy + bh / 2,
+          score: bestConf,
+          classId: clsId,
+        });
+      }
+    }
+    return cands;
+  })();
+}
+
+async function runBackendYoloTile(
+  tileCanvas: HTMLCanvasElement,
+  sliceX: number,
+  sliceY: number
+): Promise<{ ok: boolean; engine: string; cands: RawCandidate[] }> {
+  try {
+    const b64 = tileCanvas.toDataURL('image/png');
+    const resp = await fetch('/api/satellite/detect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64: b64, conf: 0.22, iou: 0.45 }),
+    });
+    if (!resp.ok) return { ok: false, engine: 'unavailable', cands: [] };
+    const data = (await resp.json()) as {
+      ok?: boolean;
+      engine?: string;
+      boxes?: Array<{ xmin: number; ymin: number; xmax: number; ymax: number; classId?: number; score?: number }>;
+    };
+    if (!data.ok) return { ok: false, engine: data.engine || 'unavailable', cands: [] };
+    const cands: RawCandidate[] = (data.boxes || []).map((b) => ({
+      xmin: sliceX + b.xmin,
+      ymin: sliceY + b.ymin,
+      xmax: sliceX + b.xmax,
+      ymax: sliceY + b.ymax,
+      score: Number(b.score ?? 0.5),
+      classId: (b.classId === 1 || b.classId === 2 ? b.classId : 0) as 0 | 1 | 2,
+    }));
+    return { ok: true, engine: data.engine || 'YOLOv8 Backend', cands };
+  } catch {
+    return { ok: false, engine: 'unavailable', cands: [] };
+  }
 }
 
 /**
- * Pixel-level Excess Green Index (ExG) + Texture Analysis + Multi-scale canopy blob detector with NMS
+ * Multi-Scale Canopy Candidate Proposal on a 512x512 masked tile (used when ONNX/Python YOLO weights are absent).
+ * Produces raw candidates that are subsequently filtered by Stage 3 (Cast-Shadow + Laplacian Variance).
  */
-function detectCanopyTrees(
-  imgData: ImageData,
-  farmMask: Uint8Array,
+function proposeCanopyCandidatesInSlice(
+  tileData: Uint8ClampedArray,
+  tw: number,
+  th: number,
+  sliceX: number,
+  sliceY: number,
+  strictMask: Uint8Array,
   boundaryMask: Uint8Array,
-  lat: number,
-  zoom: number
-): {
-  boxes: TreeDetectionBox[];
-  vegPct: number;
-  counts: { lo: number; mid: number; hi: number; interiorMid: number };
-  crownM: number | null;
-} {
-  const w = imgData.width;
-  const h = imgData.height;
-  const data = imgData.data;
-  const mpp = (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
+  fullW: number,
+  mpp: number,
+  species: string
+): RawCandidate[] {
+  const scoreMap = new Float32Array(tw * th);
 
-  // Compute active area mask for texture computation
-  const activeMask = new Uint8Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    activeMask[i] = farmMask[i] || boundaryMask[i] ? 1 : 0;
-  }
-
-  // 1. Texture Analysis: compute local roughness and gradient energy
-  const { roughness, normScore: textureNorm } = computeTextureRoughnessMap(
-    data,
-    w,
-    h,
-    activeMask
-  );
-
-  // 2. Compute ExG map & fuse with Texture Analysis to isolate tree crowns from crops
-  const canopyScore = new Float32Array(w * h);
-  let boundaryPxCount = 0;
-  let boundaryVegCount = 0;
-
-  for (let i = 0; i < w * h; i++) {
-    const idx = i * 4;
-    const r = data[idx];
-    const g = data[idx + 1];
-    const b = data[idx + 2];
-    const sum = r + g + b + 1e-6;
-    const exg = (2 * g - r - b) / sum;
-    const brightness = (r + g + b) / 3;
-
-    if (boundaryMask[i]) {
-      boundaryPxCount++;
-      if (exg > VEG_EXG) {
-        boundaryVegCount++;
-      }
-    }
-
-    if (farmMask[i] || boundaryMask[i]) {
-      // Combine greenness index and dark-canopy shadow contrast
-      const greenComponent = Math.max(0, (exg - 0.015) * 3.2);
-      const darkCanopy =
-        brightness > 22 && brightness < 118 && g >= r * 0.92 ? (118 - brightness) / 230 : 0;
-      const baseScore = greenComponent * 0.72 + darkCanopy * 0.48;
-
-      // Texture Fusion: penalize flat, smooth green crops (clover/wheat/vegetables)
-      // Smooth surfaces (textureNorm ~ 0) have their score suppressed by up to 65%
-      // 3D Rough tree foliage (textureNorm ~ 0.8-1.0) is preserved and boosted
-      const texWeight = 0.35 + 0.65 * textureNorm[i];
-      canopyScore[i] = Math.min(1, baseScore * texWeight);
+  for (let y = 0; y < th; y++) {
+    const gy = sliceY + y;
+    const gRow = gy * fullW;
+    const tRow = y * tw;
+    for (let x = 0; x < tw; x++) {
+      const gx = sliceX + x;
+      if (!strictMask[gRow + gx]) continue;
+      const o = (tRow + x) * 4;
+      const r = tileData[o];
+      const g = tileData[o + 1];
+      const b = tileData[o + 2];
+      const sum = r + g + b + 1e-6;
+      const exg = (2 * g - r - b) / sum;
+      const lum = (r + g + b) / 3;
+      const greenComp = Math.max(0, (exg - 0.012) * 3.1);
+      const darkCanopy = lum > 20 && lum < 120 && g >= r * 0.9 ? (120 - lum) / 230 : 0;
+      scoreMap[tRow + x] = Math.min(1, greenComp * 0.68 + darkCanopy * 0.52);
     }
   }
 
-  const vegPct =
-    boundaryPxCount > 0 ? Number(((boundaryVegCount / boundaryPxCount) * 100).toFixed(1)) : 0;
-
-  // Box-blur canopy score at ~1.6m radius to find crown centers
-  const crownRadiusPx = Math.max(2, Math.min(9, Math.round(1.75 / Math.max(mpp, 0.12))));
-  const smoothed = new Float32Array(w * h);
-  for (let y = crownRadiusPx; y < h - crownRadiusPx; y++) {
-    for (let x = crownRadiusPx; x < w - crownRadiusPx; x++) {
-      const centerIdx = y * w + x;
-      if (!farmMask[centerIdx] && !boundaryMask[centerIdx]) continue;
+  const rad = Math.max(2, Math.min(8, Math.round(1.65 / Math.max(mpp, 0.12))));
+  const smoothed = new Float32Array(tw * th);
+  for (let y = rad; y < th - rad; y++) {
+    for (let x = rad; x < tw - rad; x++) {
+      if (!strictMask[(sliceY + y) * fullW + (sliceX + x)]) continue;
       let acc = 0;
       let cnt = 0;
-      for (let dy = -crownRadiusPx; dy <= crownRadiusPx; dy++) {
-        const rowOff = (y + dy) * w;
-        for (let dx = -crownRadiusPx; dx <= crownRadiusPx; dx++) {
-          acc += canopyScore[rowOff + x + dx];
+      for (let dy = -rad; dy <= rad; dy++) {
+        const off = (y + dy) * tw;
+        for (let dx = -rad; dx <= rad; dx++) {
+          acc += scoreMap[off + x + dx];
           cnt++;
         }
       }
-      smoothed[centerIdx] = acc / cnt;
+      smoothed[y * tw + x] = acc / cnt;
     }
   }
 
-  // Local maxima search + Texture & Annular isolation filters + NMS
-  const minSepPx = Math.max(4, Math.round(2.6 / Math.max(mpp, 0.12)));
-  const candidates: Array<{ x: number; y: number; score: number; radiusPx: number }> = [];
-
-  for (let y = crownRadiusPx + 1; y < h - crownRadiusPx - 1; y += 2) {
-    for (let x = crownRadiusPx + 1; x < w - crownRadiusPx - 1; x += 2) {
-      const idx = y * w + x;
-      const val = smoothed[idx];
+  const out: RawCandidate[] = [];
+  for (let y = rad + 1; y < th - rad - 1; y += 2) {
+    for (let x = rad + 1; x < tw - rad - 1; x += 2) {
+      const val = smoothed[y * tw + x];
       if (val < AI_BAND[2]) continue;
 
       let isMax = true;
       for (let dy = -2; dy <= 2 && isMax; dy++) {
         for (let dx = -2; dx <= 2; dx++) {
           if (dx === 0 && dy === 0) continue;
-          if (smoothed[(y + dy) * w + (x + dx)] > val) {
+          if (smoothed[(y + dy) * tw + (x + dx)] > val) {
             isMax = false;
             break;
           }
@@ -659,378 +876,401 @@ function detectCanopyTrees(
       }
       if (!isMax) continue;
 
-      // 1. Physical Tall-Tree Cast Shadow in Sun-Opposing Northern Quadrant (North/North-East in Egypt)
-      // Trees in Egypt cast distinct dark shadows (Brightness < 54) northward/northeastward
-      const shY1 = Math.max(0, y - Math.round(crownRadiusPx * 2.8));
-      const shY2 = Math.max(0, y - 2);
-      const shX1 = Math.max(0, x - Math.round(crownRadiusPx * 1.8));
-      const shX2 = Math.min(w - 1, x + Math.round(crownRadiusPx * 2.2));
-      let darkShadowPx = 0;
-      let minShadowLum = 255;
-      for (let sy = shY1; sy <= shY2; sy++) {
-        const sRow = sy * w;
-        for (let sx = shX1; sx <= shX2; sx++) {
-          const pIdx = (sRow + sx) * 4;
-          const lum = (data[pIdx] + data[pIdx + 1] + data[pIdx + 2]) / 3;
-          if (lum < minShadowLum) minShadowLum = lum;
-          if (lum < 54.0) darkShadowPx++;
-        }
-      }
-      const hasTallShadow = minShadowLum < 50.0 && darkShadowPx >= 3;
+      const gx = sliceX + x;
+      const gy = sliceY + y;
+      const onBound = Boolean(boundaryMask[gy * fullW + gx]);
+      const rPx = Math.max(4, rad * (val > 0.34 ? 1.7 : 1.35));
+      const radiusM = rPx * mpp;
+      const { classId } = inferFallbackTreeClass(species, onBound, radiusM);
 
-      // 2. Opposing Directional Ray Pairs Drop Test (عزل تام للخطوط وحواف الحقول العادية)
-      // A 1D step-edge (field border, road line) drops in only ONE direction (towards road)
-      // while the opposite ray (towards field) remains high.
-      // A 2D tree dome drops in BOTH opposite directions across its cross-section!
-      let dropRayCount = 0;
-      let twoSidedDropPairs = 0;
-      let stepEdgePairs = 0;
-      const rRay = Math.max(4, Math.round(crownRadiusPx * 1.6));
-      const rayVals: number[] = [];
-
-      for (let a = 0; a < 8; a++) {
-        const rad = (a * Math.PI) / 4;
-        const rx = Math.round(x + rRay * Math.cos(rad));
-        const ry = Math.round(y + rRay * Math.sin(rad));
-        if (rx >= 0 && rx < w && ry >= 0 && ry < h) {
-          rayVals.push(canopyScore[ry * w + rx]);
-        } else {
-          rayVals.push(-0.5);
-        }
-      }
-
-      for (let a = 0; a < 8; a++) {
-        if (val - rayVals[a] >= 0.055) {
-          dropRayCount++;
-        }
-      }
-
-      for (let pIdx = 0; pIdx < 4; pIdx++) {
-        const d1 = val - rayVals[pIdx];
-        const d2 = val - rayVals[pIdx + 4];
-        if (d1 >= 0.045 && d2 >= 0.045) {
-          twoSidedDropPairs++;
-        } else if ((d1 >= 0.12 && d2 < 0.02) || (d2 >= 0.12 && d1 < 0.02)) {
-          stepEdgePairs++;
-        }
-      }
-
-      // If it is purely a 1D step edge with NO opposing drops on any axis: REJECT IT!
-      // (This completely eliminates the necklace of fake points along the boundary vector line)
-      if (twoSidedDropPairs === 0 && !hasTallShadow) continue;
-      if (stepEdgePairs >= 2 && twoSidedDropPairs === 0) continue;
-
-      // 3. Texture Roughness Verification at apex:
-      // Real tree crowns have high local variance and gradients at their apex
-      const apexRough = roughness[idx];
-      if (apexRough < 6.8 && !hasTallShadow) continue;
-
-      // 4. Annular Contrast Drop & Multi-Directional Isolation
-      const rIn = Math.max(2, Math.round(crownRadiusPx * 0.75));
-      const rOut = Math.max(rIn + 2, Math.round(crownRadiusPx * 2.0));
-      let ringAcc = 0;
-      let ringCnt = 0;
-      for (let dy = -rOut; dy <= rOut; dy += 2) {
-        for (let dx = -rOut; dx <= rOut; dx += 2) {
-          const distSq = dx * dx + dy * dy;
-          if (distSq >= rIn * rIn && distSq <= rOut * rOut) {
-            const ny = y + dy;
-            const nx = x + dx;
-            if (ny >= 0 && ny < h && nx >= 0 && nx < w) {
-              ringAcc += canopyScore[ny * w + nx];
-              ringCnt++;
-            }
-          }
-        }
-      }
-      const ringMean = ringCnt > 0 ? ringAcc / ringCnt : val;
-      const annularDrop = val - ringMean;
-      const ringRatio = ringMean / (val + 1e-5);
-
-      // Acceptance Criteria:
-      // Type A: Upright tree with tall cast shadow (palms, casuarinas, boundary trees)
-      // Type B: Isolated standalone 2D tree dome with two-sided drops on multiple axes
-      let isRealTree = false;
-      if (hasTallShadow && (twoSidedDropPairs >= 1 || dropRayCount >= 3)) {
-        isRealTree = true;
-      } else if (
-        twoSidedDropPairs >= 2 &&
-        annularDrop >= 0.055 &&
-        ringRatio <= 0.80 &&
-        dropRayCount >= 4
-      ) {
-        isRealTree = true;
-      }
-
-      if (!isRealTree) continue;
-
-      // Estimate local crown size
-      let rPx = crownRadiusPx * 1.35;
-      if (val > 0.35) rPx = crownRadiusPx * 1.65;
-      const normScore = Math.min(
-        0.98,
-        val * (1.25 + 0.25 * Math.min(1, apexRough / 18.0))
-      );
-      if (normScore >= AI_BAND[2]) {
-        candidates.push({ x, y, score: normScore, radiusPx: rPx });
-      }
+      out.push({
+        xmin: gx - rPx,
+        ymin: gy - rPx,
+        xmax: gx + rPx,
+        ymax: gy + rPx,
+        score: Math.min(0.97, val * 1.35),
+        classId,
+      });
     }
   }
-
-  candidates.sort((a, b) => b.score - a.score);
-  const accepted: typeof candidates = [];
-  for (const cand of candidates) {
-    const tooClose = accepted.some(
-      (prev) => Math.hypot(prev.x - cand.x, prev.y - cand.y) < minSepPx
-    );
-    if (!tooClose) {
-      accepted.push(cand);
-      if (accepted.length >= 650) break;
-    }
-  }
-
-  const boxes: TreeDetectionBox[] = accepted.map((c) => {
-    const onBoundary = Boolean(boundaryMask[c.y * w + c.x]);
-    return {
-      xmin: Math.max(0, c.x - c.radiusPx),
-      ymin: Math.max(0, c.y - c.radiusPx),
-      xmax: Math.min(w - 1, c.x + c.radiusPx),
-      ymax: Math.min(h - 1, c.y + c.radiusPx),
-      score: c.score,
-      onBoundary,
-    };
-  });
-
-  const boundaryBoxes = boxes.filter((b) => b.onBoundary);
-  const interiorBoxes = boxes.filter((b) => !b.onBoundary);
-
-  const counts = {
-    lo: boundaryBoxes.filter((b) => b.score >= AI_BAND[0]).length,
-    mid: boundaryBoxes.filter((b) => b.score >= AI_BAND[1]).length,
-    hi: boundaryBoxes.filter((b) => b.score >= AI_BAND[2]).length,
-    interiorMid: interiorBoxes.filter((b) => b.score >= AI_BAND[1]).length,
-  };
-
-  const midBoundary = boundaryBoxes.filter((b) => b.score >= AI_BAND[1]);
-  let crownM: number | null = null;
-  if (midBoundary.length > 0) {
-    const sides = midBoundary
-      .map((b) => Math.sqrt((b.xmax - b.xmin) * (b.ymax - b.ymin)) * mpp)
-      .sort((a, b) => a - b);
-    const midIdx = Math.floor(sides.length / 2);
-    crownM = Number(sides[midIdx].toFixed(2));
-  }
-
-  return { boxes, vegPct, counts, crownM };
+  return out;
 }
 
-function renderAnnotatedSatellite(
+// ---------------------------------------------------------------------------
+// Stage 3: Cast-Shadow (HSV Value Drop) & Laplacian Texture Variance Post-Filter
+// ---------------------------------------------------------------------------
+
+function filterByShadowAndTexture(
+  candidates: RawCandidate[],
+  imgData: ImageData,
+  strictMask: Uint8Array,
+  boundaryMask: Uint8Array,
+  mpp: number,
+  species: string
+): TreeDetectionBox[] {
+  const w = imgData.width;
+  const h = imgData.height;
+  const data = imgData.data;
+
+  // Precompute luminance & HSV Value [0..1]
+  const lum = new Float32Array(w * h);
+  const hsvV = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const o = i * 4;
+    const r = data[o];
+    const g = data[o + 1];
+    const b = data[o + 2];
+    lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    hsvV[i] = Math.max(r, g, b) / 255.0;
+  }
+
+  const verified: TreeDetectionBox[] = [];
+  let nextId = 1;
+
+  for (const cand of candidates) {
+    const cx = Math.round((cand.xmin + cand.xmax) / 2);
+    const cy = Math.round((cand.ymin + cand.ymax) / 2);
+    if (cx < 2 || cx >= w - 2 || cy < 2 || cy >= h - 2) continue;
+    if (!strictMask[cy * w + cx]) continue;
+
+    const x1 = Math.max(1, Math.floor(cand.xmin));
+    const y1 = Math.max(1, Math.floor(cand.ymin));
+    const x2 = Math.min(w - 2, Math.ceil(cand.xmax));
+    const y2 = Math.min(h - 2, Math.ceil(cand.ymax));
+    const radiusPx = Math.max(3, (cand.xmax - cand.xmin + (cand.ymax - cand.ymin)) / 4);
+
+    // 1. Laplacian Texture Variance inside candidate crown box (rejects smooth flat row crops)
+    let lapSum = 0;
+    let lapSqSum = 0;
+    let lumSum = 0;
+    let lumSqSum = 0;
+    let cnt = 0;
+    let greenSum = 0;
+
+    for (let y = y1; y <= y2; y++) {
+      for (let x = x1; x <= x2; x++) {
+        const idx = y * w + x;
+        const l = lum[idx];
+        const lap = Math.abs(
+          lum[idx - 1] + lum[idx + 1] + lum[idx - w] + lum[idx + w] - 4 * l
+        );
+        lapSum += lap;
+        lapSqSum += lap * lap;
+        lumSum += l;
+        lumSqSum += l * l;
+        const pIdx = idx * 4;
+        const sumRgb = data[pIdx] + data[pIdx + 1] + data[pIdx + 2] + 1e-6;
+        greenSum += (2 * data[pIdx + 1] - data[pIdx] - data[pIdx + 2]) / sumRgb;
+        cnt++;
+      }
+    }
+    if (cnt < 9) continue;
+
+    const meanLap = lapSum / cnt;
+    const laplacianVar = Math.max(0, lapSqSum / cnt - meanLap * meanLap);
+    const meanLum = lumSum / cnt;
+    const lumStd = Math.sqrt(Math.max(0, lumSqSum / cnt - meanLum * meanLum));
+    const meanExg = greenSum / cnt;
+
+    // Require minimum chlorophyll vegetation signal (reject bare rooftops/soil)
+    if (meanExg < 0.008) continue;
+
+    // 2. Adjacent Cast-Shadow Check: sample HSV Value in surrounding skirt & northern shadow quadrant
+    let crownVSum = 0;
+    let crownVCnt = 0;
+    const cRad = Math.max(2, Math.round(radiusPx * 0.55));
+    for (let dy = -cRad; dy <= cRad; dy++) {
+      const py = cy + dy;
+      if (py < 0 || py >= h) continue;
+      for (let dx = -cRad; dx <= cRad; dx++) {
+        const px = cx + dx;
+        if (px < 0 || px >= w) continue;
+        crownVSum += hsvV[py * w + px];
+        crownVCnt++;
+      }
+    }
+    const crownV = crownVCnt > 0 ? crownVSum / crownVCnt : hsvV[cy * w + cx];
+
+    const shRIn = Math.max(3, Math.round(radiusPx * 0.95));
+    const shROut = Math.max(shRIn + 2, Math.round(radiusPx * 2.4));
+    const sy1 = Math.max(0, cy - shROut);
+    const sy2 = Math.min(h - 1, cy + Math.round(shROut * 0.6)); // emphasizes North/NW/NE cast shadows
+    const sx1 = Math.max(0, cx - shROut);
+    const sx2 = Math.min(w - 1, cx + shROut);
+
+    let minShadowV = 1.0;
+    let darkShadowPx = 0;
+    let ringVSum = 0;
+    let ringVCnt = 0;
+
+    for (let sy = sy1; sy <= sy2; sy++) {
+      for (let sx = sx1; sx <= sx2; sx++) {
+        const d2 = (sx - cx) * (sx - cx) + (sy - cy) * (sy - cy);
+        if (d2 >= shRIn * shRIn && d2 <= shROut * shROut) {
+          const v = hsvV[sy * w + sx];
+          ringVSum += v;
+          ringVCnt++;
+          if (v < minShadowV) minShadowV = v;
+          if (v < 0.24) darkShadowPx++;
+        }
+      }
+    }
+
+    const ringMeanV = ringVCnt > 0 ? ringVSum / ringVCnt : crownV;
+    const shadowDrop = Math.max(crownV - minShadowV, ringMeanV - minShadowV);
+    const hasCastShadow = (shadowDrop >= 0.085 && minShadowV <= 0.27) || darkShadowPx >= 3;
+
+    // 3. Opposing-Axis Canopy Isolation Check (eliminates flat green field carpets & 1D border lines)
+    let twoSidedDropAxes = 0;
+    const rRay = Math.max(4, Math.round(radiusPx * 1.7));
+    const rayExg: number[] = [];
+    for (let a = 0; a < 8; a++) {
+      const radAngle = (a * Math.PI) / 4;
+      const rx = Math.round(cx + rRay * Math.cos(radAngle));
+      const ry = Math.round(cy + rRay * Math.sin(radAngle));
+      if (rx >= 0 && rx < w && ry >= 0 && ry < h) {
+        const o = (ry * w + rx) * 4;
+        const sRgb = data[o] + data[o + 1] + data[o + 2] + 1e-6;
+        rayExg.push((2 * data[o + 1] - data[o] - data[o + 2]) / sRgb);
+      } else {
+        rayExg.push(-0.2);
+      }
+    }
+    for (let a = 0; a < 4; a++) {
+      if (meanExg - rayExg[a] >= 0.015 && meanExg - rayExg[a + 4] >= 0.015) {
+        twoSidedDropAxes++;
+      }
+    }
+
+    // Combined Stage-3 Gate: reject uniform low-variance crop beds without cast shadows
+    const hasHighTexture = laplacianVar >= 26.0 || lumStd >= 6.8;
+    if (!hasCastShadow && !hasHighTexture) continue;
+    if (!hasCastShadow && twoSidedDropAxes < 2) continue;
+    if (laplacianVar < 14.0 && lumStd < 5.0) continue;
+
+    const onBoundary = Boolean(boundaryMask[cy * w + cx]);
+    const radiusM = radiusPx * mpp;
+    const fallbackCls = inferFallbackTreeClass(species, onBoundary, radiusM);
+    const classId = (cand.classId ?? fallbackCls.classId) as 0 | 1 | 2;
+    const className = TREE_CLASSES[classId] || fallbackCls.className;
+
+    const calibratedScore = Math.min(
+      0.99,
+      Math.max(
+        cand.score,
+        cand.score * (hasCastShadow ? 1.08 : 0.94) + Math.min(0.12, laplacianVar / 600)
+      )
+    );
+
+    if (calibratedScore < AI_BAND[2]) continue;
+
+    verified.push({
+      id: nextId++,
+      xmin: x1,
+      ymin: y1,
+      xmax: x2,
+      ymax: y2,
+      cx,
+      cy,
+      radiusPx: Math.round(radiusPx),
+      score: Number(calibratedScore.toFixed(3)),
+      classId,
+      className,
+      onBoundary,
+      shadowDrop: Number(shadowDrop.toFixed(3)),
+      laplacianVar: Number(laplacianVar.toFixed(1)),
+    });
+  }
+
+  return verified;
+}
+
+// ---------------------------------------------------------------------------
+// Clean Overlay Renderer (UTF-8 Arabic font stack, zero overlapping dark labels)
+// ---------------------------------------------------------------------------
+
+const CLASS_COLORS: Record<TreeClassName, string> = {
+  orchard_tree: '#10b981',
+  palm_tree: '#f59e0b',
+  windbreak_tree: '#06b6d4',
+};
+
+function renderCleanAndAnnotatedCanvases(
   baseCanvas: HTMLCanvasElement,
-  farmMask: Uint8Array,
+  strictMask: Uint8Array,
   ring: Array<[number, number]>,
-  strokePx: number,
+  clippedRing: Array<[number, number]>,
   boxes: TreeDetectionBox[],
   provider: string,
-  zoom: number
-): string {
-  const origW = baseCanvas.width;
-  const origH = baseCanvas.height;
-  const minDim = Math.min(origW, origH);
-  // High-Definition super-sampling (minimum 640px for crystal-clear satellite inspection)
-  const visScale = minDim < 640 ? 640 / Math.max(1, minDim) : 1.25;
-  const w = Math.round(origW * visScale);
-  const h = Math.round(origH * visScale);
+  zoom: number,
+  detectorEngine: string,
+  inwardBufferM: number
+): { cleanImageUrl: string; annotatedImageUrl: string } {
+  const w = baseCanvas.width;
+  const h = baseCanvas.height;
 
-  const out = document.createElement('canvas');
-  out.width = w;
-  out.height = h;
-  const ctx = out.getContext('2d')!;
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(baseCanvas, 0, 0, w, h);
+  const cleanCanvas = document.createElement('canvas');
+  cleanCanvas.width = w;
+  cleanCanvas.height = h;
+  const cCtx = cleanCanvas.getContext('2d')!;
+  cCtx.drawImage(baseCanvas, 0, 0);
 
-  // Dim background outside farm boundary to 55%, keep farm interior 100% bright & vivid
+  // Dim outside strict masked polygon so auditor sees clipped evaluation zone clearly
+  const frame = cCtx.getImageData(0, 0, w, h);
+  const px = frame.data;
+  for (let i = 0; i < w * h; i++) {
+    if (!strictMask[i]) {
+      const o = i * 4;
+      px[o] = Math.round(px[o] * 0.48);
+      px[o + 1] = Math.round(px[o + 1] * 0.48);
+      px[o + 2] = Math.round(px[o + 2] * 0.48);
+    }
+  }
+  cCtx.putImageData(frame, 0, 0);
+
+  // Draw calibrated outer farm GPS boundary & optional inward buffer ring
+  if (ring.length >= 3) {
+    cCtx.save();
+    cCtx.strokeStyle = 'rgba(0, 245, 255, 0.95)';
+    cCtx.lineWidth = 2.5;
+    cCtx.lineJoin = 'round';
+    cCtx.beginPath();
+    ring.forEach(([x, y], i) => (i === 0 ? cCtx.moveTo(x, y) : cCtx.lineTo(x, y)));
+    cCtx.closePath();
+    cCtx.stroke();
+
+    if (Math.abs(inwardBufferM) >= 0.05 && clippedRing.length >= 3) {
+      cCtx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
+      cCtx.lineWidth = 1.6;
+      cCtx.setLineDash([6, 4]);
+      cCtx.beginPath();
+      clippedRing.forEach(([x, y], i) => (i === 0 ? cCtx.moveTo(x, y) : cCtx.lineTo(x, y)));
+      cCtx.closePath();
+      cCtx.stroke();
+      cCtx.setLineDash([]);
+    }
+    cCtx.restore();
+  }
+
+  const cleanImageUrl = cleanCanvas.toDataURL('image/png');
+
+  // Annotated image for lightbox/export using clean circles & UTF-8 Arabic font stack
+  const annCanvas = document.createElement('canvas');
+  annCanvas.width = w;
+  annCanvas.height = h;
+  const aCtx = annCanvas.getContext('2d')!;
+  aCtx.drawImage(cleanCanvas, 0, 0);
+
+  for (const b of boxes) {
+    if (b.score < AI_BAND[1]) continue;
+    const color = CLASS_COLORS[b.className] || '#10b981';
+    aCtx.save();
+    aCtx.strokeStyle = color;
+    aCtx.lineWidth = 2;
+    aCtx.beginPath();
+    aCtx.arc(b.cx, b.cy, Math.max(4, b.radiusPx), 0, Math.PI * 2);
+    aCtx.stroke();
+
+    aCtx.fillStyle = color;
+    aCtx.beginPath();
+    aCtx.arc(b.cx, b.cy, 2.2, 0, Math.PI * 2);
+    aCtx.fill();
+    aCtx.restore();
+  }
+
+  // Crisp UTF-8 Top Banner
+  aCtx.fillStyle = 'rgba(15, 23, 42, 0.90)';
+  aCtx.fillRect(0, 0, w, 30);
+  aCtx.fillStyle = '#38bdf8';
+  aCtx.font = '600 12px "IBM Plex Sans Arabic", "Noto Sans Arabic", "JetBrains Mono", system-ui, sans-serif';
+  aCtx.fillText(
+    `${provider} · Z${zoom} · ${detectorEngine} · الأشجار المرصودة: ${boxes.filter((b) => b.score >= AI_BAND[1]).length}`,
+    12,
+    20
+  );
+
+  const annotatedImageUrl = annCanvas.toDataURL('image/png');
+  return { cleanImageUrl, annotatedImageUrl };
+}
+
+function renderComparisonCanvasUrl(mosaic: FetchedMosaic, inwardBufferM: number): string {
+  const w = mosaic.canvas.width;
+  const h = mosaic.canvas.height;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d')!;
+  ctx.drawImage(mosaic.canvas, 0, 0);
+
+  const strictMask = createPolygonMask(w, h, mosaic.clippedRing);
   const frame = ctx.getImageData(0, 0, w, h);
   const px = frame.data;
-  for (let y = 0; y < h; y++) {
-    const srcY = Math.min(origH - 1, Math.floor(y / visScale));
-    for (let x = 0; x < w; x++) {
-      const srcX = Math.min(origW - 1, Math.floor(x / visScale));
-      if (!farmMask[srcY * origW + srcX]) {
-        const i = (y * w + x) * 4;
-        px[i] = Math.round(px[i] * 0.55);
-        px[i + 1] = Math.round(px[i + 1] * 0.55);
-        px[i + 2] = Math.round(px[i + 2] * 0.55);
-      }
+  for (let i = 0; i < w * h; i++) {
+    if (!strictMask[i]) {
+      const o = i * 4;
+      px[o] = Math.round(px[o] * 0.48);
+      px[o + 1] = Math.round(px[o + 1] * 0.48);
+      px[o + 2] = Math.round(px[o + 2] * 0.48);
     }
   }
   ctx.putImageData(frame, 0, 0);
 
-  if (ring.length >= 3) {
-    const pts = ring.map(([x, y]) => [x * visScale, y * visScale] as [number, number]);
-
-    // 1. Translucent amber/yellow buffer zone showing the 8m boundary tree corridor
-    ctx.save();
-    ctx.strokeStyle = 'rgba(255, 220, 0, 0.22)';
-    ctx.lineWidth = Math.max(14, Math.round(strokePx * visScale));
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
+  if (mosaic.ring.length >= 3) {
+    ctx.strokeStyle = 'rgba(0, 245, 255, 0.95)';
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
-    pts.forEach(([x, y], idx) => (idx === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+    mosaic.ring.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
     ctx.closePath();
     ctx.stroke();
 
-    // 2. High-precision farm perimeter outline (outer shadow + cyan glow + gold core)
-    const lineW = Math.max(3, Math.floor(Math.min(w, h) / 140));
-
-    // Outer dark contrast track
-    ctx.strokeStyle = 'rgba(0, 0, 0, 0.75)';
-    ctx.lineWidth = lineW + 4;
-    ctx.stroke();
-
-    // Vibrant cyan outer glow
-    ctx.strokeStyle = 'rgba(0, 245, 255, 0.95)';
-    ctx.lineWidth = lineW + 2;
-    ctx.stroke();
-
-    // Golden core perimeter
-    ctx.strokeStyle = 'rgba(255, 235, 50, 1)';
-    ctx.lineWidth = lineW;
-    ctx.stroke();
-
-    // 3. Vertex coordinates pins
-    const rPt = Math.max(4, lineW + 1);
-    pts.forEach(([pxX, pxY], i) => {
-      // Pin outer ring
-      ctx.fillStyle = '#00f5ff';
+    if (Math.abs(inwardBufferM) >= 0.05 && mosaic.clippedRing.length >= 3) {
+      ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
+      ctx.lineWidth = 1.6;
+      ctx.setLineDash([6, 4]);
       ctx.beginPath();
-      ctx.arc(pxX, pxY, rPt + 2, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Pin center
-      ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = '#000000';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(pxX, pxY, rPt, 0, Math.PI * 2);
-      ctx.fill();
+      mosaic.clippedRing.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+      ctx.closePath();
       ctx.stroke();
-
-      // Vertex label
-      if (pts.length <= 16) {
-        ctx.fillStyle = '#0f172a';
-        ctx.font = 'bold 9px "JetBrains Mono", monospace';
-        ctx.fillText(`P${i + 1}`, pxX + rPt + 3, pxY - 3);
-      }
-    });
-    ctx.restore();
-  }
-
-  let boundaryTreesDrawn = 0;
-  let interiorTreesDrawn = 0;
-
-  for (const b of boxes) {
-    if (b.score < AI_BAND[1]) continue;
-    const x1 = b.xmin * visScale;
-    const y1 = b.ymin * visScale;
-    const bw = (b.xmax - b.xmin) * visScale;
-    const bh = (b.ymax - b.ymin) * visScale;
-    const cx = x1 + bw / 2;
-    const cy = y1 + bh / 2;
-    const radius = Math.max(bw, bh) * 0.6;
-
-    if (b.onBoundary) {
-      boundaryTreesDrawn++;
-
-      // Soft circular crown aura
-      ctx.save();
-      ctx.fillStyle = 'rgba(255, 40, 75, 0.22)';
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Sharp bounding box
-      ctx.strokeStyle = 'rgba(255, 30, 70, 0.95)';
-      ctx.lineWidth = 2.0;
-      ctx.strokeRect(x1, y1, bw, bh);
-
-      // Corner reticle brackets
-      const bracketLen = Math.max(3, Math.min(6, bw * 0.25));
-      ctx.strokeStyle = '#ffff00';
-      ctx.lineWidth = 2.2;
-      // Top-left
-      ctx.beginPath();
-      ctx.moveTo(x1, y1 + bracketLen);
-      ctx.lineTo(x1, y1);
-      ctx.lineTo(x1 + bracketLen, y1);
-      ctx.stroke();
-      // Bottom-right
-      ctx.beginPath();
-      ctx.moveTo(x1 + bw, y1 + bh - bracketLen);
-      ctx.lineTo(x1 + bw, y1 + bh);
-      ctx.lineTo(x1 + bw - bracketLen, y1 + bh);
-      ctx.stroke();
-
-      // Luminous lime-green apex pin
-      ctx.fillStyle = '#00ff66';
-      ctx.beginPath();
-      ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    } else {
-      interiorTreesDrawn++;
-      // Subtle interior canopy marker
-      ctx.strokeStyle = 'rgba(0, 210, 255, 0.65)';
-      ctx.lineWidth = 1.2;
-      ctx.strokeRect(x1, y1, bw, bh);
-
-      ctx.fillStyle = 'rgba(0, 210, 255, 0.85)';
-      ctx.beginPath();
-      ctx.arc(cx, cy, 1.8, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.setLineDash([]);
     }
   }
 
-  // Top HUD Banner
-  const bannerH = 32;
-  ctx.fillStyle = 'rgba(11, 19, 36, 0.92)';
-  ctx.fillRect(0, 0, w, bannerH);
-  ctx.fillStyle = '#38bdf8';
-  ctx.font = '700 11px "JetBrains Mono", monospace';
-  ctx.fillText('HD SATELLITE · TEXTURE & NDVI VERIFIED', 12, 20);
-
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '600 11px "JetBrains Mono", monospace';
-  let legendTxt = ` | ${provider} | Boundary Trees: ${boundaryTreesDrawn}`;
-  if (interiorTreesDrawn > 0) {
-    legendTxt += ` | Interior: ${interiorTreesDrawn}`;
-  }
-  ctx.fillText(legendTxt, 250, 20);
-
-  // Bottom Sub-Bar: Texture Filter Status
-  const subH = 22;
-  ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-  ctx.fillRect(0, h - subH, w, subH);
-  ctx.fillStyle = '#a7f3d0';
-  ctx.font = '500 10px "JetBrains Mono", monospace';
-  ctx.fillText(
-    `Canopy Micro-Roughness Gate: Active (σ_lum > 8.0) · Zoom: ${zoom} · Flat Crop Rejection: ON`,
-    12,
-    h - 7
-  );
-
-  return out.toDataURL('image/jpeg', 0.94);
+  return c.toDataURL('image/png');
 }
+
+// ---------------------------------------------------------------------------
+// Public Entrypoint
+// ---------------------------------------------------------------------------
 
 export async function analyzeFarmSatellite(params: {
   poly: PointLonLat[];
   species: string;
   submissionTime: string;
   useNdvi: boolean;
+  providerMode?: BasemapViewMode;
+  offsetX_m?: number;
+  offsetY_m?: number;
+  inwardBufferM?: number;
 }): Promise<SatelliteAnalysisResult> {
-  const { poly, species, submissionTime, useNdvi } = params;
-  const [cLon, cLat] = polygonCentroid(poly);
-  const [minx, miny, maxx, maxy] = polygonBounds(poly);
+  const {
+    poly,
+    species,
+    submissionTime,
+    useNdvi,
+    providerMode = 'google',
+    offsetX_m = 0,
+    offsetY_m = 0,
+    inwardBufferM = -1.5,
+  } = params;
+
+  const calibratedPoly = shiftPolygonMeters(poly, offsetX_m, offsetY_m);
+  const clippedPoly =
+    Math.abs(inwardBufferM) >= 0.05
+      ? bufferPolygonMeters(calibratedPoly, inwardBufferM)
+      : calibratedPoly;
+
+  const [cLon, cLat] = polygonCentroid(calibratedPoly);
+  const [minx, miny, maxx, maxy] = polygonBounds(calibratedPoly);
 
   const metaPromise = fetch(
     `/api/satellite/metadata?lon=${cLon}&lat=${cLat}&minx=${minx}&miny=${miny}&maxx=${maxx}&maxy=${maxy}&useNdvi=${useNdvi ? '1' : '0'}`
@@ -1041,44 +1281,193 @@ export async function analyzeFarmSatellite(params: {
     ndviSceneFound?: boolean;
   } | null>;
 
-  const { canvas: rawCanvas, ring, zoom, provider } = await fetchFarmMosaic(poly);
+  const primaryPref: BasemapProvider = providerMode === 'esri' ? 'esri' : 'google';
+  const secondaryPref: BasemapProvider = primaryPref === 'google' ? 'esri' : 'google';
+  const strictSingleProvider = providerMode !== 'compare';
 
-  // High-Definition Satellite Enhancement (Auto-Contrast, de-hazing, unsharp masking foliage)
-  const canvas = enhanceSatelliteCanvas(rawCanvas);
+  let primaryMosaic = await fetchProviderMosaic(
+    poly,
+    calibratedPoly,
+    clippedPoly,
+    primaryPref,
+    strictSingleProvider
+  );
+  if (!primaryMosaic) {
+    primaryMosaic = await fetchProviderMosaic(
+      poly,
+      calibratedPoly,
+      clippedPoly,
+      secondaryPref,
+      false
+    );
+  }
+  if (!primaryMosaic) {
+    throw new Error(
+      'تعذّر تحميل صور القمر الصناعي الحية (Google Satellite / Esri World Imagery) لهذه الإحداثيات.'
+    );
+  }
+
+  let compareImageUrl: string | null = null;
+  let compareProvider: string | null = null;
+  let compareZoomUsed: number | null = null;
+  if (providerMode === 'compare') {
+    const altMosaic = await fetchProviderMosaic(
+      poly,
+      calibratedPoly,
+      clippedPoly,
+      secondaryPref,
+      true
+    );
+    if (altMosaic) {
+      compareImageUrl = renderComparisonCanvasUrl(altMosaic, inwardBufferM);
+      compareProvider = altMosaic.provider;
+      compareZoomUsed = altMosaic.zoom;
+    }
+  }
+
+  const canvas = enhanceSatelliteCanvas(primaryMosaic.canvas);
+  const w = canvas.width;
+  const h = canvas.height;
   const ctx = canvas.getContext('2d')!;
-  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const imgData = ctx.getImageData(0, 0, w, h);
 
-  const farmMask = createPolygonMask(canvas.width, canvas.height, ring);
-  const { mask: boundaryMask, strokePx } = createBoundaryCorridorMask(
-    canvas.width,
-    canvas.height,
-    ring,
-    cLat,
-    zoom,
+  // Strict Polygon Masking: everything outside clippedPoly is masked to 0 before detection
+  const strictMask = createPolygonMask(w, h, primaryMosaic.clippedRing);
+  const { mask: boundaryMask } = createBoundaryCorridorMask(
+    w,
+    h,
+    primaryMosaic.ring,
+    primaryMosaic.mpp,
     BOUNDARY_BUFFER_M
   );
 
-  const { boxes, vegPct, counts, crownM } = detectCanopyTrees(
+  // Compute vegetation percentage inside polygon
+  let polyPxCount = 0;
+  let polyVegCount = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (!strictMask[i]) continue;
+    polyPxCount++;
+    const o = i * 4;
+    const sum = imgData.data[o] + imgData.data[o + 1] + imgData.data[o + 2] + 1e-6;
+    const exg = (2 * imgData.data[o + 1] - imgData.data[o] - imgData.data[o + 2]) / sum;
+    if (exg > VEG_EXG) polyVegCount++;
+  }
+  const vegPct = polyPxCount > 0 ? Number(((polyVegCount / polyPxCount) * 100).toFixed(1)) : 0;
+
+  // Stage 1: Masked Canvas + SAHI 512x512 Overlapping Slices (20% overlap)
+  const maskedCanvas = buildStrictlyMaskedCanvas(canvas, strictMask);
+  const maskedCtx = maskedCanvas.getContext('2d')!;
+  const slices = generateSahiSlices(w, h, strictMask, 512, 0.2);
+
+  // Stage 2: Real AI Object Detection (ONNX Runtime Web -> Backend YOLO -> Multi-Scale CV)
+  const modelStatus = await getModelStatus();
+  let detectorEngine = 'SAHI 512px + Cast-Shadow & Laplacian Filter';
+  let rawCandidates: RawCandidate[] = [];
+
+  if (modelStatus.onnxReady && modelStatus.onnxUrl) {
+    const session = await getOnnxSession(modelStatus.onnxUrl);
+    if (session) {
+      for (const s of slices) {
+        const subCanvas = document.createElement('canvas');
+        subCanvas.width = s.w;
+        subCanvas.height = s.h;
+        const sCtx = subCanvas.getContext('2d')!;
+        sCtx.drawImage(maskedCanvas, s.x, s.y, s.w, s.h, 0, 0, s.w, s.h);
+        const tileCands = await runOnnxTileInference(session, subCanvas, s.x, s.y, 0.22);
+        rawCandidates.push(...tileCands);
+      }
+      detectorEngine = 'YOLOv8 ONNX (SAHI 512px · 20% Overlap)';
+    }
+  }
+
+  if (rawCandidates.length === 0 && modelStatus.backendYoloReady) {
+    let backendWorked = false;
+    for (const s of slices) {
+      const subCanvas = document.createElement('canvas');
+      subCanvas.width = s.w;
+      subCanvas.height = s.h;
+      subCanvas.getContext('2d')!.drawImage(maskedCanvas, s.x, s.y, s.w, s.h, 0, 0, s.w, s.h);
+      const res = await runBackendYoloTile(subCanvas, s.x, s.y);
+      if (res.ok) {
+        backendWorked = true;
+        rawCandidates.push(...res.cands);
+        detectorEngine = `${res.engine} (SAHI 512px)`;
+      } else {
+        break;
+      }
+    }
+    if (!backendWorked) rawCandidates = [];
+  }
+
+  if (rawCandidates.length === 0) {
+    for (const s of slices) {
+      const tileImgData = maskedCtx.getImageData(s.x, s.y, s.w, s.h);
+      const tileCands = proposeCanopyCandidatesInSlice(
+        tileImgData.data,
+        s.w,
+        s.h,
+        s.x,
+        s.y,
+        strictMask,
+        boundaryMask,
+        w,
+        primaryMosaic.mpp,
+        species
+      );
+      rawCandidates.push(...tileCands);
+    }
+  }
+
+  // Merge SAHI slice overlaps using NMS (IoU = 0.45)
+  const minCenterDistPx = Math.max(5, Math.round(2.3 / Math.max(primaryMosaic.mpp, 0.12)));
+  const nmsMerged = mergeDetectionsNMS(rawCandidates, 0.45, minCenterDistPx);
+
+  // Stage 3: Cast-Shadow & Laplacian Texture Variance Post-Filter
+  const boxes = filterByShadowAndTexture(
+    nmsMerged,
     imgData,
-    farmMask,
+    strictMask,
     boundaryMask,
-    cLat,
-    zoom
+    primaryMosaic.mpp,
+    species
   );
+
+  // Count metrics: when inwardBufferM < 0, border windbreaks are clipped out, so count verified orchard trees cleanly
+  const boundaryBoxes = boxes.filter((b) => b.onBoundary);
+  const interiorBoxes = boxes.filter((b) => !b.onBoundary);
+  const primaryBoxes = inwardBufferM < -0.5 ? boxes : boundaryBoxes;
+
+  const counts = {
+    lo: primaryBoxes.filter((b) => b.score >= AI_BAND[0]).length,
+    mid: primaryBoxes.filter((b) => b.score >= AI_BAND[1]).length,
+    hi: primaryBoxes.filter((b) => b.score >= AI_BAND[2]).length,
+    interiorMid: interiorBoxes.filter((b) => b.score >= AI_BAND[1]).length,
+  };
+
+  const midBoxes = primaryBoxes.filter((b) => b.score >= AI_BAND[1]);
+  let crownM: number | null = null;
+  if (midBoxes.length > 0) {
+    const sides = midBoxes
+      .map((b) => Math.sqrt((b.xmax - b.xmin) * (b.ymax - b.ymin)) * primaryMosaic!.mpp)
+      .sort((a, b) => a - b);
+    crownM = Number(sides[Math.floor(sides.length / 2)].toFixed(2));
+  }
 
   const factor = calibFactor(species);
   const aiLow = Math.round(counts.lo * factor);
   const aiCount = Math.round(counts.mid * factor);
   const aiHigh = Math.round(counts.hi * factor);
 
-  const annotatedImageUrl = renderAnnotatedSatellite(
+  const { cleanImageUrl, annotatedImageUrl } = renderCleanAndAnnotatedCanvases(
     canvas,
-    farmMask,
-    ring,
-    strokePx,
+    strictMask,
+    primaryMosaic.ring,
+    primaryMosaic.clippedRing,
     boxes,
-    provider,
-    zoom
+    primaryMosaic.provider,
+    primaryMosaic.zoom,
+    detectorEngine,
+    inwardBufferM
   );
 
   const meta = await metaPromise;
@@ -1096,16 +1485,14 @@ export async function analyzeFarmSatellite(params: {
 
   let ndviRecent: number | null = null;
   if (useNdvi) {
-    // Derive calibrated greenness-based NDVI estimate anchored to Sentinel-2 availability & ExG cover
     let interiorGreen = 0;
     let interiorTotal = 0;
-    for (let i = 0; i < canvas.width * canvas.height; i++) {
-      if (!farmMask[i]) continue;
+    for (let i = 0; i < w * h; i++) {
+      if (!strictMask[i]) continue;
       const idx = i * 4;
       const r = imgData.data[idx];
       const g = imgData.data[idx + 1];
-      const vri = (g - r) / (g + r + 1e-6);
-      interiorGreen += vri;
+      interiorGreen += (g - r) / (g + r + 1e-6);
       interiorTotal++;
     }
     const meanVari = interiorTotal > 0 ? interiorGreen / interiorTotal : 0;
@@ -1128,8 +1515,23 @@ export async function analyzeFarmSatellite(params: {
     imageryDate,
     imgAge,
     ndviRecent,
-    zoomUsed: zoom,
-    provider,
+    zoomUsed: primaryMosaic.zoom,
+    mpp: Number(primaryMosaic.mpp.toFixed(3)),
+    provider: primaryMosaic.provider,
+    providerId: primaryMosaic.providerId,
+    detectorEngine,
+    inwardBufferM,
+    offsetX_m,
+    offsetY_m,
+    canvasWidth: w,
+    canvasHeight: h,
+    ringPx: primaryMosaic.ring,
+    clippedRingPx: primaryMosaic.clippedRing,
+    boxes,
+    cleanImageUrl,
     annotatedImageUrl,
+    compareImageUrl,
+    compareProvider,
+    compareZoomUsed,
   };
 }

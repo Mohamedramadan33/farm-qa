@@ -12,3 +12,5 @@ streamlit-folium>=0.22.0
 scipy>=1.11.0
 geopy>=2.4.0
 opencv-python-headless>=4.8.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2

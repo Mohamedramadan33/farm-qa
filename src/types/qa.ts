@@ -76,13 +76,32 @@ export type LabelMap = Record<string, [string, string]>;
 export type PointLonLat = [number, number];
 export type PointLatLon = [number, number];
 
+export type TreeClassName = 'orchard_tree' | 'palm_tree' | 'windbreak_tree';
+export type BasemapProvider = 'google' | 'esri';
+export type BasemapViewMode = 'google' | 'esri' | 'compare';
+
+export interface SatelliteCalibrationOptions {
+  providerMode: BasemapViewMode;
+  offsetX_m: number;
+  offsetY_m: number;
+  inwardBufferM: number;
+}
+
 export interface TreeDetectionBox {
+  id: number;
   xmin: number;
   ymin: number;
   xmax: number;
   ymax: number;
+  cx: number;
+  cy: number;
+  radiusPx: number;
   score: number;
+  classId: 0 | 1 | 2;
+  className: TreeClassName;
   onBoundary: boolean;
+  shadowDrop: number;
+  laplacianVar: number;
 }
 
 export interface SatelliteAnalysisResult {
@@ -98,8 +117,23 @@ export interface SatelliteAnalysisResult {
   imgAge: number | null;
   ndviRecent: number | null;
   zoomUsed: number;
+  mpp: number;
   provider: string;
+  providerId: BasemapProvider;
+  detectorEngine: string;
+  inwardBufferM: number;
+  offsetX_m: number;
+  offsetY_m: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  ringPx: Array<[number, number]>;
+  clippedRingPx: Array<[number, number]>;
+  boxes: TreeDetectionBox[];
+  cleanImageUrl: string;
   annotatedImageUrl: string;
+  compareImageUrl?: string | null;
+  compareProvider?: string | null;
+  compareZoomUsed?: number | null;
   aiError?: string;
 }
 

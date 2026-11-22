@@ -1,6 +1,10 @@
 import express from 'express';
+import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { SEED_LABELS, SEED_SUBMISSIONS } from './src/server/seedSubmissions.ts';
 import { divideWorkFairly, type UnvalidatedFarmItem } from './src/lib/workDivider.ts';
 import {
@@ -15,10 +19,36 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const execFileAsync = promisify(execFile);
 
 const PORT = Number(process.env.PORT || 3000);
 const KOBO_SERVER = (process.env.KOBO_SERVER || 'https://kf.kobotoolbox.org').replace(/\/+$/, '');
 const KOBO_ASSET_UID = process.env.KOBO_ASSET_UID || 'aX4NJWgge6tooXjfSYXhrq';
+
+const TREE_CLASSES = ['orchard_tree', 'palm_tree', 'windbreak_tree'] as const;
+
+function resolveConfinedModel(relCandidates: string[]): string | null {
+  for (const rel of relCandidates) {
+    const resolved = path.resolve(__dirname, rel);
+    if (!resolved.startsWith(__dirname + path.sep)) continue;
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+      return resolved;
+    }
+  }
+  return null;
+}
+
+let cachedPyYoloAvail: boolean | null = null;
+async function checkPythonYoloAvailable(): Promise<boolean> {
+  if (cachedPyYoloAvail !== null) return cachedPyYoloAvail;
+  try {
+    await execFileAsync('python3', ['-c', 'import ultralytics'], { timeout: 4000 });
+    cachedPyYoloAvail = true;
+  } catch {
+    cachedPyYoloAvail = false;
+  }
+  return cachedPyYoloAvail;
+}
 
 function nowStr(): string {
   const d = new Date();
@@ -461,6 +491,129 @@ async function startServer() {
       imageryDateIso,
       ndviSceneFound,
       ndviSceneCloud,
+    });
+  });
+
+  // 5b. Satellite AI Model Status, ONNX Serving & YOLO Backend Inference Route
+  app.get('/api/satellite/model-status', async (_req, res) => {
+    const onnxPath = resolveConfinedModel(['public/models/best.onnx', 'models/best.onnx']);
+    const ptPath = resolveConfinedModel(['models/best.pt', 'best.pt']);
+    const remoteUrl = (process.env.YOLO_INFER_URL || '').trim();
+    const pyReady = ptPath ? await checkPythonYoloAvailable() : false;
+
+    res.json({
+      ok: true,
+      onnxReady: Boolean(onnxPath),
+      onnxUrl: onnxPath ? '/models/best.onnx' : null,
+      ptReady: Boolean(ptPath),
+      backendYoloReady: Boolean(remoteUrl || pyReady),
+      classes: TREE_CLASSES,
+    });
+  });
+
+  app.get('/models/best.onnx', (_req, res) => {
+    const onnxPath = resolveConfinedModel(['public/models/best.onnx', 'models/best.onnx']);
+    if (!onnxPath) {
+      res.status(404).json({ error: 'ONNX model weights not exported yet' });
+      return;
+    }
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.sendFile(onnxPath);
+  });
+
+  app.post('/api/satellite/detect', async (req, res) => {
+    const { imageBase64, conf = 0.25, iou = 0.45 } = (req.body || {}) as {
+      imageBase64?: unknown;
+      conf?: unknown;
+      iou?: unknown;
+    };
+
+    if (typeof imageBase64 !== 'string' || imageBase64.length < 64 || imageBase64.length > 8_000_000) {
+      res.status(400).json({ ok: false, error: 'Valid imageBase64 payload is required' });
+      return;
+    }
+
+    const confNum = Math.max(0.05, Math.min(0.95, Number(conf) || 0.25));
+    const iouNum = Math.max(0.1, Math.min(0.9, Number(iou) || 0.45));
+
+    // Option A: Remote GPU/YOLO microservice if configured via server env
+    const remoteUrlRaw = (process.env.YOLO_INFER_URL || '').trim();
+    if (remoteUrlRaw) {
+      try {
+        const parsed = new URL(remoteUrlRaw);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          throw new Error('Invalid YOLO_INFER_URL protocol');
+        }
+        const upstream = await fetch(parsed.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ imageBase64, conf: confNum, iou: iouNum }),
+          signal: AbortSignal.timeout(20000),
+        });
+        if (upstream.ok) {
+          const data = (await upstream.json()) as { boxes?: unknown[] };
+          res.json({
+            ok: true,
+            engine: 'YOLO Remote API',
+            boxes: Array.isArray(data.boxes) ? data.boxes : [],
+          });
+          return;
+        }
+      } catch {
+        // Fall through to local Python check or clean fallback signal
+      }
+    }
+
+    // Option B: Local Python Ultralytics runtime on models/best.pt
+    const ptPath = resolveConfinedModel(['models/best.pt', 'best.pt']);
+    if (ptPath && (await checkPythonYoloAvailable())) {
+      const cleanB64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+      const buf = Buffer.from(cleanB64, 'base64');
+      const tmpImg = path.join(os.tmpdir(), `tile_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`);
+      try {
+        fs.writeFileSync(tmpImg, buf);
+        const pyScript = [
+          'import json, sys',
+          'from ultralytics import YOLO',
+          'model = YOLO(sys.argv[1])',
+          'res = model.predict(source=sys.argv[2], conf=float(sys.argv[3]), iou=float(sys.argv[4]), verbose=False)',
+          'out = []',
+          'if res and len(res) > 0 and res[0].boxes is not None:',
+          '    for b in res[0].boxes:',
+          '        x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]',
+          '        cls_id = int(b.cls[0].item()) if b.cls is not None else 0',
+          '        score = float(b.conf[0].item()) if b.conf is not None else 0.5',
+          '        out.append({"xmin": x1, "ymin": y1, "xmax": x2, "ymax": y2, "classId": cls_id, "score": score})',
+          'print(json.dumps({"boxes": out}))',
+        ].join('\n');
+        const { stdout } = await execFileAsync(
+          'python3',
+          ['-c', pyScript, ptPath, tmpImg, String(confNum), String(iouNum)],
+          { timeout: 25000 }
+        );
+        const parsed = JSON.parse(stdout.trim() || '{"boxes":[]}');
+        res.json({
+          ok: true,
+          engine: `YOLOv8 Backend (${path.basename(ptPath)})`,
+          boxes: Array.isArray(parsed.boxes) ? parsed.boxes : [],
+        });
+        return;
+      } catch {
+        // Fall through cleanly
+      } finally {
+        try {
+          if (fs.existsSync(tmpImg)) fs.unlinkSync(tmpImg);
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+    }
+
+    res.json({
+      ok: false,
+      engine: 'unavailable',
+      boxes: [],
     });
   });
 

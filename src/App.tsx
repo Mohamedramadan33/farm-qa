@@ -29,6 +29,8 @@ import {
   type LabelMap,
   type MasterReviewRecord,
   type RawKoboSubmission,
+  type SatelliteAnalysisResult,
+  type SatelliteCalibrationOptions,
   type TeamMemberKey,
   type UserSession,
   type WorklistItem,
@@ -106,6 +108,7 @@ export function App() {
   const [autoSat, setAutoSat] = useState(true);
   const [useNdvi, setUseNdvi] = useState(false);
   const [satelliteImages, setSatelliteImages] = useState<Record<string, string>>({});
+  const [satelliteResults, setSatelliteResults] = useState<Record<string, SatelliteAnalysisResult>>({});
   const [runningSatelliteFarmId, setRunningSatelliteFarmId] = useState<string | null>(null);
 
   // Toast feedback
@@ -260,7 +263,7 @@ export function App() {
 
   // Satellite AI execution
   const handleRunSatelliteAi = useCallback(
-    async (farmId: string) => {
+    async (farmId: string, calibration?: Partial<SatelliteCalibrationOptions>) => {
       const target = loadedRecords.find((r) => r.farm_id === farmId);
       if (!target || !target._poly) return;
 
@@ -269,14 +272,20 @@ export function App() {
       );
       setRunningSatelliteFarmId(farmId);
       try {
+        const prevRes = satelliteResults[farmId];
         const res = await analyzeFarmSatellite({
           poly: target._poly,
           species: target.species,
           submissionTime: target.submission_time,
           useNdvi,
+          providerMode: calibration?.providerMode ?? prevRes?.providerId ?? 'google',
+          offsetX_m: calibration?.offsetX_m ?? prevRes?.offsetX_m ?? 0,
+          offsetY_m: calibration?.offsetY_m ?? prevRes?.offsetY_m ?? 0,
+          inwardBufferM: calibration?.inwardBufferM ?? prevRes?.inwardBufferM ?? -1.5,
         });
 
         setSatelliteImages((prev) => ({ ...prev, [farmId]: res.annotatedImageUrl }));
+        setSatelliteResults((prev) => ({ ...prev, [farmId]: res }));
 
         setLoadedRecords((prev) =>
           prev.map((rec) => {
@@ -324,7 +333,7 @@ export function App() {
         setRunningSatelliteFarmId(null);
       }
     },
-    [loadedRecords, useNdvi, pushToast]
+    [loadedRecords, satelliteResults, useNdvi, pushToast]
   );
 
   // Auto-run satellite AI when opening a farm if enabled and not yet analyzed/errored
@@ -716,6 +725,7 @@ export function App() {
                 labelMap={labelMap}
                 auditorName={user.name}
                 satelliteImages={satelliteImages}
+                satelliteResults={satelliteResults}
                 runningSatelliteFarmId={runningSatelliteFarmId}
                 onRunSatelliteAi={handleRunSatelliteAi}
                 savedFieldDecisions={fieldReviews}

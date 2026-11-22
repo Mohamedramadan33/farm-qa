@@ -351,3 +351,125 @@ export function polygonIoU(polyA: PointLonLat[], polyB: PointLonLat[]): number {
   }
   return union > 0 ? inter / union : 0;
 }
+
+/**
+ * Translates a lon/lat polygon in meters (+offsetX_m East, +offsetY_m North)
+ * to calibrate imagery-to-GPS alignment shifts (e.g. 2-6m offset on Google Satellite).
+ */
+export function shiftPolygonMeters(
+  poly: PointLonLat[],
+  offsetX_m: number,
+  offsetY_m: number
+): PointLonLat[] {
+  if (!poly.length || (Math.abs(offsetX_m) < 1e-6 && Math.abs(offsetY_m) < 1e-6)) {
+    return poly;
+  }
+  const [, cLat] = polygonCentroid(poly);
+  const dLat = offsetY_m / 111139.0;
+  const dLon = offsetX_m / (111139.0 * Math.max(0.2, Math.cos((cLat * Math.PI) / 180)));
+  return poly.map(([lon, lat]) => [lon + dLon, lat + dLat]);
+}
+
+/**
+ * Buffers a closed polygon inward (bufferM < 0, e.g. -1.5m) or outward (bufferM > 0)
+ * using mitered edge-normal offsets in local meters. Clamps miter spikes cleanly.
+ */
+export function bufferPolygonMeters(poly: PointLonLat[], bufferM: number): PointLonLat[] {
+  if (!poly || poly.length < 3 || Math.abs(bufferM) < 0.05) {
+    return poly;
+  }
+
+  const open =
+    poly[0][0] === poly[poly.length - 1][0] && poly[0][1] === poly[poly.length - 1][1]
+      ? poly.slice(0, -1)
+      : [...poly];
+  if (open.length < 3) return poly;
+
+  const [cLon, cLat] = polygonCentroid(open);
+  const mPerDegLat = 111139.0;
+  const mPerDegLon = 111139.0 * Math.max(0.2, Math.cos((cLat * Math.PI) / 180));
+
+  const ptsM: Array<[number, number]> = open.map(([lon, lat]) => [
+    (lon - cLon) * mPerDegLon,
+    (lat - cLat) * mPerDegLat,
+  ]);
+
+  // Signed area in m^2: >0 => CCW, <0 => CW
+  let area2 = 0;
+  for (let i = 0; i < ptsM.length; i++) {
+    const [x1, y1] = ptsM[i];
+    const [x2, y2] = ptsM[(i + 1) % ptsM.length];
+    area2 += x1 * y2 - x2 * y1;
+  }
+  if (Math.abs(area2) < 1.0) return poly;
+  const ccwSign = area2 > 0 ? 1 : -1;
+
+  // For CCW polygon, outward right-hand normal is (dy, -dx)/len; inward normal is (-dy, dx)/len
+  // So moving by `bufferM` (>0 outward, <0 inward) multiplies inward normal by (-bufferM * ccwSign)
+  const n = ptsM.length;
+  const offsetEdges: Array<{ p: [number, number]; d: [number, number] }> = [];
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = ptsM[i];
+    const [x2, y2] = ptsM[(i + 1) % n];
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-4) continue;
+    // Outward unit normal for CCW is (dy/len, -dx/len)
+    const nx = (dy / len) * ccwSign;
+    const ny = (-dx / len) * ccwSign;
+    offsetEdges.push({
+      p: [x1 + nx * bufferM, y1 + ny * bufferM],
+      d: [dx / len, dy / len],
+    });
+  }
+  if (offsetEdges.length < 3) return poly;
+
+  const outM: Array<[number, number]> = [];
+  const m = offsetEdges.length;
+  const maxMiter = Math.abs(bufferM) * 3.0;
+
+  for (let i = 0; i < m; i++) {
+    const e1 = offsetEdges[(i - 1 + m) % m];
+    const e2 = offsetEdges[i];
+    const denom = e1.d[0] * e2.d[1] - e1.d[1] * e2.d[0];
+    const origV = ptsM[i % ptsM.length];
+    if (Math.abs(denom) < 1e-3) {
+      outM.push(e2.p);
+      continue;
+    }
+    const rx = e2.p[0] - e1.p[0];
+    const ry = e2.p[1] - e1.p[1];
+    const t = (rx * e2.d[1] - ry * e2.d[0]) / denom;
+    const ix = e1.p[0] + t * e1.d[0];
+    const iy = e1.p[1] + t * e1.d[1];
+    const dist = Math.hypot(ix - origV[0], iy - origV[1]);
+    if (dist > maxMiter && dist > 1e-4) {
+      const clampScale = maxMiter / dist;
+      outM.push([
+        origV[0] + (ix - origV[0]) * clampScale,
+        origV[1] + (iy - origV[1]) * clampScale,
+      ]);
+    } else {
+      outM.push([ix, iy]);
+    }
+  }
+
+  // Ensure shrunk polygon did not invert
+  let newArea2 = 0;
+  for (let i = 0; i < outM.length; i++) {
+    const [x1, y1] = outM[i];
+    const [x2, y2] = outM[(i + 1) % outM.length];
+    newArea2 += x1 * y2 - x2 * y1;
+  }
+  if (newArea2 * area2 <= 0) {
+    return poly;
+  }
+
+  const outPoly: PointLonLat[] = outM.map(([mx, my]) => [
+    cLon + mx / mPerDegLon,
+    cLat + my / mPerDegLat,
+  ]);
+  outPoly.push(outPoly[0]);
+  return outPoly;
+}

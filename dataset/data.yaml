@@ -1,8 +1,11 @@
-# YOLOv8 Tree Crown Detection Dataset Configuration
+# YOLOv8 Multi-Class Tree Crown Detection Dataset Configuration
+# Includes 30% Hard Negative background images (empty .txt label files for flat crops)
 path: ./dataset
 train: images/train
 val: images/val
 
-# Classes
+nc: 3
 names:
-  0: tree
+  0: orchard_tree
+  1: palm_tree
+  2: windbreak_tree

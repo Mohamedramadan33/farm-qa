@@ -42,10 +42,15 @@ import {
   type FormStatus,
   type ItemDecision,
   type LabelMap,
+  type BasemapViewMode,
   type MasterReviewRecord,
   type MediaQuestionItem,
   type PointLatLon,
   type RawKoboSubmission,
+  type SatelliteAnalysisResult,
+  type SatelliteCalibrationOptions,
+  type TreeClassName,
+  type TreeDetectionBox,
 } from '../types/qa';
 
 interface ReviewViewProps {
@@ -57,8 +62,12 @@ interface ReviewViewProps {
   labelMap: LabelMap;
   auditorName: string;
   satelliteImages: Record<string, string>;
+  satelliteResults: Record<string, SatelliteAnalysisResult>;
   runningSatelliteFarmId: string | null;
-  onRunSatelliteAi: (farmId: string) => Promise<void>;
+  onRunSatelliteAi: (
+    farmId: string,
+    calibration?: Partial<SatelliteCalibrationOptions>
+  ) => Promise<void>;
   savedFieldDecisions: Record<string, FieldDecisionRow[]>;
   onSaveDecision: (params: {
     master: MasterReviewRecord;
@@ -90,6 +99,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   labelMap,
   auditorName,
   satelliteImages,
+  satelliteResults,
   runningSatelliteFarmId,
   onRunSatelliteAi,
   savedFieldDecisions,
@@ -117,9 +127,17 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   const [saving, setSaving] = useState(false);
   const [syncingAirtable, setSyncingAirtable] = useState(false);
 
-  // Image lightbox state
+  // Image lightbox & interactive satellite viewport state
   const [lightbox, setLightbox] = useState<{ url: string; title: string } | null>(null);
   const [brokenUrls, setBrokenUrls] = useState<Set<string>>(new Set());
+
+  const [providerMode, setProviderMode] = useState<BasemapViewMode>('google');
+  const [offsetX_m, setOffsetX_m] = useState<number>(0);
+  const [offsetY_m, setOffsetY_m] = useState<number>(0);
+  const [inwardBufferM, setInwardBufferM] = useState<number>(-1.5);
+  const [showCompactIds, setShowCompactIds] = useState<boolean>(false);
+  const [hoveredTree, setHoveredTree] = useState<TreeDetectionBox | null>(null);
+  const [pinnedTree, setPinnedTree] = useState<TreeDetectionBox | null>(null);
 
   const auditRec = useMemo(
     () => records.find((r) => r.farm_id === selectedFarmId) || records[0],
@@ -283,6 +301,17 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
       FORM_STATUS_CHOICES.includes(auditRec.Form_Status) ? auditRec.Form_Status : STATUS_PENDING
     );
   }, [auditRec?.farm_id, auditRec?.verdict, auditRec?.area_check, savedFieldDecisions]);
+
+  // Sync calibration controls & clear active tooltip when switching farms
+  useEffect(() => {
+    if (!auditRec) return;
+    const res = satelliteResults[auditRec.farm_id];
+    setOffsetX_m(res?.offsetX_m ?? 0);
+    setOffsetY_m(res?.offsetY_m ?? 0);
+    setInwardBufferM(res?.inwardBufferM ?? -1.5);
+    setHoveredTree(null);
+    setPinnedTree(null);
+  }, [auditRec?.farm_id]);
 
   // Run PGS Business Rules Audit (independent of UI display toggles, matching app.py line 919)
   const allPresentRulesItems = useMemo(() => {
@@ -460,9 +489,51 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   if (!auditRec) return null;
 
   const satImg = satelliteImages[auditRec.farm_id];
+  const satRes = satelliteResults[auditRec.farm_id];
   const isRunningSat = runningSatelliteFarmId === auditRec.farm_id;
   const hasValidGps = auditRec._poly !== null;
   const reviewedList = records.filter((r) => r.Form_Status !== STATUS_PENDING);
+  const activeTree = hoveredTree || pinnedTree;
+
+  const classLabelAr: Record<TreeClassName, string> = {
+    orchard_tree: 'شجرة بستان (Orchard)',
+    palm_tree: 'نخيل (Palm)',
+    windbreak_tree: 'مصدات رياح (Windbreak)',
+  };
+  const classStroke: Record<TreeClassName, string> = {
+    orchard_tree: '#10b981',
+    palm_tree: '#f59e0b',
+    windbreak_tree: '#06b6d4',
+  };
+
+  const classCounts = (satRes?.boxes || []).reduce(
+    (acc, b) => {
+      acc[b.className] = (acc[b.className] || 0) + 1;
+      return acc;
+    },
+    { orchard_tree: 0, palm_tree: 0, windbreak_tree: 0 } as Record<TreeClassName, number>
+  );
+
+  const calibrationDirty =
+    satRes !== undefined &&
+    (Math.abs(offsetX_m - satRes.offsetX_m) >= 0.1 ||
+      Math.abs(offsetY_m - satRes.offsetY_m) >= 0.1 ||
+      Math.abs(inwardBufferM - satRes.inwardBufferM) >= 0.1);
+
+  const previewDxPx = satRes ? (offsetX_m - satRes.offsetX_m) / Math.max(satRes.mpp, 0.1) : 0;
+  const previewDyPx = satRes ? -(offsetY_m - satRes.offsetY_m) / Math.max(satRes.mpp, 0.1) : 0;
+
+  const triggerSatelliteWithCalib = (nextMode: BasemapViewMode = providerMode) => {
+    setProviderMode(nextMode);
+    setHoveredTree(null);
+    setPinnedTree(null);
+    void onRunSatelliteAi(auditRec.farm_id, {
+      providerMode: nextMode,
+      offsetX_m,
+      offsetY_m,
+      inwardBufferM,
+    });
+  };
 
   return (
     <div className="space-y-6">
@@ -652,7 +723,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
         <div className="space-y-6">
           {/* Top Split: Satellite Boundary Verdict + Annotated Satellite Imagery */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-            <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between space-y-4">
+            <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between space-y-4">
               <div className="space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
                   <div>
@@ -674,7 +745,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                   <button
                     type="button"
                     disabled={isRunningSat || !hasValidGps}
-                    onClick={() => onRunSatelliteAi(auditRec.farm_id)}
+                    onClick={() => triggerSatelliteWithCalib(providerMode)}
                     className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap cursor-pointer"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${isRunningSat ? 'animate-spin' : ''}`} />
@@ -792,46 +863,317 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
               </div>
             </div>
 
-            {/* Satellite Mosaic Viewport */}
-            <div className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
-              {satImg ? (
-                <div className="space-y-2.5 h-full flex flex-col">
-                  <div className="relative flex-1 min-h-[270px] bg-slate-900 rounded-lg overflow-hidden group">
-                    <img
-                      src={satImg}
-                      alt={`Annotated satellite boundary and detected perimeter trees for farm ${auditRec.farm_id}`}
-                      referrerPolicy="no-referrer"
-                      className="w-full h-full object-contain cursor-zoom-in"
-                      onClick={() =>
-                        setLightbox({
-                          url: satImg,
-                          title: `Farm ${auditRec.farm_id} — Boundary & Detected Perimeter Trees (${fmtVal(
-                            auditRec.ai_count
-                          )})`,
-                        })
-                      }
-                    />
+            {/* Satellite Mosaic Viewport & Geospatial Calibration */}
+            <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between space-y-3">
+              {/* Basemap Switcher & Compact ID Toggle */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100">
+                <div className="inline-flex items-center gap-1 p-0.5 bg-slate-100 rounded-lg text-[11px] font-medium">
+                  {(
+                    [
+                      { id: 'google', label: 'Google (Z19-20)' },
+                      { id: 'esri', label: 'Esri (Z18-19)' },
+                      { id: 'compare', label: 'Side-by-Side Compare' },
+                    ] as Array<{ id: BasemapViewMode; label: string }>
+                  ).map((opt) => (
                     <button
+                      key={opt.id}
                       type="button"
-                      onClick={() =>
-                        setLightbox({
-                          url: satImg,
-                          title: `Farm ${auditRec.farm_id} — Boundary & Detected Perimeter Trees`,
-                        })
-                      }
-                      className="absolute bottom-2.5 right-2.5 inline-flex items-center gap-1 px-2.5 py-1 bg-slate-900/80 hover:bg-slate-900 text-white text-[11px] rounded-md transition-opacity cursor-pointer"
+                      disabled={isRunningSat || !hasValidGps}
+                      onClick={() => triggerSatelliteWithCalib(opt.id)}
+                      className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                        providerMode === opt.id
+                          ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
                     >
-                      <Maximize2 className="w-3 h-3" />
-                      <span>تكبير الصورة</span>
+                      {opt.label}
                     </button>
+                  ))}
+                </div>
+
+                <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-700 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={showCompactIds}
+                    onChange={(e) => setShowCompactIds(e.target.checked)}
+                    className="rounded border-slate-300 text-emerald-700 focus:ring-emerald-600"
+                  />
+                  <span>Compact IDs (أرقام الأشجار)</span>
+                </label>
+              </div>
+
+              {satRes ? (
+                <div className="space-y-2.5 flex-1 flex flex-col">
+                  <div
+                    className={`grid gap-2.5 flex-1 ${
+                      providerMode === 'compare' && satRes.compareImageUrl
+                        ? 'grid-cols-1 sm:grid-cols-2'
+                        : 'grid-cols-1'
+                    }`}
+                  >
+                    {/* Primary Interactive Viewport (Clean Image + Interactive SVG Canopy Circles) */}
+                    <div
+                      className="relative min-h-[260px] bg-slate-950 rounded-lg overflow-hidden border border-slate-800"
+                      onClick={() => setPinnedTree(null)}
+                    >
+                      <div
+                        className="relative w-full h-full flex items-center justify-center"
+                        style={{ aspectRatio: `${satRes.canvasWidth} / ${satRes.canvasHeight}` }}
+                      >
+                        <img
+                          src={satRes.cleanImageUrl}
+                          alt={`Satellite canopy detection for farm ${auditRec.farm_id}`}
+                          referrerPolicy="no-referrer"
+                          className="w-full h-full object-contain select-none"
+                        />
+                        <svg
+                          viewBox={`0 0 ${satRes.canvasWidth} ${satRes.canvasHeight}`}
+                          className="absolute inset-0 w-full h-full"
+                        >
+                          {/* Live preview outline when dragging X/Y calibration sliders */}
+                          {calibrationDirty && satRes.ringPx.length >= 3 && (
+                            <polygon
+                              points={satRes.ringPx
+                                .map(([x, y]) => `${x + previewDxPx},${y + previewDyPx}`)
+                                .join(' ')}
+                              fill="none"
+                              stroke="#f97316"
+                              strokeWidth={2}
+                              strokeDasharray="6 4"
+                            />
+                          )}
+
+                          {/* Clean Canopy Circles with Interactive Hover/Click */}
+                          {satRes.boxes.map((tree) => {
+                            const stroke = classStroke[tree.className] || '#10b981';
+                            const isSelected = activeTree?.id === tree.id;
+                            const r = Math.max(4, tree.radiusPx);
+                            return (
+                              <g
+                                key={tree.id}
+                                className="cursor-pointer"
+                                onMouseEnter={() => setHoveredTree(tree)}
+                                onMouseLeave={() => setHoveredTree(null)}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setPinnedTree((cur) => (cur?.id === tree.id ? null : tree));
+                                }}
+                              >
+                                {/* Larger invisible hit area */}
+                                <circle cx={tree.cx} cy={tree.cy} r={Math.max(10, r + 4)} fill="transparent" />
+                                <circle
+                                  cx={tree.cx}
+                                  cy={tree.cy}
+                                  r={isSelected ? r + 2 : r}
+                                  fill={isSelected ? `${stroke}44` : `${stroke}22`}
+                                  stroke={isSelected ? '#ffffff' : stroke}
+                                  strokeWidth={isSelected ? 2.4 : 1.7}
+                                />
+                                <circle cx={tree.cx} cy={tree.cy} r={2} fill={stroke} />
+                                {showCompactIds && (
+                                  <text
+                                    x={tree.cx}
+                                    y={tree.cy - r - 2}
+                                    textAnchor="middle"
+                                    fill="#ffffff"
+                                    stroke="#0f172a"
+                                    strokeWidth={2.5}
+                                    paintOrder="stroke"
+                                    fontSize="9"
+                                    fontWeight="700"
+                                  >
+                                    {tree.id}
+                                  </text>
+                                )}
+                              </g>
+                            );
+                          })}
+                        </svg>
+
+                        {/* Interactive Hover / Click Tooltip */}
+                        {activeTree && (
+                          <div
+                            className="absolute z-20 pointer-events-none px-2.5 py-2 rounded-lg bg-slate-900/95 border border-slate-700 text-white text-[11px] shadow-lg max-w-[230px]"
+                            style={{
+                              left: `${Math.min(72, Math.max(4, (activeTree.cx / satRes.canvasWidth) * 100))}%`,
+                              top: `${Math.min(72, Math.max(4, (activeTree.cy / satRes.canvasHeight) * 100))}%`,
+                            }}
+                          >
+                            <div className="flex items-center justify-between gap-3 font-semibold">
+                              <span className="font-mono-num text-emerald-300">
+                                Tree #{activeTree.id}
+                              </span>
+                              <span className="font-mono-num text-sky-300">
+                                {Math.round(activeTree.score * 100)}% conf
+                              </span>
+                            </div>
+                            <div className="text-slate-200 mt-0.5">
+                              {classLabelAr[activeTree.className]}
+                            </div>
+                            <div className="text-[10px] font-mono-num text-slate-400 mt-0.5">
+                              Shadow ΔV: {activeTree.shadowDrop.toFixed(2)} · Lap Var:{' '}
+                              {activeTree.laplacianVar}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="absolute top-2 left-2 px-2 py-0.5 rounded bg-slate-900/85 text-[10px] font-mono-num text-sky-300">
+                        {satRes.provider} · Z{satRes.zoomUsed} ({satRes.mpp} m/px)
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setLightbox({
+                            url: satRes.annotatedImageUrl,
+                            title: `Farm ${auditRec.farm_id} — ${satRes.provider} Z${satRes.zoomUsed} (${satRes.boxes.length} trees)`,
+                          });
+                        }}
+                        className="absolute bottom-2 right-2 inline-flex items-center gap-1 px-2 py-1 bg-slate-900/85 hover:bg-slate-900 text-white text-[11px] rounded-md cursor-pointer"
+                      >
+                        <Maximize2 className="w-3 h-3" />
+                        <span>تكبير</span>
+                      </button>
+                    </div>
+
+                    {/* Side-by-Side Comparison Panel (Esri / Alternate Basemap) */}
+                    {providerMode === 'compare' && satRes.compareImageUrl && (
+                      <div className="relative min-h-[260px] bg-slate-950 rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center">
+                        <img
+                          src={satRes.compareImageUrl}
+                          alt={`Comparison imagery (${satRes.compareProvider})`}
+                          referrerPolicy="no-referrer"
+                          className="w-full h-full object-contain cursor-zoom-in"
+                          onClick={() =>
+                            setLightbox({
+                              url: satRes.compareImageUrl!,
+                              title: `Farm ${auditRec.farm_id} — ${satRes.compareProvider} Z${satRes.compareZoomUsed}`,
+                            })
+                          }
+                        />
+                        <div className="absolute top-2 left-2 px-2 py-0.5 rounded bg-slate-900/85 text-[10px] font-mono-num text-amber-300">
+                          {satRes.compareProvider} · Z{satRes.compareZoomUsed}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                  <p className="text-[11px] text-slate-500">
-                    Farm <span className="font-mono-num">{auditRec.farm_id}</span> · Boundary
-                    Corridor (Yellow 8m Belt) &amp; Detected Boundary Trees (Red Boxes:{' '}
-                    <span className="font-mono-num font-semibold text-slate-700">
-                      {fmtVal(auditRec.ai_count)}
+
+                  {/* X/Y Meter Offset Calibration (-10m..+10m) & Inward Boundary Buffer (-1.5m default) */}
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2 text-[11px]">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                      <label className="block">
+                        <div className="flex justify-between text-slate-600 mb-0.5">
+                          <span>Offset X (E/W)</span>
+                          <span className="font-mono-num font-semibold text-slate-900">
+                            {offsetX_m > 0 ? `+${offsetX_m}` : offsetX_m}m
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-10}
+                          max={10}
+                          step={0.5}
+                          value={offsetX_m}
+                          onChange={(e) => setOffsetX_m(Number(e.target.value))}
+                          className="w-full accent-emerald-700"
+                        />
+                      </label>
+
+                      <label className="block">
+                        <div className="flex justify-between text-slate-600 mb-0.5">
+                          <span>Offset Y (N/S)</span>
+                          <span className="font-mono-num font-semibold text-slate-900">
+                            {offsetY_m > 0 ? `+${offsetY_m}` : offsetY_m}m
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-10}
+                          max={10}
+                          step={0.5}
+                          value={offsetY_m}
+                          onChange={(e) => setOffsetY_m(Number(e.target.value))}
+                          className="w-full accent-emerald-700"
+                        />
+                      </label>
+
+                      <label className="block">
+                        <div className="flex justify-between text-slate-600 mb-0.5">
+                          <span>Boundary Buffer</span>
+                          <span className="font-mono-num font-semibold text-slate-900">
+                            {inwardBufferM > 0 ? `+${inwardBufferM}` : inwardBufferM}m
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-5}
+                          max={3}
+                          step={0.5}
+                          value={inwardBufferM}
+                          onChange={(e) => setInwardBufferM(Number(e.target.value))}
+                          className="w-full accent-amber-600"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                      <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-600">
+                        <span className="inline-flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                          Orchard: <strong className="font-mono-num">{classCounts.orchard_tree}</strong>
+                        </span>
+                        <span className="inline-flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-amber-500" />
+                          Palm: <strong className="font-mono-num">{classCounts.palm_tree}</strong>
+                        </span>
+                        <span className="inline-flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-cyan-500" />
+                          Windbreak:{' '}
+                          <strong className="font-mono-num">{classCounts.windbreak_tree}</strong>
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={isRunningSat}
+                          onClick={() => {
+                            setOffsetX_m(0);
+                            setOffsetY_m(0);
+                            setInwardBufferM(-1.5);
+                            void onRunSatelliteAi(auditRec.farm_id, {
+                              providerMode,
+                              offsetX_m: 0,
+                              offsetY_m: 0,
+                              inwardBufferM: -1.5,
+                            });
+                          }}
+                          className="px-2 py-1 text-[11px] text-slate-600 hover:text-slate-900 border border-slate-300 bg-white rounded cursor-pointer"
+                        >
+                          Reset
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isRunningSat}
+                          onClick={() => triggerSatelliteWithCalib(providerMode)}
+                          className="px-2.5 py-1 text-[11px] font-semibold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded cursor-pointer"
+                        >
+                          {calibrationDirty ? 'Apply Calibration' : 'Re-Detect'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-slate-500 flex flex-wrap items-center justify-between gap-2">
+                    <span>
+                      Engine: <strong className="text-slate-700">{satRes.detectorEngine}</strong>
                     </span>
-                    )
+                    <span className="font-mono-num">
+                      Verified: <strong>{satRes.boxes.length}</strong> (Counted:{' '}
+                      <strong>{fmtVal(auditRec.ai_count)}</strong>)
+                    </span>
                   </p>
                 </div>
               ) : !hasValidGps ? (
@@ -850,7 +1192,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                   </div>
                   <button
                     type="button"
-                    onClick={() => onRunSatelliteAi(auditRec.farm_id)}
+                    onClick={() => triggerSatelliteWithCalib(providerMode)}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white text-xs font-medium rounded-md transition-colors cursor-pointer"
                   >
                     <RefreshCw className="w-3.5 h-3.5" />
@@ -864,7 +1206,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                   />
                   <p className="text-xs text-slate-600 max-w-xs">
                     {isRunningSat
-                      ? `Fetching satellite imagery, drawing farm boundary & detecting perimeter trees for Farm ${auditRec.farm_id}...`
+                      ? `Fetching ${providerMode === 'esri' ? 'Esri Z18-19' : 'Google Z19-20'} imagery & running SAHI + Shadow/Texture filter for Farm ${auditRec.farm_id}...`
                       : "Click 'Run Satellite AI Check' to load satellite boundary & tree detections."}
                   </p>
                 </div>

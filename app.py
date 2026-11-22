@@ -331,7 +331,7 @@ def run_cached_satellite_canopy(
     detection_mode: str,
     sensitivity: float,
 ) -> Dict[str, Any]:
-    """Caches heavy satellite downloading & CV analysis per farm/mode to prevent Streamlit rerun stalls."""
+    """Caches high-resolution satellite downloading & SAHI/YOLO CV analysis per farm/mode."""
     coords_list = [tuple(pt) for pt in coords_tuple] if coords_tuple else None
     res = core.analyze_farm_satellite_canopy(
         coords_list,
@@ -341,13 +341,15 @@ def run_cached_satellite_canopy(
         recorded_kobo_count=kobo_trees,
         detection_mode=detection_mode,
         sensitivity=round(float(sensitivity), 2),
+        target_zoom=19,
+        tile_overlap=0.25,
     )
     out = dict(res)
     for img_key in ("annotated_img", "clean_img"):
         pil_img = out.get(img_key)
         if pil_img is not None:
             buf = BytesIO()
-            pil_img.save(buf, format="JPEG", quality=90)
+            pil_img.save(buf, format="PNG", optimize=True)
             out[f"{img_key}_bytes"] = buf.getvalue()
         else:
             out[f"{img_key}_bytes"] = None

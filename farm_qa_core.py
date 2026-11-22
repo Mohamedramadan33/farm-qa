@@ -1054,24 +1054,51 @@ def calculate_required_logistic_trees(
     }
 
 
+def _enhance_satellite_mosaic(img: Image.Image) -> Image.Image:
+    """
+    Enhances satellite mosaic micro-contrast & crown edge crispness using LAB L-channel CLAHE
+    + Gaussian unsharp masking (preserving chromaticity for accurate ExG/VARI spectral filtering).
+    Falls back cleanly to PIL UnsharpMask if OpenCV is unavailable.
+    """
+    cv2_mod = getattr(ndvi_mod, "cv2", None)
+    if getattr(ndvi_mod, "HAS_OPENCV", False) and cv2_mod is not None:
+        try:
+            rgb = np.array(img.convert("RGB"), dtype=np.uint8)
+            lab = cv2_mod.cvtColor(rgb, cv2_mod.COLOR_RGB2LAB)
+            l_ch, a_ch, b_ch = cv2_mod.split(lab)
+            clahe = cv2_mod.createCLAHE(clipLimit=1.4, tileGridSize=(8, 8))
+            l_enhanced = clahe.apply(l_ch)
+            lab_enhanced = cv2_mod.merge((l_enhanced, a_ch, b_ch))
+            rgb_cl = cv2_mod.cvtColor(lab_enhanced, cv2_mod.COLOR_LAB2RGB)
+            blurred = cv2_mod.GaussianBlur(rgb_cl, (0, 0), sigmaX=1.2)
+            sharpened = cv2_mod.addWeighted(rgb_cl, 1.32, blurred, -0.32, 0)
+            return Image.fromarray(np.clip(sharpened, 0, 255).astype(np.uint8))
+        except Exception:
+            pass
+    try:
+        return img.filter(ImageFilter.UnsharpMask(radius=1.4, percent=140, threshold=3))
+    except Exception:
+        return img
+
+
 def analyze_farm_satellite_canopy(
     coords_lon_lat: Optional[List[Tuple[float, float]]],
     perimeter_m: float,
     tree_type_str: str = "",
-    zoom: int = 18,
+    zoom: int = 19,
     custom_spacing_m: Optional[float] = None,
     sensitivity: float = 0.5,
     area_feddan: float = 0.0,
     recorded_kobo_count: Optional[int] = None,
     detection_mode: str = "high_precision",
+    target_zoom: Optional[int] = 19,
+    tile_overlap: float = 0.25,
 ) -> Dict[str, Any]:
     """
     وحدة التحليل الجغرافية والبصرية المتكاملة (GIS & Computer Vision Module):
-    - حساب تلقائي لمسافة الغرس الهندسية الثابتة حسب نوع الشجر.
-    - مواءمة مقياس الزووم تلقائياً حسب مساحة المزرعة الفدانية.
-    - استخراج وتحليل مؤشر NDVI/VARI لصحة المجموع الخضري.
-    - رصد وتصنيف الأشجار (سليمة خضراء 🟢 vs مجهدة 🟡 vs ميتة أو تالفة 🔴).
-    - توليد خريطة حرارية ملونة لحالة الغطاء النباتي (NDVI Heatmap Colormap).
+    - جلب صور أقمار صناعية فائقة الدقة حتى Z19 مع التغطية المبطّنة لمحيط المزرعة وتحسين التباين LAB CLAHE.
+    - تحليل SAHI 512x512 متداخل مع Weighted Boxes Fusion (WBF) وعزل المحاصيل المسطحة.
+    - رصد وتصنيف الأشجار (سليمة خضراء 🟢 vs مجهدة 🟡 vs ميتة أو تالفة 🔴) بحزام أمان 3 متر حول المضلع.
     - توليد صورتين منفصلتين: صورة قمر صناعي طبيعية نقية وصورة رصد الأشجار المحللة.
     - إجراء الحساب اللوجستي لعدد الأشجار المطلوبة للحزام الشجري ومقارنتها بالمسجل والمكتشف.
     """
@@ -1119,34 +1146,48 @@ def analyze_farm_satellite_canopy(
             "logistic_analysis": logistic_empty,
         }
 
-    min_lon = min(p[0] for p in coords_lon_lat)
-    max_lon = max(p[0] for p in coords_lon_lat)
-    min_lat = min(p[1] for p in coords_lon_lat)
-    max_lat = max(p[1] for p in coords_lon_lat)
+    raw_min_lon = min(p[0] for p in coords_lon_lat)
+    raw_max_lon = max(p[0] for p in coords_lon_lat)
+    raw_min_lat = min(p[1] for p in coords_lon_lat)
+    raw_max_lat = max(p[1] for p in coords_lon_lat)
 
-    center_lon = (min_lon + max_lon) / 2.0
-    center_lat = (min_lat + max_lat) / 2.0
+    center_lon = (raw_min_lon + raw_max_lon) / 2.0
+    center_lat = (raw_min_lat + raw_max_lat) / 2.0
 
     imagery_date = fetch_satellite_capture_date(center_lon, center_lat)
 
+    # Pad bounding box by ~15m on all sides so boundary shelterbelts + 3m GPS buffer + cast shadows are never clipped
+    pad_lat = 15.0 / 111139.0
+    pad_lon = 15.0 / (111139.0 * max(0.25, math.cos(math.radians(center_lat))))
+    min_lon = raw_min_lon - pad_lon
+    max_lon = raw_max_lon + pad_lon
+    min_lat = max(-85.0, raw_min_lat - pad_lat)
+    max_lat = min(85.0, raw_max_lat + pad_lat)
+
     # Real-world dimensions in meters
-    d_lat_m = abs(max_lat - min_lat) * 111139.0
-    d_lon_m = abs(max_lon - min_lon) * 111139.0 * math.cos(math.radians(center_lat))
+    d_lat_m = abs(raw_max_lat - raw_min_lat) * 111139.0
+    d_lon_m = abs(raw_max_lon - raw_min_lon) * 111139.0 * max(0.25, math.cos(math.radians(center_lat)))
     max_span_m = max(d_lat_m, d_lon_m)
 
-    # High-Definition Adaptive Zoom (Super-Resolution Satellite Fetching):
+    # Multi-Zoom Target Stitching (prefers Z19 ~0.3m/px for crisp tree canopies)
+    req_zoom = int(max(16, min(20, target_zoom if target_zoom is not None else zoom)))
     if max_span_m > 1800:
-        zoom = 17
-    elif max_span_m > 450:
-        zoom = 18
+        zoom = min(req_zoom, 17)
+    elif max_span_m > 700:
+        zoom = min(req_zoom, 18)
     else:
-        zoom = 19
+        zoom = req_zoom
 
-    # Step down zoom if tile grid exceeds 6x6 (max 36 tiles = 1536x1536 px) to keep memory safe on Cloud
+    # Step down zoom if tile grid exceeds Streamlit Cloud 1GB RAM-safe ceiling
+    # (up to 7x7 = 49 tiles = 1792x1792 px at Z19; 6x6 = 36 tiles below Z19)
     while zoom > 13:
+        max_side = 7 if zoom >= 19 else 6
+        max_tiles = 49 if zoom >= 19 else 36
         tx1, ty1 = lon_lat_to_tile(min_lon, max_lat, zoom)
         tx2, ty2 = lon_lat_to_tile(max_lon, min_lat, zoom)
-        if abs(tx2 - tx1) < 6 and abs(ty2 - ty1) < 6 and ((abs(tx2 - tx1) + 1) * (abs(ty2 - ty1) + 1) <= 36):
+        nx = abs(tx2 - tx1) + 1
+        ny = abs(ty2 - ty1) + 1
+        if nx <= max_side and ny <= max_side and (nx * ny <= max_tiles):
             break
         zoom -= 1
 
@@ -1175,12 +1216,9 @@ def analyze_farm_satellite_canopy(
     elif tiles_loaded < tiles_total:
         tile_error = f"تم تحميل {tiles_loaded} من أصل {tiles_total} مربع قمر صناعي فقط."
 
-    # Apply High-Pass Foliage Unsharp Masking to restore crisp crown edges & micro-texture
+    # Enhance crown edges & luminance contrast without distorting vegetation RGB chromaticity
     if has_tile:
-        try:
-            stitched = stitched.filter(ImageFilter.UnsharpMask(radius=1.5, percent=140, threshold=3))
-        except Exception:
-            pass
+        stitched = _enhance_satellite_mosaic(stitched)
 
     def to_px(lon: float, lat: float) -> Tuple[int, int]:
         lat_rad = math.radians(lat)
@@ -1191,13 +1229,21 @@ def analyze_farm_satellite_canopy(
 
     poly_px = [to_px(p[0], p[1]) for p in coords_lon_lat]
 
-    # Calculate pixel scale
+    # Calculate true Web Mercator metric scale (pixels per meter)
     total_px_len = 0.0
     for i in range(len(poly_px) - 1):
         pA, pB = poly_px[i], poly_px[i + 1]
         total_px_len += math.hypot(pB[0] - pA[0], pB[1] - pA[1])
 
-    px_per_m = total_px_len / max(perimeter_m, 1.0)
+    mercator_px_per_m = (2.0 ** zoom * 256.0) / (
+        40075016.686 * max(0.20, math.cos(math.radians(center_lat)))
+    )
+    poly_px_per_m = (total_px_len / max(perimeter_m, 1.0)) if (total_px_len > 0 and perimeter_m > 0) else mercator_px_per_m
+    px_per_m = (
+        mercator_px_per_m
+        if (poly_px_per_m <= 0.1 or abs(poly_px_per_m - mercator_px_per_m) > mercator_px_per_m * 0.45)
+        else poly_px_per_m
+    )
     spacing_px = max(6.0, spacing_m * px_per_m)
 
     # 1. CLEAN SATELLITE IMAGE (صورة طبيعية نقية فائقة الوضوح مع مضلع المزرعة وبدون علامات الأشجار)
@@ -1208,7 +1254,7 @@ def analyze_farm_satellite_canopy(
     header_clean = f"SATELLITE VIEW (HD RESOLUTION | Z{zoom}) | Farm Boundary GPS | Date: {imagery_date or 'Recent'}"
     draw_clean.text((12, 9), header_clean, fill=(0, 255, 200))
 
-    # 2. RUN INTEGRATED CV & NDVI DETECTION MODULE
+    # 2. RUN INTEGRATED CV & SAHI/WBF DETECTION MODULE
     cv_res = ndvi_mod.detect_and_classify_trees(
         satellite_image=stitched,
         parcel_poly_px=poly_px,
@@ -1217,6 +1263,9 @@ def analyze_farm_satellite_canopy(
         tree_type_str=tree_type_str,
         sensitivity=sensitivity,
         generate_heatmap=False,
+        tile_overlap=float(tile_overlap),
+        px_per_m=float(px_per_m),
+        slice_size=512,
     )
 
     final_ai_count = cv_res["total_trees"]
