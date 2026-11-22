@@ -102,6 +102,8 @@ export interface TreeDetectionBox {
   onBoundary: boolean;
   shadowDrop: number;
   laplacianVar: number;
+  circularity?: number;
+  crownDiameterM?: number;
 }
 
 export interface SatelliteAnalysisResult {
@@ -134,6 +136,9 @@ export interface SatelliteAnalysisResult {
   compareImageUrl?: string | null;
   compareProvider?: string | null;
   compareZoomUsed?: number | null;
+  stage1ActivePct?: number;
+  stage1CellsKept?: number;
+  stage1CellsTotal?: number;
   aiError?: string;
 }
 

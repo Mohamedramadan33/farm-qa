@@ -2,27 +2,28 @@
 """
 ndvi_tree_analyzer.py
 ---------------------
-GIS & Computer Vision Module for Agricultural Farm QA Audit:
-1. Normalized Difference Vegetation Index (NDVI) & VARI computation for aerial/satellite imagery.
-2. Healthy vs Damaged/Dead Tree classification (Healthy 🟢 vs Stressed 🟡 vs Dead/Damaged 🔴).
-3. Visual Tree Counting & Localization (OpenCV Blob/Contour Detection + YOLO architecture support).
-4. Canopy Health Mapping and Colormap Heatmap Generation.
+Two-Stage Geospatial Structural Tree Crown & Cast-Shadow Detection Engine:
+- Stage 1: Flat-Crop Texture & Shadow Rejection (4m x 4m grid cells masking out smooth crop basins).
+- Stage 2:
+    * Primary AI Path: SAHI 512x512 sliding window (20% overlap, NMS IoU=0.45, conf>=0.55) with multi-class YOLO.
+    * Algorithmic Fallback: Multi-Scale DoG crown blobs (2.0m..6.5m diameter, circularity > 0.65)
+      paired with directional adjacent cast shadows (>= 35% luminance drop relative to crown center).
+- UTF-8 Pillow text renderer using dual Arabic + Latin TTF fonts with arabic_reshaper & python-bidi.
 """
 
+from collections import deque
 from typing import Dict, Any, List, Optional, Tuple, Union
 import os
 import math
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-# Optional headless OpenCV
 try:
     import cv2
     HAS_OPENCV = True
 except ImportError:
     HAS_OPENCV = False
 
-# Optional Arabic text shaping for PIL rendering (prevents [□□□□] glyph boxes)
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display as _bidi_get_display
@@ -32,11 +33,18 @@ except ImportError:
     _bidi_get_display = None
     HAS_ARABIC_SHAPER = False
 
-# Optional Ultralytics YOLO (lazy-imported only when validating a custom tree model)
 HAS_YOLO = False
-
 _YOLO_MODEL_CACHE: Dict[str, Any] = {}
-_FONT_CACHE: Dict[int, Any] = {}
+_FONT_CACHE: Dict[Tuple[str, int], Any] = {}
+
+AI_MODEL_CONF_THRESH = 0.55
+SAHI_TILE_SIZE = 512
+SAHI_OVERLAP = 0.20
+NMS_IOU_THRESH = 0.45
+MIN_CAST_SHADOW_DROP = 0.35
+MIN_BLOB_CIRCULARITY = 0.65
+MIN_CROWN_DIAM_M = 2.0
+MAX_CROWN_DIAM_M = 6.5
 
 TREE_CLASS_NAMES: Dict[int, str] = {
     0: "orchard_tree",
@@ -55,29 +63,45 @@ _TREE_CLASS_KEYWORDS = {
     "shrub", "sapling", "wood", "شجرة", "أشجار", "نخيل",
 }
 
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ARABIC_FONT_CANDIDATES = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts", "NotoSansArabic-Regular.ttf"),
+    os.path.join(_BASE_DIR, "assets", "fonts", "NotoSansArabic-Regular.ttf"),
     "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
     "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+    os.path.join(_BASE_DIR, "assets", "fonts", "DejaVuSans.ttf"),
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+_LATIN_FONT_CANDIDATES = [
+    os.path.join(_BASE_DIR, "assets", "fonts", "DejaVuSans.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    os.path.join(_BASE_DIR, "assets", "fonts", "NotoSansArabic-Regular.ttf"),
 ]
 
 
-def _get_arabic_pil_font(size: int = 14) -> Any:
-    """Loads a valid UTF-8 Arabic TrueType font for PIL text rendering."""
-    if size in _FONT_CACHE:
-        return _FONT_CACHE[size]
-    for fp in _ARABIC_FONT_CANDIDATES:
+def _load_ttf(candidates: List[str], kind: str, size: int) -> Any:
+    key = (kind, size)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    for fp in candidates:
         if os.path.exists(fp):
             try:
                 fnt = ImageFont.truetype(fp, size=size)
-                _FONT_CACHE[size] = fnt
+                _FONT_CACHE[key] = fnt
                 return fnt
             except Exception:
                 continue
     fnt = ImageFont.load_default()
-    _FONT_CACHE[size] = fnt
+    _FONT_CACHE[key] = fnt
     return fnt
+
+
+def _get_arabic_pil_font(size: int = 14) -> Any:
+    return _load_ttf(_ARABIC_FONT_CANDIDATES, "ar", size)
+
+
+def _get_latin_pil_font(size: int = 14) -> Any:
+    return _load_ttf(_LATIN_FONT_CANDIDATES, "lat", size)
 
 
 def _format_arabic_text(text: str) -> str:
@@ -93,10 +117,56 @@ def _format_arabic_text(text: str) -> str:
     return str(text)
 
 
+def _is_arabic_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x0600 <= code <= 0x06FF
+        or 0x0750 <= code <= 0x077F
+        or 0x08A0 <= code <= 0x08FF
+        or 0xFB50 <= code <= 0xFDFF
+        or 0xFE70 <= code <= 0xFEFF
+    )
+
+
+def _draw_mixed_bidi_text(
+    draw: ImageDraw.ImageDraw,
+    xy: Tuple[int, int],
+    text: str,
+    fill: Tuple[int, int, int] = (0, 255, 200),
+    size: int = 14,
+) -> None:
+    """
+    Renders reshaped mixed Arabic + ASCII/numeric/% text cleanly in Pillow by routing
+    Arabic glyphs to NotoSansArabic-Regular.ttf and symbols/digits (%, (, ), |) to DejaVuSans.ttf,
+    eliminating [▯] missing-glyph boxes.
+    """
+    visual = _format_arabic_text(text)
+    ar_font = _get_arabic_pil_font(size)
+    lat_font = _get_latin_pil_font(size)
+
+    runs: List[Tuple[bool, str]] = []
+    for ch in visual:
+        is_ar = _is_arabic_char(ch)
+        if not runs or runs[-1][0] != is_ar:
+            runs.append((is_ar, ch))
+        else:
+            runs[-1] = (is_ar, runs[-1][1] + ch)
+
+    cur_x, y = xy
+    for is_ar, segment in runs:
+        fnt = ar_font if is_ar else lat_font
+        draw.text((cur_x, y), segment, fill=fill, font=fnt)
+        try:
+            adv = draw.textlength(segment, font=fnt)
+        except Exception:
+            bbox = draw.textbbox((0, 0), segment, font=fnt)
+            adv = max(1, bbox[2] - bbox[0])
+        cur_x += adv
+
+
 def _get_validated_tree_yolo(model_path: str) -> Tuple[Optional[Any], str]:
     """
-    Loads YOLO model (cached & lazy-imported) and verifies it defines tree/canopy classes
-    matching either the 3-class schema (orchard_tree, palm_tree, windbreak_tree) or legacy 'tree'.
+    Loads YOLO model (cached & lazy-imported) and verifies it defines tree/canopy classes.
     """
     global HAS_YOLO
     if not model_path or not os.path.exists(model_path):
@@ -129,27 +199,20 @@ def _get_validated_tree_yolo(model_path: str) -> Tuple[Optional[Any], str]:
         return None, f"load_error:{exc}"
 
 
-
 def compute_ndvi_or_vari(
     image_input: Union[np.ndarray, Image.Image],
     nir_channel: Optional[np.ndarray] = None,
     red_channel: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
-    Computes vegetation health index matrix [-1.0 to 1.0]:
-    - If NIR and Red channels are provided: uses standard multispectral NDVI = (NIR - Red) / (NIR + Red)
-    - If visible RGB is provided: uses standard satellite Visible Atmospherically Resistant Index (VARI)
-      and Green-Leaf Normalized Index (GLI), which are the gold standard for visible drone/satellite imagery.
+    Computes vegetation health index matrix [-1.0 to 1.0] ONLY for coloring/health telemetry
+    of already-detected tree crowns (never used for proposing tree locations).
     """
-    # 1. If NIR and Red channels explicitly provided
     if nir_channel is not None and red_channel is not None:
         nir = nir_channel.astype(np.float32)
         red = red_channel.astype(np.float32)
-        denom = nir + red + 1e-7
-        ndvi = (nir - red) / denom
-        return np.clip(ndvi, -1.0, 1.0)
+        return np.clip((nir - red) / (nir + red + 1e-7), -1.0, 1.0)
 
-    # 2. Extract RGB channels
     if isinstance(image_input, Image.Image):
         arr = np.array(image_input.convert("RGB"), dtype=np.float32)
     elif isinstance(image_input, np.ndarray):
@@ -157,131 +220,37 @@ def compute_ndvi_or_vari(
     else:
         raise ValueError("image_input must be PIL Image or NumPy array")
 
-    r = arr[:, :, 0]
-    g = arr[:, :, 1]
-    b = arr[:, :, 2]
-
-    # Visible Atmospherically Resistant Index (VARI) = (G - R) / (G + R - B)
-    # Normalized & stabilized for satellite / aerial RGB images:
-    num = g - r
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
     denom = g + r - b
-    # Protect against zero/negative denominators
     denom = np.where(np.abs(denom) < 1.0, np.sign(denom) * 1.0 + 1e-5, denom)
-    vari = num / denom
-
-    # Combine with Green Leaf Index (GLI) = (2G - R - B) / (2G + R + B) for robust plant chlorophyll sensitivity
-    denom_gli = 2.0 * g + r + b + 1e-5
-    gli = (2.0 * g - r - b) / denom_gli
-
-    # Weighted composite vegetation index (proxy NDVI)
-    composite_ndvi = 0.5 * np.clip(vari, -1.0, 1.0) + 0.5 * np.clip(gli, -1.0, 1.0)
-    return np.clip(composite_ndvi, -1.0, 1.0)
+    vari = (g - r) / denom
+    gli = (2.0 * g - r - b) / (2.0 * g + r + b + 1e-5)
+    return np.clip(0.5 * np.clip(vari, -1.0, 1.0) + 0.5 * np.clip(gli, -1.0, 1.0), -1.0, 1.0)
 
 
 def generate_ndvi_colormap_image(ndvi_matrix: np.ndarray, mask: Optional[np.ndarray] = None) -> Image.Image:
-    """
-    Converts NDVI float matrix into a standard RdYlGn (Red-Yellow-Green) colored heatmap image:
-    - Deep Red: Bare soil / rock / dead material (NDVI < 0.05)
-    - Yellow/Orange: Stressed / dry / sparse vegetation (0.05 <= NDVI < 0.20)
-    - Light Green: Moderate healthy vegetation (0.20 <= NDVI < 0.35)
-    - Deep Vibrant Green: Dense healthy tree canopy (NDVI >= 0.35)
-    """
     h, w = ndvi_matrix.shape
     colored = np.zeros((h, w, 3), dtype=np.uint8)
-
-    # Normalized from [-0.2, 0.6] to [0.0, 1.0] for vivid visual contrast
     norm_val = np.clip((ndvi_matrix + 0.1) / 0.6, 0.0, 1.0)
 
-    # Red, Yellow, Green color gradients
-    # Low values (0.0 - 0.5): Red (215, 48, 39) to Yellow (254, 224, 139)
-    # High values (0.5 - 1.0): Yellow (254, 224, 139) to Green (26, 152, 80)
     low_mask = norm_val < 0.5
     high_mask = ~low_mask
 
-    # Low gradient: Red to Yellow
     t_low = norm_val[low_mask] * 2.0
-    r_low = (215 + t_low * (254 - 215)).astype(np.uint8)
-    g_low = (48 + t_low * (224 - 48)).astype(np.uint8)
-    b_low = (39 + t_low * (139 - 39)).astype(np.uint8)
+    colored[low_mask, 0] = (215 + t_low * (254 - 215)).astype(np.uint8)
+    colored[low_mask, 1] = (48 + t_low * (224 - 48)).astype(np.uint8)
+    colored[low_mask, 2] = (39 + t_low * (139 - 39)).astype(np.uint8)
 
-    # High gradient: Yellow to Deep Green
     t_high = (norm_val[high_mask] - 0.5) * 2.0
-    r_high = (254 - t_high * (254 - 26)).astype(np.uint8)
-    g_high = (224 - t_high * (224 - 152)).astype(np.uint8)
-    b_high = (139 - t_high * (139 - 80)).astype(np.uint8)
+    colored[high_mask, 0] = (254 - t_high * (254 - 26)).astype(np.uint8)
+    colored[high_mask, 1] = (224 - t_high * (224 - 152)).astype(np.uint8)
+    colored[high_mask, 2] = (139 - t_high * (139 - 80)).astype(np.uint8)
 
-    colored[low_mask, 0] = r_low
-    colored[low_mask, 1] = g_low
-    colored[low_mask, 2] = b_low
-
-    colored[high_mask, 0] = r_high
-    colored[high_mask, 1] = g_high
-    colored[high_mask, 2] = b_high
-
-    # Dim areas outside parcel boundary if mask is provided
     if mask is not None:
         outside = ~mask
         colored[outside] = (colored[outside] * 0.45).astype(np.uint8)
 
     return Image.fromarray(colored)
-
-
-def compute_morphological_tophat(
-    ndvi_matrix: np.ndarray,
-    kernel_radius_px: int,
-) -> np.ndarray:
-    """
-    Morphological White Top-Hat Transform: WTH(I) = I - Opening(I, B)
-    Flat agricultural crops (vegetables, clover, wheat) form expansive continuous plateaus.
-    When a morphological opening of radius B is performed, the broad crop plateau remains unchanged,
-    so WTH = Plateau - Plateau = 0.
-    In contrast, isolated 3D tree crowns are narrower than B, so opening removes them, leaving
-    a high positive response in WTH!
-    """
-    # Normalize NDVI from [-0.2, 0.8] to [0, 255]
-    norm_u8 = np.clip((ndvi_matrix + 0.2) / 1.0 * 255.0, 0, 255).astype(np.uint8)
-    k_size = max(5, int(kernel_radius_px * 2) | 1)
-
-    if HAS_OPENCV:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-        tophat = cv2.morphologyEx(norm_u8, cv2.MORPH_TOPHAT, kernel)
-        return tophat.astype(np.float32) / 255.0
-    else:
-        pil_img = Image.fromarray(norm_u8, mode="L")
-        # Opening = MinFilter then MaxFilter
-        opened = pil_img.filter(ImageFilter.MinFilter(k_size)).filter(ImageFilter.MaxFilter(k_size))
-        diff = np.maximum(0, norm_u8.astype(np.int16) - np.array(opened, dtype=np.int16)).astype(np.uint8)
-        return diff.astype(np.float32) / 255.0
-
-
-def count_directional_drops(
-    ndvi_mat: np.ndarray,
-    cx: int,
-    cy: int,
-    r_drop: int,
-    w: int,
-    h: int,
-    center_val: float,
-    min_drop: float = 0.065,
-) -> int:
-    """
-    Tests 8 compass rays around (cx, cy) at distance r_drop.
-    Returns count of rays that drop by at least min_drop below center_val.
-    A discrete tree crown is an isolated island, so at least 4 to 5 of 8 rays drop into soil/shadow/skirt.
-    A continuous crop field (clover/vegetables) has green crops in all directions -> count is 0, 1, or 2!
-    """
-    angles = [0.0, 0.7854, 1.5708, 2.3562, 3.1416, 3.9270, 4.7124, 5.4978]
-    drop_count = 0
-    for a in angles:
-        rx = int(round(cx + r_drop * math.cos(a)))
-        ry = int(round(cy + r_drop * math.sin(a)))
-        if 0 <= rx < w and 0 <= ry < h:
-            val_at_ray = float(ndvi_mat[ry, rx])
-            if (center_val - val_at_ray) >= min_drop:
-                drop_count += 1
-        else:
-            drop_count += 1
-    return drop_count
 
 
 def _generate_sahi_slices(
@@ -291,13 +260,9 @@ def _generate_sahi_slices(
     max_y: int,
     width_px: int,
     height_px: int,
-    slice_size: int = 512,
-    overlap: float = 0.25,
+    slice_size: int = SAHI_TILE_SIZE,
+    overlap: float = SAHI_OVERLAP,
 ) -> List[Tuple[int, int, int, int]]:
-    """
-    Generates overlapping SAHI windows (e.g. 512x512 with 25% overlap -> stride 384px)
-    covering the buffered farm parcel bounding box so no tree on a slice seam is split.
-    """
     s_size = max(128, int(slice_size))
     ov = float(np.clip(overlap, 0.0, 0.50))
     stride = max(64, int(round(s_size * (1.0 - ov))))
@@ -332,13 +297,11 @@ def _generate_sahi_slices(
             break
         y += stride
 
-    slices: List[Tuple[int, int, int, int]] = []
-    for sy in ys:
-        sy2 = min(height_px, sy + s_size)
-        for sx in xs:
-            sx2 = min(width_px, sx + s_size)
-            slices.append((sx, sy, sx2, sy2))
-    return slices
+    return [
+        (sx, sy, min(width_px, sx + s_size), min(height_px, sy + s_size))
+        for sy in ys
+        for sx in xs
+    ]
 
 
 def _box_iou(b1: Tuple[int, int, int, int], b2: Tuple[int, int, int, int]) -> float:
@@ -356,14 +319,9 @@ def _box_iou(b1: Tuple[int, int, int, int], b2: Tuple[int, int, int, int]) -> fl
 
 def _apply_sahi_wbf_nms(
     candidates: List[Dict[str, Any]],
-    iou_thresh: float = 0.45,
+    iou_thresh: float = NMS_IOU_THRESH,
     min_dist_px: float = 8.0,
 ) -> List[Dict[str, Any]]:
-    """
-    Weighted Boxes Fusion (WBF) + IoU NMS (default IoU = 0.45) across overlapping SAHI slices.
-    Merges duplicate detections from overlapping tile borders using confidence weighting
-    while preserving multi-class labels (orchard_tree, palm_tree, windbreak_tree).
-    """
     if not candidates:
         return []
 
@@ -402,12 +360,16 @@ def _apply_sahi_wbf_nms(
                 "bbox": cbox,
                 "class_id": c_cls_id,
                 "class_name": c_cls_name,
+                "circularity": cand.get("circularity"),
+                "crown_diameter_m": cand.get("crown_diameter_m"),
             })
         else:
             mc = matched_cluster
             if cconf > mc["max_conf"]:
                 mc["class_id"] = c_cls_id
                 mc["class_name"] = c_cls_name
+                mc["circularity"] = cand.get("circularity", mc.get("circularity"))
+                mc["crown_diameter_m"] = cand.get("crown_diameter_m", mc.get("crown_diameter_m"))
             mc["w_sum"] += cconf
             mc["max_conf"] = max(mc["max_conf"], cconf)
             mc["wx1"] += cbox[0] * cconf
@@ -430,50 +392,319 @@ def _apply_sahi_wbf_nms(
     fused: List[Dict[str, Any]] = []
     for cl in clusters:
         w = cl["w_sum"]
-        fx1 = int(round(cl["wx1"] / w))
-        fy1 = int(round(cl["wy1"] / w))
-        fx2 = int(round(cl["wx2"] / w))
-        fy2 = int(round(cl["wy2"] / w))
-        fcx = int(round(cl["wcx"] / w))
-        fcy = int(round(cl["wcy"] / w))
-        frad = max(3, int(round(cl["wrad"] / w)))
         fused.append({
-            "bbox": (fx1, fy1, fx2, fy2),
-            "center": (fcx, fcy),
+            "bbox": (
+                int(round(cl["wx1"] / w)),
+                int(round(cl["wy1"] / w)),
+                int(round(cl["wx2"] / w)),
+                int(round(cl["wy2"] / w)),
+            ),
+            "center": (int(round(cl["wcx"] / w)), int(round(cl["wcy"] / w))),
             "conf": round(min(1.0, cl["max_conf"]), 4),
-            "crown_radius": frad,
+            "crown_radius": max(4, int(round(cl["wrad"] / w))),
             "class_id": cl["class_id"],
             "class_name": cl["class_name"],
+            "circularity": cl.get("circularity"),
+            "crown_diameter_m": cl.get("crown_diameter_m"),
         })
     return fused
 
 
-def _verify_shadow_and_laplacian_texture(
+# ---------------------------------------------------------------------------
+# Stage 1: Flat-Crop Texture & Shadow Rejection (4m x 4m Pre-Filter Grid Mask)
+# ---------------------------------------------------------------------------
+
+def _build_stage1_flat_crop_mask(
+    arr_rgb: np.ndarray,
+    lum_arr: np.ndarray,
+    hsv_v: np.ndarray,
+    lap_mag: np.ndarray,
+    strict_mask: np.ndarray,
+    px_per_m: float,
+) -> Tuple[np.ndarray, int, int, float]:
+    """
+    Divides the masked polygon into 4m x 4m physical cells.
+    Zeros out smooth flat crop basins (berseem, wheat, vegetables) that lack BOTH:
+      1) Local Texture Roughness (Laplacian variance + luminance contrast spread)
+      2) Dark Shadow Pixel Ratio (HSV V < 0.22 adjacent to brighter vegetation)
+    """
+    h, w = lum_arr.shape
+    mpp = 1.0 / max(px_per_m, 0.5)
+
+    # Local max HSV Value within ~2.2m neighborhood to identify shadow pockets adjacent to brighter crowns
+    nb_rad = max(4, min(11, int(round(2.2 / max(mpp, 0.12)))))
+    k_nb = nb_rad * 2 + 1
+    if HAS_OPENCV:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_nb, k_nb))
+        v_masked = np.where(strict_mask, hsv_v, 0.0).astype(np.float32)
+        local_max_v = cv2.dilate(v_masked, kernel)
+    else:
+        v_u8 = np.where(strict_mask, np.clip(hsv_v * 255.0, 0, 255), 0).astype(np.uint8)
+        local_max_v = np.array(Image.fromarray(v_u8, mode="L").filter(ImageFilter.MaxFilter(k_nb)), dtype=np.float32) / 255.0
+
+    shadow_pocket = strict_mask & (hsv_v < 0.22) & (local_max_v >= 0.30) & ((local_max_v - hsv_v) >= 0.11)
+
+    cell_px = max(10, int(round(4.0 / max(mpp, 0.12))))
+    halo_px = max(3, int(round(1.5 / max(mpp, 0.12))))
+
+    active_mask = np.zeros((h, w), dtype=bool)
+    cells_total = 0
+    cells_kept = 0
+
+    for cy0 in range(0, h, cell_px):
+        cy1 = min(h, cy0 + cell_px)
+        hy0 = max(0, cy0 - halo_px)
+        hy1 = min(h, cy1 + halo_px)
+        for cx0 in range(0, w, cell_px):
+            cx1 = min(w, cx0 + cell_px)
+            cell_mask = strict_mask[cy0:cy1, cx0:cx1]
+            valid_cnt = int(np.sum(cell_mask))
+            if valid_cnt < 12:
+                continue
+            cells_total += 1
+
+            cell_lap = lap_mag[cy0:cy1, cx0:cx1][cell_mask]
+            lap_var = float(np.var(cell_lap))
+
+            cell_lum = lum_arr[cy0:cy1, cx0:cx1][cell_mask]
+            p5, p95 = np.percentile(cell_lum, [5, 95])
+            contrast_range = float(p95 - p5)
+
+            hx0 = max(0, cx0 - halo_px)
+            hx1 = min(w, cx1 + halo_px)
+            shadow_cnt = int(np.sum(shadow_pocket[hy0:hy1, hx0:hx1]))
+            shadow_ratio = shadow_cnt / float(valid_cnt)
+
+            if lap_var >= 35.0 and contrast_range >= 25.0 and shadow_ratio >= 0.012 and shadow_cnt >= 3:
+                cells_kept += 1
+                active_mask[cy0:cy1, cx0:cx1] = cell_mask
+
+    total_strict = int(np.sum(strict_mask))
+    active_pct = round(float(np.sum(active_mask) / max(1, total_strict) * 100.0), 1)
+    return active_mask, cells_kept, cells_total, active_pct
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Structural Multi-Scale DoG + Circularity (>0.65) + Paired Cast Shadow (>=35%)
+# ---------------------------------------------------------------------------
+
+def _measure_blob_shape(
+    dog_map: np.ndarray,
+    stage1_mask: np.ndarray,
+    cx: int,
+    cy: int,
+    peak_val: float,
+    max_radius_px: float,
+) -> Optional[Tuple[int, float, float, Tuple[int, int, int, int]]]:
+    h, w = dog_map.shape
+    rad = max(5, min(20, int(math.ceil(max_radius_px))))
+    x0 = max(1, cx - rad)
+    y0 = max(1, cy - rad)
+    x1 = min(w - 2, cx + rad)
+    y1 = min(h - 2, cy + rad)
+    bw = x1 - x0 + 1
+    bh = y1 - y0 + 1
+    if bw < 3 or bh < 3:
+        return None
+
+    thresh = peak_val * 0.42
+    blob_bin = np.zeros((bh, bw), dtype=np.uint8)
+    queue = deque([(cx, cy)])
+    blob_bin[cy - y0, cx - x0] = 255
+
+    pts_x: List[int] = []
+    pts_y: List[int] = []
+    rad2 = rad * rad
+
+    while queue:
+        px, py = queue.popleft()
+        pts_x.append(px)
+        pts_y.append(py)
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = px + dx, py + dy
+            if nx < x0 or nx > x1 or ny < y0 or ny > y1:
+                continue
+            if blob_bin[ny - y0, nx - x0]:
+                continue
+            if (nx - cx) * (nx - cx) + (ny - cy) * (ny - cy) > rad2:
+                continue
+            if not stage1_mask[ny, nx] or dog_map[ny, nx] < thresh:
+                continue
+            blob_bin[ny - y0, nx - x0] = 255
+            queue.append((nx, ny))
+
+    area_px = len(pts_x)
+    if area_px < 10:
+        return None
+
+    # Exact perimeter & circularity
+    if HAS_OPENCV:
+        contours, _ = cv2.findContours(blob_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return None
+        cnt = max(contours, key=cv2.contourArea)
+        perim = float(cv2.arcLength(cnt, True))
+        cv_area = float(cv2.contourArea(cnt))
+        eff_area = max(float(area_px), cv_area)
+    else:
+        # 2x2 Marching Squares fallback
+        perim_lut = [0.0, 0.7071, 0.7071, 1.0, 0.7071, 1.0, 1.4142, 0.7071,
+                     0.7071, 1.4142, 1.0, 0.7071, 1.0, 0.7071, 0.7071, 0.0]
+        b0 = (blob_bin > 0).astype(np.uint8)
+        perim = 0.0
+        for ly in range(bh - 1):
+            for lx in range(bw - 1):
+                st = (int(b0[ly, lx]) << 3) | (int(b0[ly, lx + 1]) << 2) | (int(b0[ly + 1, lx + 1]) << 1) | int(b0[ly + 1, lx])
+                perim += perim_lut[st]
+        eff_area = float(area_px)
+
+    if perim <= 1.0:
+        return None
+
+    circularity = (4.0 * math.pi * eff_area) / (perim * perim)
+
+    ax = np.array(pts_x, dtype=np.float32)
+    ay = np.array(pts_y, dtype=np.float32)
+    cxx = float(np.var(ax))
+    cyy = float(np.var(ay))
+    cxy = float(np.mean((ax - np.mean(ax)) * (ay - np.mean(ay))))
+    trace = cxx + cyy
+    det = cxx * cyy - cxy * cxy
+    disc = math.sqrt(max(0.0, (trace * trace) / 4.0 - det))
+    lam1 = trace / 2.0 + disc
+    lam2 = max(0.15, trace / 2.0 - disc)
+    aspect_ratio = math.sqrt(lam1 / lam2)
+
+    bbox = (int(np.min(ax)), int(np.min(ay)), int(np.max(ax)), int(np.max(ay)))
+    return area_px, circularity, aspect_ratio, bbox
+
+
+def _detect_structural_crowns_dog(
+    arr_rgb: np.ndarray,
+    lum_arr: np.ndarray,
+    stage1_mask: np.ndarray,
+    px_per_m: float,
+    tree_type_str: str,
+    corridor_mask: np.ndarray,
+) -> List[Dict[str, Any]]:
+    h, w = lum_arr.shape
+    mpp = 1.0 / max(px_per_m, 0.5)
+    r, g, b = arr_rgb[:, :, 0], arr_rgb[:, :, 1], arr_rgb[:, :, 2]
+
+    rg_spread = np.maximum(0.0, g - r * 0.85)
+    base_struct = (0.22 * r + 0.62 * g + 0.16 * b) * np.where(g >= r * 0.88, 1.0, 0.45)
+    canopy_sig = np.where(stage1_mask, np.clip(base_struct * 0.82 + rg_spread * 0.65, 0.0, 255.0), 0.0).astype(np.float32)
+
+    dog_maps: List[np.ndarray] = []
+    scale_radii_px: List[float] = []
+    for r_m in (1.25, 2.0, 2.85):
+        r_px = max(3.8, r_m / max(mpp, 0.12))
+        scale_radii_px.append(r_px)
+        sig_f = max(1.0, r_px * 0.52)
+        sig_c = max(sig_f + 1.4, r_px * 1.45)
+        if HAS_OPENCV:
+            kf = max(3, int(round(sig_f * 4)) | 1)
+            kc = max(5, int(round(sig_c * 4)) | 1)
+            bf = cv2.GaussianBlur(canopy_sig, (kf, kf), sig_f)
+            bc = cv2.GaussianBlur(canopy_sig, (kc, kc), sig_c)
+        else:
+            sig_pil = Image.fromarray(np.clip(canopy_sig, 0, 255).astype(np.uint8), mode="L")
+            bf = np.array(sig_pil.filter(ImageFilter.GaussianBlur(radius=sig_f)), dtype=np.float32)
+            bc = np.array(sig_pil.filter(ImageFilter.GaussianBlur(radius=sig_c)), dtype=np.float32)
+        dog_maps.append(np.where(stage1_mask, bf - bc, -999.0))
+
+    dogs_stacked = np.stack(dog_maps, axis=0)
+    best_scale = np.argmax(dogs_stacked, axis=0)
+    dog_max = np.max(dogs_stacked, axis=0)
+
+    t_low = (tree_type_str or "").lower()
+    is_palm = any(k in t_low for k in ["نخيل", "نخل", "palm", "date", "بلح"])
+    is_windbreak = any(k in t_low for k in ["جازورين", "كازورينا", "كافور", "سرو", "casuarina", "eucalyptus", "مصدات"])
+
+    cands: List[Dict[str, Any]] = []
+    stride = max(2, int(round(1.0 / max(mpp, 0.12))))
+
+    for y in range(4, h - 4, stride):
+        for x in range(4, w - 4, stride):
+            if not stage1_mask[y, x]:
+                continue
+            val = float(dog_max[y, x])
+            if val < 4.5:
+                continue
+
+            s_idx = int(best_scale[y, x])
+            win_dog = dog_maps[s_idx]
+            patch = win_dog[max(0, y - 2):min(h, y + 3), max(0, x - 2):min(w, x + 3)]
+            if float(np.max(patch)) > val:
+                continue
+
+            blob_res = _measure_blob_shape(win_dog, stage1_mask, x, y, val, scale_radii_px[s_idx] * 1.55)
+            if blob_res is None:
+                continue
+            area_px, circularity, aspect_ratio, _ = blob_res
+
+            eq_diam_m = 2.0 * math.sqrt(area_px / math.pi) * mpp
+            if not (MIN_CROWN_DIAM_M <= eq_diam_m <= MAX_CROWN_DIAM_M):
+                continue
+            if circularity <= MIN_BLOB_CIRCULARITY or aspect_ratio > 2.2:
+                continue
+
+            pr, pg, pb = float(r[y, x]), float(g[y, x]), float(b[y, x])
+            chroma_exg = (2.0 * pg - pr - pb) / (pr + pg + pb + 1e-6)
+            if float(lum_arr[y, x]) < 40.0:
+                continue
+            if chroma_exg < 0.01 and pg < pr * 0.92:
+                continue
+            if max(pr, pg, pb) - min(pr, pg, pb) < 7.0:
+                continue
+
+            box_r = max(4, int(round((eq_diam_m / 2.0) / max(mpp, 0.12))))
+            on_bound = bool(corridor_mask[y, x])
+            if is_palm or (not on_bound and eq_diam_m >= 5.0):
+                cls_id, cls_name = 1, "palm_tree"
+            elif on_bound or is_windbreak:
+                cls_id, cls_name = 2, "windbreak_tree"
+            else:
+                cls_id, cls_name = 0, "orchard_tree"
+
+            cands.append({
+                "bbox": (max(1, x - box_r), max(1, y - box_r), min(w - 2, x + box_r), min(h - 2, y + box_r)),
+                "center": (x, y),
+                "conf": min(0.96, 0.48 + circularity * 0.35 + min(0.18, val / 40.0)),
+                "crown_radius": box_r,
+                "class_id": cls_id,
+                "class_name": cls_name,
+                "circularity": round(circularity, 2),
+                "crown_diameter_m": round(eq_diam_m, 2),
+            })
+    return cands
+
+
+def _verify_cast_shadow_and_telemetry(
     candidates: List[Dict[str, Any]],
     arr_rgb: np.ndarray,
-    gray_arr: np.ndarray,
-    exg: np.ndarray,
-    target_mask: np.ndarray,
+    lum_arr: np.ndarray,
+    hsv_v: np.ndarray,
+    lap_mag: np.ndarray,
+    strict_mask: np.ndarray,
+    stage1_mask: np.ndarray,
+    px_per_m: float,
+    require_strict_cast_shadow: bool = True,
 ) -> List[Dict[str, Any]]:
     """
-    Stage-3 Cast-Shadow (HSV Value drop) + Laplacian Texture Variance Post-Filter.
-    Applied across all YOLO and CV candidates to reject flat row crops (alfalfa, wheat, clover).
+    Verifies paired directional cast shadow immediately adjacent to the crown edge:
+    requires luminance drop >= 35% relative to crown center AND opposite sunlit side check.
     """
-    h, w = gray_arr.shape
-    hsv_v = np.max(arr_rgb, axis=2) / 255.0
-
-    if HAS_OPENCV:
-        lap_full = np.abs(cv2.Laplacian(gray_arr.astype(np.float32), cv2.CV_32F, ksize=3))
-    else:
-        padded = np.pad(gray_arr.astype(np.float32), 1, mode="edge")
-        lap_full = np.abs(
-            padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:] - 4.0 * gray_arr
-        )
+    h, w = lum_arr.shape
+    mpp = 1.0 / max(px_per_m, 0.5)
+    r_ch, g_ch, b_ch = arr_rgb[:, :, 0], arr_rgb[:, :, 1], arr_rgb[:, :, 2]
 
     verified: List[Dict[str, Any]] = []
     for cand in candidates:
         cx, cy = cand["center"]
-        if not (1 <= cx < w - 1 and 1 <= cy < h - 1 and target_mask[cy, cx]):
+        if not (2 <= cx < w - 2 and 2 <= cy < h - 2):
+            continue
+        if not strict_mask[cy, cx] or not stage1_mask[cy, cx]:
             continue
 
         bx1, by1, bx2, by2 = cand["bbox"]
@@ -482,34 +713,88 @@ def _verify_shadow_and_laplacian_texture(
         if x2 <= x1 or y2 <= y1:
             continue
 
-        crown_exg = float(np.mean(exg[y1:y2 + 1, x1:x2 + 1]))
-        if crown_exg < 2.0:
+        radius_px = max(3.5, float(cand.get("crown_radius", (x2 - x1) / 2.0)))
+        diam_m = float(cand.get("crown_diameter_m") or round(radius_px * 2.0 * mpp, 2))
+
+        c_rad = max(2, int(round(radius_px * 0.45)))
+        cy0, cy1 = max(0, cy - c_rad), min(h, cy + c_rad + 1)
+        cx0, cx1 = max(0, cx - c_rad), min(w, cx + c_rad + 1)
+        core_lum = float(np.mean(lum_arr[cy0:cy1, cx0:cx1]))
+        if core_lum < 42.0:
             continue
 
-        lap_var = float(np.var(lap_full[y1:y2 + 1, x1:x2 + 1]))
-        lum_std = float(np.std(gray_arr[y1:y2 + 1, x1:x2 + 1]))
-
-        rad = max(3, int(cand.get("crown_radius", 5)))
-        sy1 = max(0, cy - int(rad * 2.5))
-        sy2 = min(h, cy + int(rad * 1.4) + 1)
-        sx1 = max(0, cx - int(rad * 2.4))
-        sx2 = min(w, cx + int(rad * 2.4) + 1)
-        crown_v = float(np.mean(hsv_v[max(0, cy - 2):min(h, cy + 3), max(0, cx - 2):min(w, cx + 3)]))
-        patch_v = hsv_v[sy1:sy2, sx1:sx2]
-        min_v = float(np.min(patch_v)) if patch_v.size > 0 else crown_v
-        shadow_drop = crown_v - min_v
-        dark_px = int(np.sum(patch_v < 0.24)) if patch_v.size > 0 else 0
-        has_cast_shadow = (shadow_drop >= 0.08 and min_v <= 0.27) or dark_px >= 3
-
-        if not has_cast_shadow and lap_var < 26.0 and lum_std < 6.5:
+        cr_p = r_ch[cy0:cy1, cx0:cx1]
+        cg_p = g_ch[cy0:cy1, cx0:cx1]
+        cb_p = b_ch[cy0:cy1, cx0:cx1]
+        core_exg = float(np.mean((2.0 * cg_p - cr_p - cb_p) / (cr_p + cg_p + cb_p + 1e-6)))
+        if core_exg < 0.01 and float(np.mean(cg_p >= cr_p * 0.92)) < 0.5:
             continue
-        if lap_var < 12.0 and lum_std < 4.8:
+
+        lap_var = float(np.var(lap_mag[y1:y2 + 1, x1:x2 + 1]))
+
+        # Scan 8 directional angular wedges adjacent to crown edge (0.85*R .. 2.65*R)
+        r_in = max(2.0, radius_px * 0.85)
+        r_out = min(34.0, max(r_in + 3.0, radius_px * 2.65))
+        i_rout = int(math.ceil(r_out))
+
+        sy0, sy1 = max(0, cy - i_rout), min(h, cy + i_rout + 1)
+        sx0, sx1 = max(0, cx - i_rout), min(w, cx + i_rout + 1)
+        yy, xx = np.mgrid[sy0:sy1, sx0:sx1]
+        dx = xx - cx
+        dy = yy - cy
+        dist = np.hypot(dx, dy)
+        ring_sel = (dist >= r_in) & (dist <= r_out) & strict_mask[sy0:sy1, sx0:sx1]
+        if not np.any(ring_sel):
+            continue
+
+        angles = np.mod(np.arctan2(dy[ring_sel], dx[ring_sel]), 2.0 * math.pi)
+        sectors = (np.floor(np.mod(angles + math.pi / 8.0, 2.0 * math.pi) / (math.pi / 4.0))).astype(np.int32)
+        ring_lums = lum_arr[sy0:sy1, sx0:sx1][ring_sel]
+        ring_vs = hsv_v[sy0:sy1, sx0:sx1][ring_sel]
+
+        best_sector = -1
+        best_shadow_lum = core_lum
+        best_shadow_v = 1.0
+        sector_medians = np.full(8, core_lum, dtype=np.float32)
+
+        for s in range(8):
+            s_mask = sectors == s
+            cnt_s = int(np.sum(s_mask))
+            if cnt_s < 4:
+                continue
+            s_l = np.sort(ring_lums[s_mask])
+            s_v = np.sort(ring_vs[s_mask])
+            sector_medians[s] = float(s_l[cnt_s // 2])
+            k_dark = max(3, int(cnt_s * 0.25))
+            pocket_l = float(np.mean(s_l[:k_dark]))
+            pocket_v = float(np.mean(s_v[:k_dark]))
+            if pocket_l < best_shadow_lum:
+                best_shadow_lum = pocket_l
+                best_shadow_v = pocket_v
+                best_sector = s
+
+        rel_shadow_drop = (core_lum - best_shadow_lum) / core_lum if best_sector >= 0 else 0.0
+        opp_lum = float(sector_medians[(best_sector + 4) % 8]) if best_sector >= 0 else best_shadow_lum
+        is_directional = opp_lum >= best_shadow_lum * 1.28
+
+        has_paired_shadow = (
+            best_sector >= 0
+            and rel_shadow_drop >= MIN_CAST_SHADOW_DROP
+            and best_shadow_v <= 0.28
+            and is_directional
+        )
+
+        if require_strict_cast_shadow and not has_paired_shadow:
+            continue
+        if not require_strict_cast_shadow and rel_shadow_drop < 0.22 and lap_var < 28.0:
             continue
 
         out_cand = dict(cand)
-        out_cand["shadow_drop"] = round(shadow_drop, 3)
+        out_cand["shadow_drop"] = round(rel_shadow_drop, 3)
         out_cand["laplacian_var"] = round(lap_var, 1)
+        out_cand["crown_diameter_m"] = round(diam_m, 2)
         verified.append(out_cand)
+
     return verified
 
 
@@ -524,33 +809,38 @@ def detect_and_classify_trees(
     tree_type_str: str = "",
     sensitivity: float = 0.50,
     generate_heatmap: bool = False,
-    tile_overlap: float = 0.20,
-    px_per_m: float = 3.5,
-    slice_size: int = 512,
+    tile_overlap: float = SAHI_OVERLAP,
+    px_per_m: float = 3.8,
+    slice_size: int = SAHI_TILE_SIZE,
     inward_buffer_m: float = 0.0,
     show_compact_ids: bool = False,
 ) -> Dict[str, Any]:
     """
-    High-Precision Visual Tree Detection & Flat Crop Rejection Engine (SAHI + WBF):
-    - SAHI 512x512 overlapping window slicing (25% overlap) + Weighted Boxes Fusion (WBF).
-    - Exact 3-meter GPS polygon buffer masking for perimeter shelterbelts.
-    - Dual spectral check (ExG 2G-R-B + VARI/GLI) + cast-shadow dipole verification.
-    - Morphological White Top-Hat & Multi-Scale DoG for Total Crop Carpet Elimination.
-    - Classifies health status: Healthy (🟢), Stressed (🟡), Dead/Damaged (🔴).
+    Two-Stage Structural Tree Crown Detection Pipeline:
+    - Stage 1: Flat-Crop Texture & Shadow Rejection (4m x 4m pre-filter grid mask).
+    - Stage 2:
+        * Primary AI Path: YOLOv8 SAHI 512x512 (20% overlap, NMS IoU=0.45, conf >= 0.55).
+        * Algorithmic Fallback: Multi-Scale DoG blobs (2.0..6.5m, circularity > 0.65)
+          with paired adjacent cast shadows (>= 35% luminance drop).
     """
     orig_img = satellite_image.convert("RGB")
     width_px, height_px = orig_img.size
 
-    # 1. Compute NDVI matrix & spectral channels upfront (shared by YOLO SAHI filter & CV engine)
     ndvi_matrix = compute_ndvi_or_vari(orig_img)
     arr = np.array(orig_img, dtype=np.float32)
-    r = arr[:, :, 0]
-    g = arr[:, :, 1]
-    b = arr[:, :, 2]
-    exg = 2.0 * g - r - b
-    brightness = (r + g + b) / 3.0
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    lum_arr = 0.299 * r + 0.587 * g + 0.114 * b
+    hsv_v = np.max(arr, axis=2) / 255.0
 
-    # 2. Build parcel polygon mask + exact 3-meter boundary buffer for windbreak shelterbelts
+    if HAS_OPENCV:
+        lap_mag = np.abs(cv2.Laplacian(lum_arr.astype(np.float32), cv2.CV_32F, ksize=3))
+    else:
+        padded = np.pad(lum_arr.astype(np.float32), 1, mode="edge")
+        lap_mag = np.abs(
+            padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:] - 4.0 * lum_arr
+        )
+
+    # Strict GeoJSON Polygon Mask + optional inward buffer
     buffer_3m_px = max(3, int(round(3.0 * max(px_per_m, 1.0))))
     parcel_mask_img = Image.new("L", (width_px, height_px), 0)
     draw_mask = ImageDraw.Draw(parcel_mask_img)
@@ -566,8 +856,7 @@ def detect_and_classify_trees(
             k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1))
             parcel_mask = cv2.erode(parcel_mask.astype(np.uint8) * 255, k_erode) > 0
         else:
-            eroded_pil = parcel_mask_img.filter(ImageFilter.MinFilter(erode_px * 2 + 1))
-            parcel_mask = np.array(eroded_pil) > 0
+            parcel_mask = np.array(parcel_mask_img.filter(ImageFilter.MinFilter(erode_px * 2 + 1))) > 0
 
     total_parcel_pixels = int(np.sum(parcel_mask))
 
@@ -594,6 +883,11 @@ def detect_and_classify_trees(
 
     target_mask = corridor_mask if (detection_mode == "boundary_only" and np.any(corridor_mask)) else boundary_buf_mask
 
+    # Stage 1: Flat-Crop Texture & Shadow Rejection Pre-Filter (4m x 4m grid cells)
+    stage1_mask, cells_kept, cells_total, stage1_active_pct = _build_stage1_flat_crop_mask(
+        arr, lum_arr, hsv_v, lap_mag, target_mask, px_per_m
+    )
+
     if parcel_poly_px:
         min_x = max(0, min(p[0] for p in parcel_poly_px) - buffer_3m_px)
         max_x = min(width_px - 1, max(p[0] for p in parcel_poly_px) + buffer_3m_px)
@@ -607,44 +901,48 @@ def detect_and_classify_trees(
         min_x, min_y, max_x, max_y, width_px, height_px,
         slice_size=slice_size, overlap=tile_overlap,
     )
-    min_sep_px = max(7.5, pixel_spacing_px * 0.70)
+    min_sep_px = max(6.0, 2.4 * px_per_m)
 
-    # 3. Candidate Tree Detection (SAHI + WBF on custom YOLO or Multi-Scale Spectral CV)
+    # Zero out outside polygon AND all flat crop cells before Stage 2 detection
+    stage1_masked_u8 = np.where(stage1_mask[:, :, None], arr, 0.0).astype(np.uint8)
+
     detected_boxes: List[Dict[str, Any]] = []
     used_yolo = False
     active_yolo_path = yolo_model_path
-
     if not active_yolo_path:
         for cand in ["best.pt", "models/best.pt", "/mount/src/farm-qa/best.pt", "/mount/src/farm-qa/models/best.pt"]:
             if os.path.exists(cand):
                 active_yolo_path = cand
                 break
 
-    # Strict Masked Inference Array: zero all pixels outside target polygon mask
-    masked_arr_u8 = np.where(target_mask[:, :, None], arr, 0.0).astype(np.uint8)
-    gray_full = 0.299 * r + 0.587 * g + 0.114 * b
-
-    # Attempt YOLO deep learning detection with 512x512 SAHI slicing ONLY if model defines tree/canopy classes
     yolo_skipped_reason = ""
-    if active_yolo_path:
+    raw_yolo_cands: List[Dict[str, Any]] = []
+    if active_yolo_path and np.any(stage1_mask):
         yolo_model, skip_reason = _get_validated_tree_yolo(active_yolo_path)
         if yolo_model is not None:
             try:
-                raw_yolo_cands: List[Dict[str, Any]] = []
                 for sx1, sy1, sx2, sy2 in sahi_slices:
-                    if not np.any(target_mask[sy1:sy2, sx1:sx2]):
+                    if not np.any(stage1_mask[sy1:sy2, sx1:sx2]):
                         continue
-                    crop_arr = masked_arr_u8[sy1:sy2, sx1:sx2]
-                    yolo_res = yolo_model.predict(source=crop_arr, conf=0.20, iou=0.45, verbose=False)
+                    crop_arr = stage1_masked_u8[sy1:sy2, sx1:sx2]
+                    yolo_res = yolo_model.predict(
+                        source=crop_arr,
+                        conf=AI_MODEL_CONF_THRESH,
+                        iou=NMS_IOU_THRESH,
+                        verbose=False,
+                    )
                     if yolo_res and len(yolo_res) > 0 and len(yolo_res[0].boxes) > 0:
                         for b_box in yolo_res[0].boxes:
+                            conf_val = float(b_box.conf[0].cpu().numpy())
+                            if conf_val < AI_MODEL_CONF_THRESH:
+                                continue
                             xyxy = b_box.xyxy[0].cpu().numpy()
                             bx1 = sx1 + int(xyxy[0])
                             by1 = sy1 + int(xyxy[1])
                             bx2 = sx1 + int(xyxy[2])
                             by2 = sy1 + int(xyxy[3])
                             cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-                            if not (0 <= cy < height_px and 0 <= cx < width_px and target_mask[cy, cx]):
+                            if not (0 <= cy < height_px and 0 <= cx < width_px and stage1_mask[cy, cx]):
                                 continue
                             cls_id = int(b_box.cls[0].cpu().numpy()) if b_box.cls is not None else 0
                             cls_name = TREE_CLASS_NAMES.get(cls_id, "orchard_tree")
@@ -652,307 +950,37 @@ def detect_and_classify_trees(
                             raw_yolo_cands.append({
                                 "bbox": (bx1, by1, bx2, by2),
                                 "center": (cx, cy),
-                                "conf": float(b_box.conf[0].cpu().numpy()),
+                                "conf": conf_val,
                                 "crown_radius": crown_rad,
                                 "class_id": cls_id,
                                 "class_name": cls_name,
                             })
-                if raw_yolo_cands:
-                    fused_yolo = _apply_sahi_wbf_nms(raw_yolo_cands, iou_thresh=0.45, min_dist_px=min_sep_px)
-                    detected_boxes = _verify_shadow_and_laplacian_texture(
-                        fused_yolo, arr, gray_full, exg, target_mask
-                    )
-                    used_yolo = len(detected_boxes) > 0
+                used_yolo = True
             except Exception:
                 used_yolo = False
+                raw_yolo_cands = []
         elif skip_reason:
             yolo_skipped_reason = skip_reason
 
-    # High-Precision Multi-Scale Computer Vision & SAHI Overlapping Window Engine
-    if not detected_boxes:
-
-        # Species detection and scale band weighting
-        t_low = (tree_type_str or "").lower()
-        is_palm = any(k in t_low for k in ["نخيل", "نخل", "palm", "date", "بلح"])
-        is_casuarina = any(k in t_low for k in ["جازورين", "كافور", "سرو", "أكاسيا", "casuarina", "eucalyptus", "cypress", "acacia", "مصدات"])
-        is_citrus_olive = any(k in t_low for k in ["موالح", "برتقال", "ليمون", "يوسفي", "زيتون", "رمّان", "رمان", "مانجو", "citrus", "orange", "lemon", "olive", "pomegranate", "mango"])
-
-        # Weights across 3 spatial frequency bands:
-        # Band 1: Small crowns (1.8m - 3.2m)
-        # Band 2: Medium crowns (3.2m - 5.5m)
-        # Band 3: Large crowns (5.5m - 9.0m)
-        if is_palm:
-            w1, w2, w3 = 0.80, 1.10, 1.45
-        elif is_casuarina:
-            w1, w2, w3 = 1.45, 1.05, 0.70
-        elif is_citrus_olive:
-            w1, w2, w3 = 0.95, 1.40, 1.05
-        else:
-            w1, w2, w3 = 1.05, 1.20, 1.00
-
-        # Multi-scale Gaussian Pyramid of NDVI
-        ndvi_u8 = ((np.clip(ndvi_matrix, -0.2, 0.8) + 0.2) / 1.0 * 255.0).astype(np.uint8)
-        ndvi_pil = Image.fromarray(ndvi_u8, mode="L")
-
-        # Scale 1: Small crowns
-        sig_fine1 = max(0.9, pixel_spacing_px * 0.12)
-        sig_coarse1 = max(1.9, pixel_spacing_px * 0.28)
-        b_fine1 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_fine1)), dtype=np.float32)
-        b_coarse1 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_coarse1)), dtype=np.float32)
-        dog1 = (b_fine1 - b_coarse1) * w1
-
-        # Scale 2: Medium crowns
-        sig_fine2 = max(1.7, pixel_spacing_px * 0.22)
-        sig_coarse2 = max(3.5, pixel_spacing_px * 0.52)
-        b_fine2 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_fine2)), dtype=np.float32)
-        b_coarse2 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_coarse2)), dtype=np.float32)
-        dog2 = (b_fine2 - b_coarse2) * w2
-
-        # Scale 3: Large crowns
-        sig_fine3 = max(2.8, pixel_spacing_px * 0.35)
-        sig_coarse3 = max(5.5, pixel_spacing_px * 0.78)
-        b_fine3 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_fine3)), dtype=np.float32)
-        b_coarse3 = np.array(ndvi_pil.filter(ImageFilter.GaussianBlur(radius=sig_coarse3)), dtype=np.float32)
-        dog3 = (b_fine3 - b_coarse3) * w3
-
-        # Stack and find peak response scale
-        dogs_stacked = np.stack([dog1, dog2, dog3], axis=0)
-        best_scale_idx = np.argmax(dogs_stacked, axis=0)  # 0, 1, or 2
-        dog_canopy = np.max(dogs_stacked, axis=0)
-
-        # Morphological White Top-Hat Transform for Total Crop Carpet Elimination
-        # Removes expansive flat green fields (clover, wheat, alfalfa, vegetables)
-        k_tophat = max(5, int(pixel_spacing_px * 0.90))
-        tophat_matrix = compute_morphological_tophat(ndvi_matrix, kernel_radius_px=k_tophat)
-
-        # Dynamic Calibration Factors based on Sensitivity Slider (0.15 to 0.90)
-        sens_clamp = float(np.clip(sensitivity, 0.15, 0.95))
-        # rigor_scale: at 0.50 -> 1.0; at 0.30 -> 1.66 (very strict); at 0.75 -> 0.66 (sensitive)
-        rigor_scale = float(0.50 / sens_clamp)
-
-        tophat_th = 0.050 * rigor_scale
-        dog_th = 6.0 * rigor_scale
-        drop_th = 0.060 * rigor_scale
-        min_drop_val = 0.055 * rigor_scale
-        ratio_th = min(0.88, 0.81 + (sens_clamp - 0.50) * 0.12)
-
-        # Sky-diffuse Blue Shadow Detection
-        blue_ratio = b / (r + g + b + 1e-5)
-        shadow_map = (blue_ratio > 0.32) & (brightness < 92.0)
-
-        # Grayscale luminance array for micro-texture roughness
-        gray_arr = 0.299 * r + 0.587 * g + 0.114 * b
-        r_core = max(2, int(pixel_spacing_px * 0.25))
-        r_ring = max(r_core + 2, int(pixel_spacing_px * 0.60))
-
-        # Find true physical tree canopy peaks per overlapping SAHI slice, then fuse with WBF
-        step_px = max(2, int(pixel_spacing_px * 0.28))
-        dog_th_cand = max(2.5, 3.8 * rigor_scale)
-        raw_cv_cands: List[Dict[str, Any]] = []
-
-        seen_interior_peaks = set()
-
-        for sx1, sy1, sx2, sy2 in sahi_slices:
-            if not np.any(target_mask[sy1:sy2, sx1:sx2]):
-                continue
-            slice_seen_peaks = set()
-            for gy in range(sy1, sy2, step_px):
-                for gx in range(sx1, sx2, step_px):
-                    if not target_mask[gy, gx]:
-                        continue
-
-                    w_y1 = max(sy1, gy - r_core)
-                    w_y2 = min(sy2, gy + r_core + 1)
-                    w_x1 = max(sx1, gx - r_core)
-                    w_x2 = min(sx2, gx + r_core + 1)
-
-                    sub_dog = dog_canopy[w_y1:w_y2, w_x1:w_x2]
-                    sub_mask = target_mask[w_y1:w_y2, w_x1:w_x2]
-                    if sub_dog.size == 0 or not np.any(sub_mask):
-                        continue
-
-                    masked_dog = np.where(sub_mask, sub_dog, -999.0)
-                    max_pos = np.unravel_index(np.argmax(masked_dog), masked_dog.shape)
-                    cand_y = w_y1 + int(max_pos[0])
-                    cand_x = w_x1 + int(max_pos[1])
-                    dog_peak = float(sub_dog[max_pos])
-
-                    if dog_peak < dog_th_cand:
-                        continue
-
-                    if (cand_x, cand_y) in slice_seen_peaks or (cand_x, cand_y) in seen_interior_peaks:
-                        continue
-                    slice_seen_peaks.add((cand_x, cand_y))
-
-                    on_slice_margin = (
-                        (sx1 > 0 and cand_x < sx1 + r_ring)
-                        or (sx2 < width_px and cand_x >= sx2 - r_ring)
-                        or (sy1 > 0 and cand_y < sy1 + r_ring)
-                        or (sy2 < height_px and cand_y >= sy2 - r_ring)
-                    )
-                    if not on_slice_margin:
-                        seen_interior_peaks.add((cand_x, cand_y))
-
-                    cand_ndvi = float(ndvi_matrix[cand_y, cand_x])
-                    cand_exg = float(exg[cand_y, cand_x])
-                    cand_bright = float(brightness[cand_y, cand_x])
-                    cand_tophat = float(tophat_matrix[cand_y, cand_x])
-
-                    # Tree crown requires green foliage presence (relaxed for dark casuarinas/palms)
-                    if cand_ndvi < 0.08 or cand_exg < 3.0:
-                        continue
-
-                    # 1. Physical Tall-Tree Cast Shadow in Sun-Opposing Northern Quadrant (North / North-East in Egypt)
-                    # Trees in Egypt cast deep shadows (Brightness < 55) northward/northeastward onto ground/roads
-                    sh_y1 = max(0, cand_y - int(pixel_spacing_px * 2.2))
-                    sh_y2 = max(0, cand_y - 2)
-                    sh_x1 = max(0, cand_x - int(pixel_spacing_px * 1.5))
-                    sh_x2 = min(width_px, cand_x + int(pixel_spacing_px * 1.8) + 1)
-                    sh_patch = brightness[sh_y1:sh_y2, sh_x1:sh_x2]
-                    has_tall_shadow = False
-                    if sh_patch.size >= 6:
-                        dark_pixels = np.sum(sh_patch < 54.0)
-                        min_sh = float(np.min(sh_patch))
-                        if min_sh < 50.0 and dark_pixels >= 3:
-                            has_tall_shadow = True
-
-                    # 2. Opposing Directional Pairs Drop Test (عزل تام وحاسم لحواف الحقول والخطوط العادية):
-                    # A 1D step-edge (field border, ditch, road line) drops in ONLY ONE direction (towards road)
-                    # while the opposite ray (towards field) remains high.
-                    # A 2D tree dome drops in BOTH opposite directions across its cross-section!
-                    angles = [0.0, 0.7854, 1.5708, 2.3562, 3.1416, 3.9270, 4.7124, 5.4978]
-                    two_sided_drop_pairs = 0
-                    step_edge_pairs = 0
-                    drop_rays_total = 0
-
-                    for p_idx in range(4):
-                        a1 = angles[p_idx]
-                        a2 = angles[p_idx + 4]
-                        rx1 = int(round(cand_x + r_ring * math.cos(a1)))
-                        ry1 = int(round(cand_y + r_ring * math.sin(a1)))
-                        rx2 = int(round(cand_x + r_ring * math.cos(a2)))
-                        ry2 = int(round(cand_y + r_ring * math.sin(a2)))
-
-                        val1 = float(ndvi_matrix[ry1, rx1]) if (0 <= rx1 < width_px and 0 <= ry1 < height_px) else -0.5
-                        val2 = float(ndvi_matrix[ry2, rx2]) if (0 <= rx2 < width_px and 0 <= ry2 < height_px) else -0.5
-
-                        d1 = cand_ndvi - val1
-                        d2 = cand_ndvi - val2
-
-                        if d1 >= min_drop_val:
-                            drop_rays_total += 1
-                        if d2 >= min_drop_val:
-                            drop_rays_total += 1
-
-                        if d1 >= 0.045 and d2 >= 0.045:
-                            two_sided_drop_pairs += 1
-                        elif (d1 >= 0.12 and d2 < 0.02) or (d2 >= 0.12 and d1 < 0.02):
-                            step_edge_pairs += 1
-
-                    # If it is purely a 1D step edge with NO opposing drops on any axis: REJECT IT!
-                    # (This completely eliminates the necklace of fake points along the boundary vector line)
-                    if two_sided_drop_pairs == 0 and not has_tall_shadow:
-                        continue
-                    if step_edge_pairs >= 2 and two_sided_drop_pairs == 0:
-                        continue
-
-                    # 3. Luminance Micro-Texture Roughness (عزل المحاصيل والبرسيم المسطح الأملس):
-                    patch_gray = gray_arr[max(0, cand_y - 3):min(height_px, cand_y + 4),
-                                          max(0, cand_x - 3):min(width_px, cand_x + 4)]
-                    lum_std = float(np.std(patch_gray)) if patch_gray.size >= 9 else 0.0
-                    if lum_std < 6.8 and not has_tall_shadow:
-                        # Smooth flat agricultural crop carpet -> REJECT!
-                        continue
-
-                    # 4. Radial Annular Drop (Tree Dome vs Flat Field)
-                    ring_y1 = max(0, cand_y - r_ring)
-                    ring_y2 = min(height_px, cand_y + r_ring + 1)
-                    ring_x1 = max(0, cand_x - r_ring)
-                    ring_x2 = min(width_px, cand_x + r_ring + 1)
-
-                    ring_ndvi_crop = ndvi_matrix[ring_y1:ring_y2, ring_x1:ring_x2]
-                    core_ndvi_crop = ndvi_matrix[max(0, cand_y - r_core):min(height_px, cand_y + r_core + 1),
-                                                 max(0, cand_x - r_core):min(width_px, cand_x + r_core + 1)]
-
-                    mean_core = float(np.mean(core_ndvi_crop)) if core_ndvi_crop.size > 0 else cand_ndvi
-                    mean_ring = float(np.mean(ring_ndvi_crop)) if ring_ndvi_crop.size > 0 else mean_core
-                    annular_drop = mean_core - mean_ring
-                    ring_ratio = mean_ring / (mean_core + 1e-5)
-
-                    # Acceptance Criteria:
-                    # Type A: Upright tree with tall cast shadow (e.g. palms, casuarinas, boundary trees)
-                    # Type B: Isolated standalone 2D tree dome with two-sided drops on multiple axes
-                    is_real_tree = False
-                    if has_tall_shadow and (two_sided_drop_pairs >= 1 or drop_rays_total >= 3):
-                        is_real_tree = True
-                    elif two_sided_drop_pairs >= 2 and annular_drop >= drop_th and ring_ratio <= ratio_th and drop_rays_total >= 4:
-                        ring_bright = brightness[ring_y1:ring_y2, ring_x1:ring_x2]
-                        min_ring_b = float(np.min(ring_bright)) if ring_bright.size > 0 else 100.0
-                        if min_ring_b < 75.0 or cand_tophat >= tophat_th:
-                            is_real_tree = True
-
-                    if not is_real_tree:
-                        continue
-
-                    # Sub-pixel Quadratic Apex Interpolation
-                    dx_sub, dy_sub = 0.0, 0.0
-                    if 1 <= cand_x < width_px - 1 and 1 <= cand_y < height_px - 1:
-                        dx1 = float(dog_canopy[cand_y, cand_x - 1])
-                        dx2 = float(dog_canopy[cand_y, cand_x])
-                        dx3 = float(dog_canopy[cand_y, cand_x + 1])
-                        denom_x = 2.0 * (2.0 * dx2 - dx1 - dx3)
-                        if abs(denom_x) > 1e-4:
-                            dx_sub = float(np.clip((dx3 - dx1) / denom_x, -0.45, 0.45))
-
-                        dy1 = float(dog_canopy[cand_y - 1, cand_x])
-                        dy2 = float(dog_canopy[cand_y, cand_x])
-                        dy3 = float(dog_canopy[cand_y + 1, cand_x])
-                        denom_y = 2.0 * (2.0 * dy2 - dy1 - dy3)
-                        if abs(denom_y) > 1e-4:
-                            dy_sub = float(np.clip((dy3 - dy1) / denom_y, -0.45, 0.45))
-
-                    sub_cx = int(round(cand_x + dx_sub))
-                    sub_cy = int(round(cand_y + dy_sub))
-
-                    if not (0 <= sub_cx < width_px and 0 <= sub_cy < height_px and target_mask[sub_cy, sub_cx]):
-                        continue
-
-                    win_scale = int(best_scale_idx[cand_y, cand_x])
-                    if win_scale == 0:
-                        crown_radius = max(3, int(pixel_spacing_px * 0.24))
-                    elif win_scale == 1:
-                        crown_radius = max(5, int(pixel_spacing_px * 0.38))
-                    else:
-                        crown_radius = max(7, int(pixel_spacing_px * 0.54))
-
-                    if is_palm or win_scale == 2:
-                        cls_id, cls_name = 1, "palm_tree"
-                    elif is_casuarina or bool(corridor_mask[sub_cy, sub_cx]):
-                        cls_id, cls_name = 2, "windbreak_tree"
-                    else:
-                        cls_id, cls_name = 0, "orchard_tree"
-
-                    raw_cv_cands.append({
-                        "bbox": (sub_cx - crown_radius, sub_cy - crown_radius, sub_cx + crown_radius, sub_cy + crown_radius),
-                        "center": (sub_cx, sub_cy),
-                        "conf": min(1.0, float(max(annular_drop * 6.0, cand_tophat * 8.0, dog_peak / 20.0))),
-                        "crown_radius": crown_radius,
-                        "class_id": cls_id,
-                        "class_name": cls_name,
-                    })
-
-        # Fuse detections across overlapping SAHI windows with Weighted Boxes Fusion (IoU = 0.45)
-        fused_cv = _apply_sahi_wbf_nms(raw_cv_cands, iou_thresh=0.45, min_dist_px=min_sep_px)
-        detected_boxes = _verify_shadow_and_laplacian_texture(
-            fused_cv, arr, gray_full, exg, target_mask
+    if used_yolo:
+        fused = _apply_sahi_wbf_nms(raw_yolo_cands, iou_thresh=NMS_IOU_THRESH, min_dist_px=min_sep_px)
+        detected_boxes = _verify_cast_shadow_and_telemetry(
+            fused, arr, lum_arr, hsv_v, lap_mag, target_mask, stage1_mask,
+            px_per_m, require_strict_cast_shadow=False,
+        )
+    elif np.any(stage1_mask):
+        raw_dog = _detect_structural_crowns_dog(
+            arr, lum_arr, stage1_mask, px_per_m, tree_type_str, corridor_mask
+        )
+        fused = _apply_sahi_wbf_nms(raw_dog, iou_thresh=NMS_IOU_THRESH, min_dist_px=min_sep_px)
+        detected_boxes = _verify_cast_shadow_and_telemetry(
+            fused, arr, lum_arr, hsv_v, lap_mag, target_mask, stage1_mask,
+            px_per_m, require_strict_cast_shadow=True,
         )
 
-        # Explicitly release large intermediate arrays before image rendering
-        del dogs_stacked, dog1, dog2, dog3, dog_canopy, best_scale_idx, tophat_matrix, shadow_map, gray_arr
+    del arr, stage1_masked_u8, lum_arr, hsv_v, lap_mag, r, g, b
 
-    del arr, masked_arr_u8, gray_full, r, g, b, exg, brightness
-
-    # 4. Classify Health (Healthy vs Stressed vs Dead/Damaged) for each detected tree
+    # Health Classification on verified detections only
     trees_classified: List[Dict[str, Any]] = []
     healthy_count = 0
     stressed_count = 0
@@ -962,14 +990,11 @@ def detect_and_classify_trees(
         bx1, by1, bx2, by2 = item["bbox"]
         cx, cy = item["center"]
         crown_rad = item.get("crown_radius", max(4, int((bx2 - bx1) // 2)))
-
-        # Clamp box to image limits
         cx1 = max(0, min(width_px - 1, bx1))
         cy1 = max(0, min(height_px - 1, by1))
         cx2 = max(0, min(width_px - 1, bx2))
         cy2 = max(0, min(height_px - 1, by2))
 
-        # Sample NDVI inside tree crown box
         crown_ndvi_crop = ndvi_matrix[cy1:cy2 + 1, cx1:cx2 + 1]
         if crown_ndvi_crop.size > 0:
             mean_ndvi = float(np.mean(crown_ndvi_crop))
@@ -978,21 +1003,20 @@ def detect_and_classify_trees(
             mean_ndvi = float(ndvi_matrix[cy, cx])
             max_ndvi = mean_ndvi
 
-        # Health state determination
         if mean_ndvi >= healthy_ndvi_threshold or max_ndvi >= (healthy_ndvi_threshold + 0.05):
             status = "healthy"
             status_ar = "سليمة / حيوية عالية"
-            color_rgb = (34, 197, 94)    # Green
+            color_rgb = (34, 197, 94)
             healthy_count += 1
         elif mean_ndvi >= stressed_ndvi_threshold:
             status = "stressed"
             status_ar = "مجهدة / حيوية متوسطة"
-            color_rgb = (234, 179, 8)    # Yellow
+            color_rgb = (234, 179, 8)
             stressed_count += 1
         else:
             status = "damaged"
             status_ar = "ميتة أو تالفة / جافة"
-            color_rgb = (239, 68, 68)    # Red
+            color_rgb = (239, 68, 68)
             damaged_count += 1
 
         trees_classified.append({
@@ -1002,9 +1026,11 @@ def detect_and_classify_trees(
             "crown_radius": crown_rad,
             "class_id": int(item.get("class_id", 0)),
             "class_name": str(item.get("class_name", "orchard_tree")),
-            "conf": float(item.get("conf", 0.5)),
+            "conf": float(item.get("conf", 0.55)),
             "shadow_drop": float(item.get("shadow_drop", 0.0)),
             "laplacian_var": float(item.get("laplacian_var", 0.0)),
+            "circularity": item.get("circularity"),
+            "crown_diameter_m": item.get("crown_diameter_m"),
             "mean_ndvi": round(mean_ndvi, 3),
             "max_ndvi": round(max_ndvi, 3),
             "status": status,
@@ -1017,13 +1043,10 @@ def detect_and_classify_trees(
     stressed_pct = round((stressed_count / max(1, total_trees)) * 100.0, 1) if total_trees > 0 else 0.0
     damaged_pct = round((damaged_count / max(1, total_trees)) * 100.0, 1) if total_trees > 0 else 0.0
 
-    # 5. Render Clean Visual Detection Image (Clean Canopy Circles + UTF-8 Arabic Font, zero overlapping dark boxes)
+    # Render Clean Canopy Overlay + Dual-Font Reshaped BiDi Arabic Banner (Zero [▯] glyph boxes)
     annotated_img = orig_img.copy()
     draw_ann = ImageDraw.Draw(annotated_img)
-    ar_font_sm = _get_arabic_pil_font(12)
-    ar_font_hdr = _get_arabic_pil_font(14)
 
-    # Draw farm boundary in bright turquoise
     if parcel_poly_px and len(parcel_poly_px) >= 3:
         draw_ann.line(parcel_poly_px + [parcel_poly_px[0]], fill=(0, 255, 200), width=3)
 
@@ -1032,29 +1055,23 @@ def detect_and_classify_trees(
         col = t["color_rgb"]
         cr = t.get("crown_radius", 5)
 
-        # Clean concentric canopy circle + high-contrast center pinpoint (no cluttered dark rectangles)
         draw_ann.ellipse([cx - cr, cy - cr, cx + cr, cy + cr], outline=col, width=2)
         draw_ann.ellipse([cx - 3, cy - 3, cx + 3, cy + 3], fill=(0, 0, 0))
         draw_ann.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=col)
 
         if show_compact_ids:
-            tid = t["tree_id"]
-            id_txt = f"{tid}"
-            draw_ann.text((cx + cr + 2, cy - 6), id_txt, fill=(255, 255, 255), font=ar_font_sm)
+            _draw_mixed_bidi_text(draw_ann, (cx + cr + 2, cy - 6), str(t["tree_id"]), fill=(255, 255, 255), size=11)
 
-    # Top Statistical Banner with reshaped Arabic text (prevents [□□□□] glyph boxes)
     banner_h = 38
     draw_ann.rectangle([0, 0, width_px, banner_h], fill=(15, 23, 42))
-    header_txt = _format_arabic_text(
+    header_txt = (
         f"إجمالي الأشجار: {total_trees} | سليمة: {healthy_count} ({healthy_pct}%) | "
         f"مجهدة: {stressed_count} ({stressed_pct}%) | تالفة: {damaged_count} ({damaged_pct}%)"
     )
-    draw_ann.text((12, 9), header_txt, fill=(0, 255, 200), font=ar_font_hdr)
+    _draw_mixed_bidi_text(draw_ann, (12, 9), header_txt, fill=(0, 255, 200), size=14)
 
-    # Generate optional NDVI heatmap image only when explicitly requested
     ndvi_heatmap = generate_ndvi_colormap_image(ndvi_matrix, mask=parcel_mask) if generate_heatmap else None
 
-    # Compute overall vegetation coverage percentage
     veg_pixels = (ndvi_matrix > 0.12) & parcel_mask
     parcel_veg_coverage_pct = round(float(np.sum(veg_pixels) / max(1, total_parcel_pixels) * 100.0), 1)
 
@@ -1067,9 +1084,16 @@ def detect_and_classify_trees(
         "damaged_count": damaged_count,
         "damaged_pct": damaged_pct,
         "parcel_veg_coverage_pct": parcel_veg_coverage_pct,
+        "stage1_active_pct": stage1_active_pct,
+        "stage1_cells_kept": cells_kept,
+        "stage1_cells_total": cells_total,
         "annotated_image": annotated_img,
         "ndvi_heatmap_image": ndvi_heatmap,
-        "engine_used": f"YOLOv8 SAHI {slice_size}px ({os.path.basename(active_yolo_path)})" if used_yolo else f"SAHI {slice_size}px ({int(tile_overlap * 100)}% Overlap) + OpenCV WBF",
+        "engine_used": (
+            f"YOLOv8 SAHI {slice_size}px ({os.path.basename(active_yolo_path)}, Conf>=0.55)"
+            if used_yolo
+            else "Two-Stage DoG Structural Crowns + Cast-Shadow (>=35%)"
+        ),
         "yolo_model_loaded": used_yolo,
         "yolo_model_path": active_yolo_path if used_yolo else None,
         "yolo_skipped_reason": yolo_skipped_reason,

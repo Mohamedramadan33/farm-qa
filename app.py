@@ -342,7 +342,7 @@ def run_cached_satellite_canopy(
         detection_mode=detection_mode,
         sensitivity=round(float(sensitivity), 2),
         target_zoom=19,
-        tile_overlap=0.25,
+        tile_overlap=0.20,
     )
     out = dict(res)
     for img_key in ("annotated_img", "clean_img"):

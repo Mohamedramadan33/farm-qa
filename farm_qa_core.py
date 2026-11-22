@@ -1169,20 +1169,14 @@ def analyze_farm_satellite_canopy(
     d_lon_m = abs(raw_max_lon - raw_min_lon) * 111139.0 * max(0.25, math.cos(math.radians(center_lat)))
     max_span_m = max(d_lat_m, d_lon_m)
 
-    # Multi-Zoom Target Stitching (prefers Z19 ~0.3m/px for crisp tree canopies)
+    # Multi-Zoom Target Stitching (prefers native Zoom 19 ~0.26m/px for crisp tree canopies)
     req_zoom = int(max(16, min(20, target_zoom if target_zoom is not None else zoom)))
-    if max_span_m > 1800:
-        zoom = min(req_zoom, 17)
-    elif max_span_m > 700:
-        zoom = min(req_zoom, 18)
-    else:
-        zoom = req_zoom
+    zoom = req_zoom
 
-    # Step down zoom if tile grid exceeds Streamlit Cloud 1GB RAM-safe ceiling
-    # (up to 7x7 = 49 tiles = 1792x1792 px at Z19; 6x6 = 36 tiles below Z19)
-    while zoom > 13:
-        max_side = 7 if zoom >= 19 else 6
-        max_tiles = 49 if zoom >= 19 else 36
+    # Step down zoom ONLY if tile grid exceeds safe memory ceiling (up to 12x12 = 144 tiles at Z19)
+    while zoom > 14:
+        max_side = 12 if zoom >= 19 else 9
+        max_tiles = 144 if zoom >= 19 else 81
         tx1, ty1 = lon_lat_to_tile(min_lon, max_lat, zoom)
         tx2, ty2 = lon_lat_to_tile(max_lon, min_lat, zoom)
         nx = abs(tx2 - tx1) + 1
@@ -1216,9 +1210,7 @@ def analyze_farm_satellite_canopy(
     elif tiles_loaded < tiles_total:
         tile_error = f"تم تحميل {tiles_loaded} من أصل {tiles_total} مربع قمر صناعي فقط."
 
-    # Enhance crown edges & luminance contrast without distorting vegetation RGB chromaticity
-    if has_tile:
-        stitched = _enhance_satellite_mosaic(stitched)
+    # Keep unaltered raw Z19 pixels for accurate shadow & texture analysis in Stage 1 / Stage 2
 
     def to_px(lon: float, lat: float) -> Tuple[int, int]:
         lat_rad = math.radians(lat)
@@ -1250,11 +1242,11 @@ def analyze_farm_satellite_canopy(
     clean_img = stitched.copy()
     draw_clean = ImageDraw.Draw(clean_img)
     draw_clean.line(poly_px + [poly_px[0]], fill=(0, 255, 200), width=3)
-    draw_clean.rectangle([0, 0, width_px, 32], fill=(15, 23, 42))
-    header_clean = f"SATELLITE VIEW (HD RESOLUTION | Z{zoom}) | Farm Boundary GPS | Date: {imagery_date or 'Recent'}"
-    draw_clean.text((12, 9), header_clean, fill=(0, 255, 200))
+    draw_clean.rectangle([0, 0, width_px, 34], fill=(15, 23, 42))
+    header_clean = f"SATELLITE VIEW (Z{zoom} | {round(1.0 / max(px_per_m, 0.01), 2)} m/px) | Date: {imagery_date or 'Recent'}"
+    ndvi_mod._draw_mixed_bidi_text(draw_clean, (12, 9), header_clean, fill=(0, 255, 200), size=13)
 
-    # 2. RUN INTEGRATED CV & SAHI/WBF DETECTION MODULE
+    # 2. RUN TWO-STAGE STRUCTURAL CV & SAHI/YOLO DETECTION MODULE
     cv_res = ndvi_mod.detect_and_classify_trees(
         satellite_image=stitched,
         parcel_poly_px=poly_px,

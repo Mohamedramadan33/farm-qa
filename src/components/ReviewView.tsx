@@ -870,7 +870,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                 <div className="inline-flex items-center gap-1 p-0.5 bg-slate-100 rounded-lg text-[11px] font-medium">
                   {(
                     [
-                      { id: 'google', label: 'Google (Z19-20)' },
+                      { id: 'google', label: 'Google (Z19)' },
                       { id: 'esri', label: 'Esri (Z18-19)' },
                       { id: 'compare', label: 'Side-by-Side Compare' },
                     ] as Array<{ id: BasemapViewMode; label: string }>
@@ -904,6 +904,56 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
 
               {satRes ? (
                 <div className="space-y-2.5 flex-1 flex flex-col">
+                  {/* Crisp HTML/CSS Arabic & Numeric Telemetry HUD (zero canvas glyph boxes) */}
+                  <div
+                    dir="rtl"
+                    className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-slate-900 text-slate-100 text-[11px] border border-slate-800"
+                  >
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <span className="font-semibold text-emerald-300">
+                        إجمالي الأشجار المرصودة:{' '}
+                        <strong className="font-mono-num text-white">{satRes.boxes.length}</strong>
+                      </span>
+                      <span className="text-slate-600">|</span>
+                      <span className="text-slate-300">
+                        بستان:{' '}
+                        <strong className="font-mono-num text-emerald-400">
+                          {classCounts.orchard_tree}
+                        </strong>{' '}
+                        <span className="font-mono-num text-slate-400">
+                          (
+                          {satRes.boxes.length > 0
+                            ? ((classCounts.orchard_tree / satRes.boxes.length) * 100).toFixed(1)
+                            : '0.0'}
+                          %)
+                        </span>
+                      </span>
+                      <span className="text-slate-300">
+                        نخيل:{' '}
+                        <strong className="font-mono-num text-amber-400">
+                          {classCounts.palm_tree}
+                        </strong>
+                      </span>
+                      <span className="text-slate-300">
+                        مصدات:{' '}
+                        <strong className="font-mono-num text-cyan-400">
+                          {classCounts.windbreak_tree}
+                        </strong>
+                      </span>
+                    </div>
+
+                    <div dir="ltr" className="flex items-center gap-2 font-mono-num text-[10px] text-sky-300">
+                      <span>
+                        {satRes.provider} · Z{satRes.zoomUsed} ({satRes.mpp} m/px)
+                      </span>
+                      {typeof satRes.stage1ActivePct === 'number' && (
+                        <span className="text-slate-400">
+                          · Stage-1 Kept: {satRes.stage1ActivePct}%
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
                   <div
                     className={`grid gap-2.5 flex-1 ${
                       providerMode === 'compare' && satRes.compareImageUrl
@@ -993,10 +1043,10 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                         {/* Interactive Hover / Click Tooltip */}
                         {activeTree && (
                           <div
-                            className="absolute z-20 pointer-events-none px-2.5 py-2 rounded-lg bg-slate-900/95 border border-slate-700 text-white text-[11px] shadow-lg max-w-[230px]"
+                            className="absolute z-20 pointer-events-none px-2.5 py-2 rounded-lg bg-slate-900/95 border border-slate-700 text-white text-[11px] shadow-lg max-w-[250px]"
                             style={{
-                              left: `${Math.min(72, Math.max(4, (activeTree.cx / satRes.canvasWidth) * 100))}%`,
-                              top: `${Math.min(72, Math.max(4, (activeTree.cy / satRes.canvasHeight) * 100))}%`,
+                              left: `${Math.min(70, Math.max(4, (activeTree.cx / satRes.canvasWidth) * 100))}%`,
+                              top: `${Math.min(70, Math.max(4, (activeTree.cy / satRes.canvasHeight) * 100))}%`,
                             }}
                           >
                             <div className="flex items-center justify-between gap-3 font-semibold">
@@ -1010,16 +1060,24 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                             <div className="text-slate-200 mt-0.5">
                               {classLabelAr[activeTree.className]}
                             </div>
-                            <div className="text-[10px] font-mono-num text-slate-400 mt-0.5">
-                              Shadow ΔV: {activeTree.shadowDrop.toFixed(2)} · Lap Var:{' '}
+                            <div className="text-[10px] font-mono-num text-slate-300 mt-0.5">
+                              Shadow Drop: {Math.round(activeTree.shadowDrop * 100)}% · Lap Var:{' '}
                               {activeTree.laplacianVar}
                             </div>
+                            {(activeTree.crownDiameterM !== undefined ||
+                              activeTree.circularity !== undefined) && (
+                              <div className="text-[10px] font-mono-num text-slate-400 mt-0.5">
+                                {activeTree.crownDiameterM !== undefined &&
+                                  `Crown: ${activeTree.crownDiameterM}m`}
+                                {activeTree.crownDiameterM !== undefined &&
+                                  activeTree.circularity !== undefined &&
+                                  ' · '}
+                                {activeTree.circularity !== undefined &&
+                                  `Circularity: ${activeTree.circularity}`}
+                              </div>
+                            )}
                           </div>
                         )}
-                      </div>
-
-                      <div className="absolute top-2 left-2 px-2 py-0.5 rounded bg-slate-900/85 text-[10px] font-mono-num text-sky-300">
-                        {satRes.provider} · Z{satRes.zoomUsed} ({satRes.mpp} m/px)
                       </div>
 
                       <button
