@@ -1,10 +1,13 @@
-import express from 'express';
+import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { GoogleGenAI, Type } from '@google/genai';
+import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { SEED_LABELS, SEED_SUBMISSIONS } from './src/server/seedSubmissions.ts';
 import { divideWorkFairly, type UnvalidatedFarmItem } from './src/lib/workDivider.ts';
 import {
@@ -15,6 +18,8 @@ import {
   type MasterReviewRecord,
   type RawKoboSubmission,
   type TeamMemberKey,
+  type TreeClassName,
+  type TreeHealthStatus,
 } from './src/types/qa.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -26,6 +31,60 @@ const KOBO_SERVER = (process.env.KOBO_SERVER || 'https://kf.kobotoolbox.org').re
 const KOBO_ASSET_UID = process.env.KOBO_ASSET_UID || 'aX4NJWgge6tooXjfSYXhrq';
 const ALLOWED_MEDIA_HOST = new URL(KOBO_SERVER).hostname;
 const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+const SESSION_SECRET =
+  process.env.SESSION_SECRET?.trim() || crypto.randomBytes(32).toString('hex');
+const SESSION_TTL_SEC = 12 * 3600;
+
+interface ServerDetectionConfig {
+  version: string;
+  classes: TreeClassName[];
+  aiModelConfThresh: number;
+  confIntervalDelta: number;
+  sahiTileSize: number;
+  sahiOverlap: number;
+  highAccuracyTileSize?: number;
+  highAccuracyOverlap?: number;
+  nmsIouThresh: number;
+  wbfIouThresh?: number;
+  classAwareNms: boolean;
+  crossClassSuppressionIou: number;
+  minCrownDiamM: number;
+  maxCrownDiamM: number;
+}
+
+const DEFAULT_DETECTION_CONFIG: ServerDetectionConfig = {
+  version: '1.1.0',
+  classes: ['orchard_tree', 'palm_tree', 'windbreak_tree'],
+  aiModelConfThresh: 0.55,
+  confIntervalDelta: 0.1,
+  sahiTileSize: 512,
+  sahiOverlap: 0.25,
+  highAccuracyTileSize: 384,
+  highAccuracyOverlap: 0.3,
+  nmsIouThresh: 0.4,
+  wbfIouThresh: 0.45,
+  classAwareNms: true,
+  crossClassSuppressionIou: 0.85,
+  minCrownDiamM: 1.8,
+  maxCrownDiamM: 7.0,
+};
+
+function loadServerDetectionConfig(): ServerDetectionConfig {
+  const cfgPath = path.resolve(__dirname, 'config', 'detection.config.json');
+  try {
+    if (fs.existsSync(cfgPath)) {
+      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')) as Partial<ServerDetectionConfig>;
+      return { ...DEFAULT_DETECTION_CONFIG, ...parsed };
+    }
+  } catch {
+    // Fallback to defaults if config JSON cannot be read
+  }
+  return DEFAULT_DETECTION_CONFIG;
+}
+
+const detectionConfig = loadServerDetectionConfig();
+const TREE_CLASSES = ['orchard_tree', 'palm_tree', 'windbreak_tree'] as const;
+const FEEDBACK_ROOT = path.resolve(__dirname, 'dataset', 'feedback_queue');
 
 function isAllowedMediaUrl(raw: string): boolean {
   try {
@@ -35,8 +94,6 @@ function isAllowedMediaUrl(raw: string): boolean {
     return false;
   }
 }
-
-const TREE_CLASSES = ['orchard_tree', 'palm_tree', 'windbreak_tree'] as const;
 
 function resolveConfinedModel(relCandidates: string[]): string | null {
   for (const rel of relCandidates) {
@@ -61,6 +118,238 @@ async function checkPythonYoloAvailable(): Promise<boolean> {
   return cachedPyYoloAvail;
 }
 
+function signDetectionToken(userKey: TeamMemberKey): string {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const payload = Buffer.from(
+    JSON.stringify({ sub: userKey, iat: nowSec, exp: nowSec + SESSION_TTL_SEC }),
+    'utf-8'
+  ).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifyDetectionToken(token: string): boolean {
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  const [payloadB64, sigB64] = parts;
+  if (!payloadB64 || !sigB64) return false;
+
+  const expectedSig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(payloadB64)
+    .digest('base64url');
+  const a = Buffer.from(sigB64);
+  const b = Buffer.from(expectedSig);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+
+  try {
+    const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8')) as {
+      sub?: string;
+      exp?: number;
+    };
+    if (!decoded.sub || !TEAM_KEYS.includes(decoded.sub as TeamMemberKey)) return false;
+    if (!decoded.exp || decoded.exp < Math.floor(Date.now() / 1000)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function requireDetectionAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
+  const authHeader = String(req.headers.authorization || '').trim();
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (token && verifyDetectionToken(token)) {
+      next();
+      return;
+    }
+  }
+
+  const configuredKey = process.env.DETECTION_API_KEY?.trim();
+  const apiKeyHeader = String(req.headers['x-api-key'] || '').trim();
+  if (configuredKey && apiKeyHeader) {
+    const a = Buffer.from(apiKeyHeader);
+    const b = Buffer.from(configuredKey);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      next();
+      return;
+    }
+  }
+
+  res.status(401).json({
+    ok: false,
+    error: 'Authentication required (valid Bearer session token or X-API-Key).',
+  });
+}
+
+function pointInRing(x: number, y: number, ring: Array<[number, number]>): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    const intersect = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function worldPxToLonLatServer(px: number, py: number, zoom: number): [number, number] {
+  const worldSize = 256 * Math.pow(2, zoom);
+  const lon = (px / worldSize) * 360 - 180;
+  const n = Math.PI - (2 * Math.PI * py) / worldSize;
+  const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+  return [lon, lat];
+}
+
+interface ServerDetectionBox {
+  xmin: number;
+  ymin: number;
+  xmax: number;
+  ymax: number;
+  label: TreeClassName;
+  confidence: number;
+  health: TreeHealthStatus;
+  lat?: number;
+  lon?: number;
+}
+
+function serverBoxIoU(a: ServerDetectionBox, b: ServerDetectionBox): number {
+  const ix1 = Math.max(a.xmin, b.xmin);
+  const iy1 = Math.max(a.ymin, b.ymin);
+  const ix2 = Math.min(a.xmax, b.xmax);
+  const iy2 = Math.min(a.ymax, b.ymax);
+  if (ix2 <= ix1 || iy2 <= iy1) return 0;
+  const inter = (ix2 - ix1) * (iy2 - iy1);
+  const areaA = Math.max(1, (a.xmax - a.xmin) * (a.ymax - a.ymin));
+  const areaB = Math.max(1, (b.xmax - b.xmin) * (b.ymax - b.ymin));
+  return inter / (areaA + areaB - inter);
+}
+
+/**
+ * Class-Aware Weighted Box Fusion (WBF) for overlapping SAHI tiles.
+ * Confidence-weights duplicate seam detections instead of discarding edge boxes,
+ * producing tighter crown centers across tile boundaries.
+ */
+function fuseServerDetectionsWBF(
+  boxes: ServerDetectionBox[],
+  iouThresh: number,
+  minCenterDistPx: number,
+  crossClassIou: number
+): ServerDetectionBox[] {
+  const ordered = [...boxes].sort((a, b) => b.confidence - a.confidence);
+  interface Cluster {
+    wSum: number;
+    maxConf: number;
+    wxmin: number;
+    wymin: number;
+    wxmax: number;
+    wymax: number;
+    label: TreeClassName;
+    health: TreeHealthStatus;
+    rep: ServerDetectionBox;
+  }
+
+  const clusters: Cluster[] = [];
+  for (const b of ordered) {
+    const cx = (b.xmin + b.xmax) / 2;
+    const cy = (b.ymin + b.ymax) / 2;
+    let target: Cluster | null = null;
+
+    for (const cl of clusters) {
+      const iou = serverBoxIoU(b, cl.rep);
+      const pcx = (cl.rep.xmin + cl.rep.xmax) / 2;
+      const pcy = (cl.rep.ymin + cl.rep.ymax) / 2;
+      const dist = Math.hypot(cx - pcx, cy - pcy);
+
+      if (b.label === cl.label) {
+        if (iou >= iouThresh || dist < minCenterDistPx) {
+          target = cl;
+          break;
+        }
+      } else if (iou >= crossClassIou) {
+        target = cl;
+        break;
+      }
+    }
+
+    const w = Math.max(0.05, b.confidence);
+    if (!target) {
+      clusters.push({
+        wSum: w,
+        maxConf: b.confidence,
+        wxmin: b.xmin * w,
+        wymin: b.ymin * w,
+        wxmax: b.xmax * w,
+        wymax: b.ymax * w,
+        label: b.label,
+        health: b.health,
+        rep: { ...b },
+      });
+    } else {
+      if (b.confidence > target.maxConf) {
+        target.label = b.label;
+        target.health = b.health;
+      }
+      target.wSum += w;
+      target.maxConf = Math.max(target.maxConf, b.confidence);
+      target.wxmin += b.xmin * w;
+      target.wymin += b.ymin * w;
+      target.wxmax += b.xmax * w;
+      target.wymax += b.ymax * w;
+      target.rep = {
+        xmin: target.wxmin / target.wSum,
+        ymin: target.wymin / target.wSum,
+        xmax: target.wxmax / target.wSum,
+        ymax: target.wymax / target.wSum,
+        label: target.label,
+        confidence: target.maxConf,
+        health: target.health,
+      };
+    }
+  }
+
+  return clusters.slice(0, 1200).map((cl) => ({
+    xmin: Math.round(cl.rep.xmin),
+    ymin: Math.round(cl.rep.ymin),
+    xmax: Math.round(cl.rep.xmax),
+    ymax: Math.round(cl.rep.ymax),
+    label: cl.label,
+    confidence: Number(cl.maxConf.toFixed(3)),
+    health: cl.health,
+  }));
+}
+
+function buildTreeVisionPrompt(tileW: number, tileH: number, mpp: number): string {
+  const pxPerM = 1 / Math.max(mpp, 0.1);
+  const youngPx = Math.max(6, Math.round(1.8 * pxPerM));
+  const maturePx = Math.round(6.0 * pxPerM);
+  return [
+    'You are an expert agricultural geospatial computer-vision detector analyzing high-resolution top-down satellite imagery of Egyptian farms (Nile Delta & desert reclamation orchards).',
+    `Image dimensions: ${tileW}x${tileH} px at ~${mpp.toFixed(2)} m/pixel (~${youngPx}-${maturePx} px diameter for typical 1.8m-6.0m tree crowns).`,
+    '',
+    'TASK: Detect EVERY distinct individual tree or palm crown visible inside the tile.',
+    '',
+    'CRITICAL POSITIVE RULES (INCLUDE):',
+    '1. Detect mature orchard trees (citrus, mango, olive, guava, pomegranate) AND young/small orchard saplings (~1.5m-3m) planted in rhythmic grid rows along sandy or tilled drip lines. Look for rounded textured foliage blobs paired with an adjacent dark directional cast shadow.',
+    '2. Detect date palms ("palm_tree"): recognizable by star/rosette frond texture and elongated palm shadows.',
+    '3. Detect boundary hedgerow/windbreak trees ("windbreak_tree"): tall linear casuarina/eucalyptus trees along farm edges, fences, or canals.',
+    '4. When adjacent trees in a row touch slightly, emit SEPARATE tight bounding boxes centered on each individual tree crown rather than merging multiple trees into one large box.',
+    '5. Center [ymin, xmin, ymax, xmax] tightly on the sunlit leafy crown ONLY—exclude the elongated cast shadow tail.',
+    '',
+    'CRITICAL NEGATIVE RULES (STRICTLY IGNORE):',
+    '- DO NOT detect flat uniform green field crops (berseem/clover, alfalfa, wheat, maize/vegetables in dense beds), furrow stripes, weeds, or bare soil.',
+    '- DO NOT detect buildings, sheds, greenhouses, shade nets, water basins, canal water, roads, vehicles, or standalone shadows with no leafy crown.',
+    '- Ignore any thin cyan dashed boundary guide line or slightly dimmed border region outside the parcel.',
+    '- If the tile contains only flat crops, soil, or buildings, return detections: [].',
+    '',
+    'Return ONLY JSON matching the schema with normalized coordinates [ymin, xmin, ymax, xmax] in 0..1000.',
+  ].join('\n');
+}
+
 function nowStr(): string {
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -73,7 +362,6 @@ const masterReviews = new Map<string, MasterReviewRecord>();
 const fieldReviews = new Map<string, FieldDecisionRow[]>();
 const assignments = new Map<string, AssignmentRecord>();
 
-// Initialize balanced initial assignments across the 4 EBDA team members for seed submissions
 SEED_SUBMISSIONS.forEach((sub, idx) => {
   const subId = String(sub._id);
   const member = TEAM_KEYS[idx % TEAM_KEYS.length];
@@ -194,7 +482,35 @@ async function getSubmissionsBundle(forceRefresh = false) {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '15mb' }));
+  app.set('trust proxy', 1);
+  app.use(express.json({ limit: '25mb' }));
+
+  const detectionLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 45,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { ok: false, error: 'Too many detection requests; please wait a moment.' },
+  });
+
+  const feedbackLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { ok: false, error: 'Too many dataset feedback uploads; please wait a moment.' },
+  });
+
+  // 0. Session Token Issuance for Authenticated Auditor Detection Calls
+  app.post('/api/auth/session', (req, res) => {
+    const { userKey } = (req.body || {}) as { userKey?: unknown };
+    if (typeof userKey !== 'string' || !TEAM_KEYS.includes(userKey as TeamMemberKey)) {
+      res.status(400).json({ ok: false, error: 'Valid team member userKey is required.' });
+      return;
+    }
+    const token = signDetectionToken(userKey as TeamMemberKey);
+    res.json({ ok: true, token, expiresInSec: SESSION_TTL_SEC });
+  });
 
   // 1. Kobo Submissions & Survey Labels
   app.get('/api/kobo/submissions', async (req, res) => {
@@ -202,7 +518,6 @@ async function startServer() {
       const refresh = req.query.refresh === '1';
       const bundle = await getSubmissionsBundle(refresh);
 
-      // Auto-assign any unassigned pending submissions evenly across team members
       let nextIdx = assignments.size;
       for (const r of bundle.rows) {
         const subId = String(r._id ?? '');
@@ -360,7 +675,6 @@ async function startServer() {
       if (buf.length < 400) return null;
       const contentType = upstream.headers.get('content-type') || 'image/jpeg';
       if (!contentType.startsWith('image/')) return null;
-      // ESRI "Map data not yet available" grey tiles in rural Egypt are consistently ~2.4KB-2.7KB JPEGs
       const isLikelyBlank = prov === 'esri' && buf.length <= 2750;
       return { buf, contentType, isLikelyBlank };
     } catch {
@@ -414,7 +728,7 @@ async function startServer() {
     res.send(result.buf);
   });
 
-  // 5. Satellite Capture Date (ArcGIS SRC_DATE2) & Recent Sentinel-2 STAC NDVI Metadata
+  // 5. Satellite Capture Date (ArcGIS SRC_DATE2) & Recent Sentinel-2 STAC Metadata
   app.get('/api/satellite/metadata', async (req, res) => {
     const lon = Number(req.query.lon);
     const lat = Number(req.query.lat);
@@ -425,7 +739,7 @@ async function startServer() {
     const maxy = Number(req.query.maxy ?? lat + 0.001);
 
     if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
-      res.status(400).json({ imageryDate: null, ndviRecent: null });
+      res.status(400).json({ imageryDate: null, pseudoNdvi: null });
       return;
     }
 
@@ -504,8 +818,9 @@ async function startServer() {
     });
   });
 
-  // 5b. Satellite AI Model Status, ONNX Serving & YOLO Backend Inference Route
+  // 5b. Satellite AI Model Status & ONNX Serving
   app.get('/api/satellite/model-status', async (_req, res) => {
+    const geminiReady = Boolean(process.env.GEMINI_API_KEY?.trim());
     const onnxPath = resolveConfinedModel(['public/models/best.onnx', 'models/best.onnx']);
     const ptPath = resolveConfinedModel(['models/best.pt', 'best.pt']);
     const remoteUrl = (process.env.YOLO_INFER_URL || '').trim();
@@ -513,11 +828,13 @@ async function startServer() {
 
     res.json({
       ok: true,
+      geminiReady,
       onnxReady: Boolean(onnxPath),
       onnxUrl: onnxPath ? '/models/best.onnx' : null,
       ptReady: Boolean(ptPath),
       backendYoloReady: Boolean(remoteUrl || pyReady),
       classes: TREE_CLASSES,
+      config: detectionConfig,
     });
   });
 
@@ -532,22 +849,343 @@ async function startServer() {
     res.sendFile(onnxPath);
   });
 
-  app.post('/api/satellite/detect', async (req, res) => {
-    const { imageBase64, conf = 0.25, iou = 0.45 } = (req.body || {}) as {
-      imageBase64?: unknown;
-      conf?: unknown;
-      iou?: unknown;
+  // 5c. Primary Tier-1 AI Spatial Tree Crown Detector (Gemini Vision + WBF + Geometry Filtering)
+  app.post('/api/detect-trees', detectionLimiter, requireDetectionAuth, async (req, res) => {
+    const geminiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!geminiKey) {
+      res.status(503).json({
+        ok: false,
+        error: 'GEMINI_API_KEY is not configured on the server.',
+      });
+      return;
+    }
+
+    const {
+      tiles,
+      polygonRingPx,
+      geoTransform,
+      highAccuracy = false,
+      confThresh,
+      minConf,
+    } = (req.body || {}) as {
+      tiles?: Array<{
+        imageBase64?: unknown;
+        offsetX?: unknown;
+        offsetY?: unknown;
+        width?: unknown;
+        height?: unknown;
+      }>;
+      polygonRingPx?: unknown;
+      geoTransform?: {
+        worldOriginX?: unknown;
+        worldOriginY?: unknown;
+        zoom?: unknown;
+        mpp?: unknown;
+      };
+      highAccuracy?: unknown;
+      confThresh?: unknown;
+      minConf?: unknown;
     };
+
+    if (!Array.isArray(tiles) || tiles.length === 0 || tiles.length > 48) {
+      res.status(400).json({ ok: false, error: 'tiles array (1..48 tiles) is required.' });
+      return;
+    }
+
+    const validTiles: Array<{
+      b64: string;
+      mimeType: string;
+      offsetX: number;
+      offsetY: number;
+      width: number;
+      height: number;
+    }> = [];
+
+    for (const t of tiles) {
+      if (typeof t?.imageBase64 !== 'string' || t.imageBase64.length < 32 || t.imageBase64.length > 8_000_000) {
+        res.status(400).json({ ok: false, error: 'Invalid tile imageBase64 payload.' });
+        return;
+      }
+      const m = t.imageBase64.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);
+      const mimeType = m ? m[1] : 'image/png';
+      const b64 = m ? m[2] : t.imageBase64;
+      validTiles.push({
+        b64,
+        mimeType,
+        offsetX: Number(t.offsetX) || 0,
+        offsetY: Number(t.offsetY) || 0,
+        width: Math.max(64, Math.min(1024, Number(t.width) || detectionConfig.sahiTileSize)),
+        height: Math.max(64, Math.min(1024, Number(t.height) || detectionConfig.sahiTileSize)),
+      });
+    }
+
+    const ring: Array<[number, number]> = Array.isArray(polygonRingPx)
+      ? polygonRingPx
+          .filter(
+            (p): p is [number, number] =>
+              Array.isArray(p) && p.length >= 2 && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1]))
+          )
+          .map(([x, y]) => [Number(x), Number(y)])
+      : [];
+
+    const mpp = Number(geoTransform?.mpp) > 0 ? Number(geoTransform?.mpp) : 0.26;
+    const zoom = Number.isInteger(Number(geoTransform?.zoom)) ? Number(geoTransform?.zoom) : 19;
+    const worldOriginX = Number.isFinite(Number(geoTransform?.worldOriginX))
+      ? Number(geoTransform?.worldOriginX)
+      : undefined;
+    const worldOriginY = Number.isFinite(Number(geoTransform?.worldOriginY))
+      ? Number(geoTransform?.worldOriginY)
+      : undefined;
+
+    const reqConfThresh = Math.max(
+      0.25,
+      Math.min(0.85, Number(confThresh ?? detectionConfig.aiModelConfThresh) || 0.55)
+    );
+    const effectiveMinConf = Math.max(
+      0.2,
+      Math.min(reqConfThresh, Number(minConf ?? reqConfThresh - detectionConfig.confIntervalDelta) || reqConfThresh)
+    );
+
+    const modelName = highAccuracy ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
+    const ai = new GoogleGenAI({
+      apiKey: geminiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+
+    const responseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        detections: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              box_2d: {
+                type: Type.ARRAY,
+                items: { type: Type.NUMBER },
+              },
+              label: {
+                type: Type.STRING,
+                enum: ['orchard_tree', 'palm_tree', 'windbreak_tree'],
+              },
+              confidence: { type: Type.NUMBER },
+              health: {
+                type: Type.STRING,
+                enum: ['healthy', 'stressed', 'dead'],
+              },
+            },
+            required: ['box_2d', 'label', 'confidence', 'health'],
+          },
+        },
+      },
+      required: ['detections'],
+    };
+
+    const rawBoxes: ServerDetectionBox[] = [];
+    const tileErrors: string[] = [];
+    const concurrency = highAccuracy ? 3 : 4;
+
+    const runTile = async (tile: (typeof validTiles)[number]): Promise<void> => {
+      const prompt = buildTreeVisionPrompt(tile.width, tile.height, mpp);
+      const imagePart = {
+        inlineData: {
+          mimeType: tile.mimeType,
+          data: tile.b64,
+        },
+      };
+      const textPart = { text: prompt };
+
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: { parts: [imagePart, textPart] },
+            config: {
+              temperature: 0.1,
+              seed: 42,
+              responseMimeType: 'application/json',
+              responseSchema,
+            },
+          });
+
+          const rawText = (response.text ?? '{"detections":[]}').trim();
+          const parsed = JSON.parse(rawText) as {
+            detections?: Array<{
+              box_2d?: unknown;
+              label?: unknown;
+              confidence?: unknown;
+              health?: unknown;
+            }>;
+          };
+
+          for (const item of parsed.detections || []) {
+            if (!Array.isArray(item.box_2d) || item.box_2d.length < 4) continue;
+            const [ny1, nx1, ny2, nx2] = item.box_2d.map(Number);
+            if (![ny1, nx1, ny2, nx2].every(Number.isFinite)) continue;
+
+            const confVal = Math.max(0, Math.min(1, Number(item.confidence ?? 0.7)));
+            if (confVal < effectiveMinConf) continue;
+
+            const ymin = tile.offsetY + (Math.min(ny1, ny2) / 1000) * tile.height;
+            const xmin = tile.offsetX + (Math.min(nx1, nx2) / 1000) * tile.width;
+            const ymax = tile.offsetY + (Math.max(ny1, ny2) / 1000) * tile.height;
+            const xmax = tile.offsetX + (Math.max(nx1, nx2) / 1000) * tile.width;
+
+            const bw = xmax - xmin;
+            const bh = ymax - ymin;
+            if (bw < 3 || bh < 3) continue;
+            const aspect = Math.max(bw / bh, bh / bw);
+            if (aspect > 3.2) continue;
+
+            const diamM = ((bw + bh) / 2) * mpp;
+            if (diamM < 0.7 || diamM > 15.0) continue;
+
+            const rawLabel = String(item.label || 'orchard_tree');
+            const label: TreeClassName =
+              rawLabel === 'palm_tree' || rawLabel === 'windbreak_tree' ? rawLabel : 'orchard_tree';
+            const rawHealth = String(item.health || 'healthy');
+            const health: TreeHealthStatus =
+              rawHealth === 'stressed' || rawHealth === 'dead' ? rawHealth : 'healthy';
+
+            rawBoxes.push({
+              xmin,
+              ymin,
+              xmax,
+              ymax,
+              label,
+              confidence: confVal,
+              health,
+            });
+          }
+          return;
+        } catch (err) {
+          lastErr = err;
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 600));
+          }
+        }
+      }
+      tileErrors.push(lastErr instanceof Error ? lastErr.message : String(lastErr));
+    };
+
+    for (let i = 0; i < validTiles.length; i += concurrency) {
+      await Promise.all(validTiles.slice(i, i + concurrency).map((tile) => runTile(tile)));
+    }
+
+    if (tileErrors.length === validTiles.length) {
+      res.status(502).json({
+        ok: false,
+        error: `Gemini Vision inference failed on all tiles: ${tileErrors[0]}`,
+      });
+      return;
+    }
+
+    const polygonFiltered =
+      ring.length >= 3
+        ? rawBoxes.filter((b) => pointInRing((b.xmin + b.xmax) / 2, (b.ymin + b.ymax) / 2, ring))
+        : rawBoxes;
+
+    const minCenterDistPx = Math.max(5, Math.round(2.0 / Math.max(mpp, 0.12)));
+    const fused = fuseServerDetectionsWBF(
+      polygonFiltered,
+      detectionConfig.wbfIouThresh ?? detectionConfig.nmsIouThresh,
+      minCenterDistPx,
+      detectionConfig.crossClassSuppressionIou
+    );
+
+    const detections = fused.map((d) => {
+      if (worldOriginX !== undefined && worldOriginY !== undefined) {
+        const cx = (d.xmin + d.xmax) / 2;
+        const cy = (d.ymin + d.ymax) / 2;
+        const [lon, lat] = worldPxToLonLatServer(worldOriginX + cx, worldOriginY + cy, zoom);
+        return { ...d, lon, lat };
+      }
+      return d;
+    });
+
+    res.json({
+      ok: true,
+      engine: highAccuracy
+        ? 'AI Vision (Gemini 2.5 Pro · Dense WBF)'
+        : 'AI Vision (Gemini 2.5 Flash · Spatial WBF)',
+      detections,
+      partialTileErrors: tileErrors.length,
+    });
+  });
+
+  // 5d. FastAPI Batch YOLO Delegation (/api/satellite/detect-batch)
+  app.post('/api/satellite/detect-batch', detectionLimiter, requireDetectionAuth, async (req, res) => {
+    const { tiles, conf = detectionConfig.aiModelConfThresh, iou = detectionConfig.nmsIouThresh } =
+      (req.body || {}) as {
+        tiles?: Array<{ imageBase64?: unknown; offsetX?: unknown; offsetY?: unknown }>;
+        conf?: unknown;
+        iou?: unknown;
+      };
+
+    if (!Array.isArray(tiles) || tiles.length === 0 || tiles.length > 48) {
+      res.status(400).json({ ok: false, error: 'tiles array (1..48) is required' });
+      return;
+    }
+
+    const remoteUrlRaw = (process.env.YOLO_INFER_URL || '').trim();
+    if (!remoteUrlRaw) {
+      res.json({ ok: false, engine: 'unavailable', boxes: [] });
+      return;
+    }
+
+    try {
+      const parsed = new URL(remoteUrlRaw);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error('Invalid YOLO_INFER_URL protocol');
+      }
+      const targetUrl = new URL('/detect-batch', parsed.toString()).toString();
+      const confNum = Math.max(0.05, Math.min(0.95, Number(conf) || detectionConfig.aiModelConfThresh));
+      const iouNum = Math.max(0.1, Math.min(0.9, Number(iou) || detectionConfig.nmsIouThresh));
+
+      const upstream = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tiles, conf: confNum, iou: iouNum }),
+        signal: AbortSignal.timeout(30000),
+      });
+
+      if (!upstream.ok) {
+        res.json({ ok: false, engine: 'unavailable', boxes: [] });
+        return;
+      }
+
+      const data = (await upstream.json()) as { ok?: boolean; engine?: string; boxes?: unknown[] };
+      res.json({
+        ok: Boolean(data.ok),
+        engine: data.engine || 'YOLOv8 FastAPI Batch',
+        boxes: Array.isArray(data.boxes) ? data.boxes : [],
+      });
+    } catch {
+      res.json({ ok: false, engine: 'unavailable', boxes: [] });
+    }
+  });
+
+  app.post('/api/satellite/detect', detectionLimiter, requireDetectionAuth, async (req, res) => {
+    const { imageBase64, conf = detectionConfig.aiModelConfThresh, iou = detectionConfig.nmsIouThresh } =
+      (req.body || {}) as {
+        imageBase64?: unknown;
+        conf?: unknown;
+        iou?: unknown;
+      };
 
     if (typeof imageBase64 !== 'string' || imageBase64.length < 64 || imageBase64.length > 8_000_000) {
       res.status(400).json({ ok: false, error: 'Valid imageBase64 payload is required' });
       return;
     }
 
-    const confNum = Math.max(0.05, Math.min(0.95, Number(conf) || 0.25));
-    const iouNum = Math.max(0.1, Math.min(0.9, Number(iou) || 0.45));
+    const confNum = Math.max(0.05, Math.min(0.95, Number(conf) || detectionConfig.aiModelConfThresh));
+    const iouNum = Math.max(0.1, Math.min(0.9, Number(iou) || detectionConfig.nmsIouThresh));
 
-    // Option A: Remote GPU/YOLO microservice if configured via server env
     const remoteUrlRaw = (process.env.YOLO_INFER_URL || '').trim();
     if (remoteUrlRaw) {
       try {
@@ -555,27 +1193,31 @@ async function startServer() {
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
           throw new Error('Invalid YOLO_INFER_URL protocol');
         }
-        const upstream = await fetch(parsed.toString(), {
+        const batchUrl = new URL('/detect-batch', parsed.toString()).toString();
+        const upstream = await fetch(batchUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imageBase64, conf: confNum, iou: iouNum }),
+          body: JSON.stringify({
+            tiles: [{ imageBase64, offsetX: 0, offsetY: 0 }],
+            conf: confNum,
+            iou: iouNum,
+          }),
           signal: AbortSignal.timeout(20000),
         });
         if (upstream.ok) {
-          const data = (await upstream.json()) as { boxes?: unknown[] };
+          const data = (await upstream.json()) as { engine?: string; boxes?: unknown[] };
           res.json({
             ok: true,
-            engine: 'YOLO Remote API',
+            engine: data.engine || 'YOLO Remote API',
             boxes: Array.isArray(data.boxes) ? data.boxes : [],
           });
           return;
         }
       } catch {
-        // Fall through to local Python check or clean fallback signal
+        // Fall through to local Python check
       }
     }
 
-    // Option B: Local Python Ultralytics runtime on models/best.pt
     const ptPath = resolveConfinedModel(['models/best.pt', 'best.pt']);
     if (ptPath && (await checkPythonYoloAvailable())) {
       const cleanB64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
@@ -627,9 +1269,137 @@ async function startServer() {
     });
   });
 
+  // 5e. Active-Learning Feedback Queue (Auditor-Corrected Raw Tiles + YOLO Labels)
+  app.get('/api/dataset/feedback/stats', (_req, res) => {
+    try {
+      const imgDir = path.resolve(FEEDBACK_ROOT, 'images');
+      if (!imgDir.startsWith(FEEDBACK_ROOT + path.sep) || !fs.existsSync(imgDir)) {
+        res.json({ ok: true, queuedTiles: 0 });
+        return;
+      }
+      const files = fs.readdirSync(imgDir).filter((f) => f.endsWith('.png'));
+      res.json({ ok: true, queuedTiles: files.length });
+    } catch {
+      res.json({ ok: true, queuedTiles: 0 });
+    }
+  });
+
+  app.post('/api/dataset/feedback', feedbackLimiter, requireDetectionAuth, (req, res) => {
+    const { farmId, provider, auditor, manualDelta, tiles } = (req.body || {}) as {
+      farmId?: unknown;
+      provider?: unknown;
+      auditor?: unknown;
+      manualDelta?: { added?: unknown; deleted?: unknown; reclassified?: unknown };
+      tiles?: Array<{
+        imageBase64?: unknown;
+        annotations?: Array<{
+          classId?: unknown;
+          cx?: unknown;
+          cy?: unknown;
+          w?: unknown;
+          h?: unknown;
+        }>;
+      }>;
+    };
+
+    const safeFarm = String(farmId || '')
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .slice(0, 48);
+    const safeProvider = String(provider || 'google')
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .slice(0, 16);
+
+    if (!safeFarm || !Array.isArray(tiles) || tiles.length === 0 || tiles.length > 64) {
+      res.status(400).json({ ok: false, error: 'Valid farmId and 1..64 tiles are required.' });
+      return;
+    }
+
+    const imagesDir = path.resolve(FEEDBACK_ROOT, 'images');
+    const labelsDir = path.resolve(FEEDBACK_ROOT, 'labels');
+    const metaPath = path.resolve(FEEDBACK_ROOT, 'metadata.json');
+
+    if (
+      !imagesDir.startsWith(FEEDBACK_ROOT + path.sep) ||
+      !labelsDir.startsWith(FEEDBACK_ROOT + path.sep) ||
+      !metaPath.startsWith(FEEDBACK_ROOT + path.sep)
+    ) {
+      res.status(400).json({ ok: false, error: 'Invalid feedback path.' });
+      return;
+    }
+
+    fs.mkdirSync(imagesDir, { recursive: true });
+    fs.mkdirSync(labelsDir, { recursive: true });
+
+    const tsTag = Date.now();
+    let savedTiles = 0;
+
+    tiles.forEach((t, idx) => {
+      if (typeof t?.imageBase64 !== 'string' || t.imageBase64.length < 32) return;
+      const cleanB64 = t.imageBase64.replace(/^data:image\/\w+;base64,/, '');
+      const buf = Buffer.from(cleanB64, 'base64');
+      if (buf.byteLength === 0 || buf.byteLength > 5 * 1024 * 1024) return;
+
+      const baseName = `fb_${safeFarm}_${safeProvider}_${tsTag}_${String(idx + 1).padStart(3, '0')}`;
+      const imgPath = path.resolve(imagesDir, `${baseName}.png`);
+      const lblPath = path.resolve(labelsDir, `${baseName}.txt`);
+      if (!imgPath.startsWith(imagesDir + path.sep) || !lblPath.startsWith(labelsDir + path.sep)) {
+        return;
+      }
+
+      const yoloLines: string[] = [];
+      if (Array.isArray(t.annotations)) {
+        for (const a of t.annotations) {
+          const cid = Number(a.classId);
+          const cx = Number(a.cx);
+          const cy = Number(a.cy);
+          const w = Number(a.w);
+          const h = Number(a.h);
+          if (
+            ![0, 1, 2].includes(cid) ||
+            ![cx, cy, w, h].every((v) => Number.isFinite(v) && v >= 0 && v <= 1)
+          ) {
+            continue;
+          }
+          yoloLines.push(`${cid} ${cx.toFixed(6)} ${cy.toFixed(6)} ${w.toFixed(6)} ${h.toFixed(6)}`);
+        }
+      }
+
+      fs.writeFileSync(imgPath, buf);
+      fs.writeFileSync(lblPath, yoloLines.join('\n'), 'utf-8');
+      savedTiles++;
+    });
+
+    let manifest: Array<Record<string, unknown>> = [];
+    try {
+      if (fs.existsSync(metaPath)) {
+        const parsed = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+        if (Array.isArray(parsed)) manifest = parsed;
+      }
+    } catch {
+      manifest = [];
+    }
+
+    manifest.push({
+      farmId: safeFarm,
+      provider: safeProvider,
+      auditor: String(auditor || '').slice(0, 64),
+      savedTiles,
+      manualDelta: {
+        added: Number(manualDelta?.added || 0),
+        deleted: Number(manualDelta?.deleted || 0),
+        reclassified: Number(manualDelta?.reclassified || 0),
+      },
+      createdAt: new Date().toISOString(),
+    });
+    if (manifest.length > 500) manifest = manifest.slice(-500);
+    fs.writeFileSync(metaPath, JSON.stringify(manifest, null, 2), 'utf-8');
+
+    const queuedTotal = fs.readdirSync(imagesDir).filter((f) => f.endsWith('.png')).length;
+    res.json({ ok: true, savedTiles, queuedTotal });
+  });
+
   // 6. Team Assignments & Work Distribution Pipeline
   app.get('/api/team/assignments', async (_req, res) => {
-    // Optionally hydrate from Airtable if configured
     const apiKey = process.env.AIRTABLE_API_KEY?.trim();
     const baseId = process.env.AIRTABLE_BASE_ID?.trim();
     const tableName = process.env.AIRTABLE_TABLE_NAME?.trim();
@@ -791,7 +1561,7 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // 8. Airtable Upsert Sync (Port of append_to_airtable in app.py)
+  // 8. Airtable Upsert Sync
   app.post('/api/airtable/sync', async (req, res) => {
     const rec = req.body as MasterReviewRecord;
     if (!rec || !rec.farm_id) {

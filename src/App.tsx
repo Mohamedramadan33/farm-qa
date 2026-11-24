@@ -18,7 +18,7 @@ import {
   runCrossChecks,
 } from './lib/farmQaCore';
 import { analyzeFarmSatellite } from './lib/satelliteAnalyzer';
-import { setDetectionAuthToken } from './services/satellite/config';
+import { DETECTION_CONFIG, setDetectionAuthToken } from './services/satellite/config';
 import { displayName } from './lib/workDivider';
 import {
   STATUS_PENDING,
@@ -331,6 +331,8 @@ export function App() {
           offsetY_m: calibration?.offsetY_m ?? prevRes?.offsetY_m ?? 0,
           inwardBufferM: calibration?.inwardBufferM ?? prevRes?.inwardBufferM ?? -1.5,
           highAccuracy: calibration?.highAccuracy ?? false,
+          confThresh:
+            calibration?.confThresh ?? prevRes?.confThreshUsed ?? DETECTION_CONFIG.aiModelConfThresh,
           signal: controller.signal,
           onProgress: (p) => setSatProgress(p),
         });

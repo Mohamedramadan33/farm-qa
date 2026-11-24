@@ -8,6 +8,7 @@ import {
 import { countTreesInPolygon } from '../src/services/satellite/polygonCounter.ts';
 import { worldPxToLonLat } from '../src/services/satellite/tileFetcher.ts';
 import {
+  fuseDetectionsWBF,
   mergeDetectionsNMS,
   runMorphologicalFourGateFallback,
   type RawCandidate,
@@ -68,11 +69,11 @@ function makeOrchardTileWithTwoTrees(w: number, h: number): Uint8ClampedArray {
   return rgba;
 }
 
-test('Class-aware NMS preserves overlapping distinct tree classes and merges same class', () => {
+test('Class-aware WBF/NMS preserves overlapping distinct tree classes and fuses seam duplicates', () => {
   const candidates: RawCandidate[] = [
     { xmin: 10, ymin: 10, xmax: 30, ymax: 30, score: 0.9, classId: 0 }, // orchard_tree
-    { xmin: 12, ymin: 12, xmax: 31, ymax: 31, score: 0.78, classId: 0 }, // duplicate orchard_tree
-    { xmin: 13, ymin: 13, xmax: 33, ymax: 33, score: 0.85, classId: 1 }, // overlapping palm_tree (IoU ~0.52 < 0.85)
+    { xmin: 12, ymin: 12, xmax: 32, ymax: 32, score: 0.78, classId: 0 }, // overlapping seam orchard_tree
+    { xmin: 13, ymin: 13, xmax: 33, ymax: 33, score: 0.85, classId: 1 }, // overlapping palm_tree (IoU < 0.85)
   ];
 
   const merged = mergeDetectionsNMS(candidates, DETECTION_CONFIG.nmsIouThresh, 8);
@@ -81,6 +82,11 @@ test('Class-aware NMS preserves overlapping distinct tree classes and merges sam
     merged.map((m) => m.classId).sort(),
     [0, 1]
   );
+
+  // Verify Weighted Box Fusion blended the two orchard_tree boxes instead of discarding the 2nd box
+  const orchard = merged.find((m) => m.classId === 0)!;
+  assert.ok(orchard.xmin > 10.2 && orchard.xmin < 11.8, `Expected confidence-weighted xmin blend, got ${orchard.xmin}`);
+  assert.equal(fuseDetectionsWBF(candidates, DETECTION_CONFIG.wbfIouThresh, 8).length, 2);
 });
 
 test('Polygon counter produces genuine multi-threshold lo/mid/hi interval and unit aiFactor=1.0', () => {
@@ -130,6 +136,38 @@ test('Polygon counter produces genuine multi-threshold lo/mid/hi interval and un
   assert.equal(summary.aiLow, 2, 'lo should reflect high-threshold conf+0.10=0.65 count');
   assert.equal(summary.aiHigh, 4, 'hi should reflect low-threshold conf-0.10=0.45 count');
   assert.ok(summary.aiLow < summary.aiCount && summary.aiCount < summary.aiHigh);
+
+  // Also test custom lowered confThresh (0.45) capturing all 4 trees
+  const sensitiveBoxes: TreeDetectionBox[] = candidates.map((c, idx) => ({
+    id: idx + 1,
+    xmin: c.xmin,
+    ymin: c.ymin,
+    xmax: c.xmax,
+    ymax: c.ymax,
+    cx: (c.xmin + c.xmax) / 2,
+    cy: (c.ymin + c.ymax) / 2,
+    radiusPx: 5,
+    score: c.score,
+    classId: c.classId,
+    className: 'orchard_tree',
+    health: 'healthy',
+    onBoundary: true,
+    shadowDrop: 0.4,
+    laplacianVar: 35,
+  }));
+  const sensitiveSummary = countTreesInPolygon({
+    boxes: sensitiveBoxes,
+    allThresholdCandidates: candidates,
+    strictMask,
+    boundaryMask,
+    width: w,
+    height: h,
+    mpp: 0.26,
+    inwardBufferM: -1.5,
+    confThresh: 0.45,
+  });
+  assert.equal(sensitiveSummary.aiCount, 4);
+  assert.equal(sensitiveSummary.aiLow, 3); // >= 0.55
 });
 
 test('4-Gate morphological fallback rejects uniform green crop sheet (>85 m2) to 0 trees', () => {

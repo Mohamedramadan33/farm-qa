@@ -145,47 +145,125 @@ export function boxIoU(a: RawCandidate, b: RawCandidate): number {
 }
 
 /**
- * Class-aware Non-Maximum Suppression.
- * Suppresses same-class overlaps at `iouThresh` and `minCenterDistPx`, while permitting distinct
- * classes (e.g., palm_tree vs orchard_tree) unless cross-class overlap exceeds `crossClassIou`.
+ * Class-aware Weighted Box Fusion (WBF).
+ * Confidence-weights overlapping detections across SAHI tile seams so box coordinates
+ * and centers tighten rather than dropping edge candidates, while keeping distinct classes
+ * unless cross-class IoU exceeds `crossClassIou`.
  */
-export function mergeDetectionsNMS(
+export function fuseDetectionsWBF(
   candidates: RawCandidate[],
-  iouThresh = DETECTION_CONFIG.nmsIouThresh,
+  iouThresh = DETECTION_CONFIG.wbfIouThresh,
   minCenterDistPx = 6,
   classAware = DETECTION_CONFIG.classAwareNms,
   crossClassIou = DETECTION_CONFIG.crossClassSuppressionIou
 ): RawCandidate[] {
   const ordered = [...candidates].sort((a, b) => b.score - a.score);
-  const kept: RawCandidate[] = [];
+  interface Cluster {
+    wSum: number;
+    maxScore: number;
+    wxmin: number;
+    wymin: number;
+    wxmax: number;
+    wymax: number;
+    classId: 0 | 1 | 2;
+    health?: TreeHealthStatus;
+    circularity?: number;
+    crownDiameterM?: number;
+    lat?: number;
+    lon?: number;
+    rep: RawCandidate;
+  }
+
+  const clusters: Cluster[] = [];
   for (const cand of ordered) {
     const cx = (cand.xmin + cand.xmax) / 2;
     const cy = (cand.ymin + cand.ymax) / 2;
-    const overlaps = kept.some((prev) => {
-      const iou = boxIoU(cand, prev);
-      const pcx = (prev.xmin + prev.xmax) / 2;
-      const pcy = (prev.ymin + prev.ymax) / 2;
+    let target: Cluster | null = null;
+
+    for (const cl of clusters) {
+      const iou = boxIoU(cand, cl.rep);
+      const pcx = (cl.rep.xmin + cl.rep.xmax) / 2;
+      const pcy = (cl.rep.ymin + cl.rep.ymax) / 2;
       const dist = Math.hypot(cx - pcx, cy - pcy);
 
-      if (!classAware || cand.classId === prev.classId) {
-        return iou >= iouThresh || dist < minCenterDistPx;
+      if (!classAware || cand.classId === cl.classId) {
+        if (iou >= iouThresh || dist < minCenterDistPx) {
+          target = cl;
+          break;
+        }
+      } else if (iou >= crossClassIou) {
+        target = cl;
+        break;
       }
-      return iou >= crossClassIou;
-    });
-    if (!overlaps) {
-      kept.push(cand);
-      if (kept.length >= 900) break;
+    }
+
+    const w = Math.max(0.05, cand.score);
+    if (!target) {
+      clusters.push({
+        wSum: w,
+        maxScore: cand.score,
+        wxmin: cand.xmin * w,
+        wymin: cand.ymin * w,
+        wxmax: cand.xmax * w,
+        wymax: cand.ymax * w,
+        classId: cand.classId,
+        health: cand.health,
+        circularity: cand.circularity,
+        crownDiameterM: cand.crownDiameterM,
+        lat: cand.lat,
+        lon: cand.lon,
+        rep: { ...cand },
+      });
+      if (clusters.length >= 1200) break;
+    } else {
+      if (cand.score > target.maxScore) {
+        target.classId = cand.classId;
+        target.health = cand.health ?? target.health;
+        target.circularity = cand.circularity ?? target.circularity;
+        target.crownDiameterM = cand.crownDiameterM ?? target.crownDiameterM;
+        target.lat = cand.lat ?? target.lat;
+        target.lon = cand.lon ?? target.lon;
+      }
+      target.wSum += w;
+      target.maxScore = Math.max(target.maxScore, cand.score);
+      target.wxmin += cand.xmin * w;
+      target.wymin += cand.ymin * w;
+      target.wxmax += cand.xmax * w;
+      target.wymax += cand.ymax * w;
+      target.rep = {
+        xmin: target.wxmin / target.wSum,
+        ymin: target.wymin / target.wSum,
+        xmax: target.wxmax / target.wSum,
+        ymax: target.wymax / target.wSum,
+        score: target.maxScore,
+        classId: target.classId,
+      };
     }
   }
-  return kept;
+
+  return clusters.map((cl) => ({
+    xmin: cl.rep.xmin,
+    ymin: cl.rep.ymin,
+    xmax: cl.rep.xmax,
+    ymax: cl.rep.ymax,
+    score: cl.maxScore,
+    classId: cl.classId,
+    health: cl.health,
+    circularity: cl.circularity,
+    crownDiameterM: cl.crownDiameterM,
+    lat: cl.lat,
+    lon: cl.lon,
+  }));
 }
+
+export const mergeDetectionsNMS = fuseDetectionsWBF;
 
 // ---------------------------------------------------------------------------
 // Tier 1: Gemini Spatial Vision (/api/detect-trees)
 // ---------------------------------------------------------------------------
 
 async function runGeminiVisionDetection(params: {
-  maskedCanvas: HTMLCanvasElement;
+  visionCanvas: HTMLCanvasElement;
   slices: SahiSlice[];
   polygonRingPx: Array<[number, number]>;
   worldOriginX: number;
@@ -193,6 +271,8 @@ async function runGeminiVisionDetection(params: {
   zoom: number;
   mpp: number;
   highAccuracy: boolean;
+  confThresh: number;
+  minConf: number;
   signal?: AbortSignal;
   onProgress?: (p: SatelliteProgress) => void;
 }): Promise<{
@@ -202,7 +282,7 @@ async function runGeminiVisionDetection(params: {
   errorNotice?: string;
 }> {
   const {
-    maskedCanvas,
+    visionCanvas,
     slices,
     polygonRingPx,
     worldOriginX,
@@ -210,6 +290,8 @@ async function runGeminiVisionDetection(params: {
     zoom,
     mpp,
     highAccuracy,
+    confThresh,
+    minConf,
     signal,
     onProgress,
   } = params;
@@ -227,7 +309,7 @@ async function runGeminiVisionDetection(params: {
     const sub = document.createElement('canvas');
     sub.width = s.w;
     sub.height = s.h;
-    sub.getContext('2d')!.drawImage(maskedCanvas, s.x, s.y, s.w, s.h, 0, 0, s.w, s.h);
+    sub.getContext('2d')!.drawImage(visionCanvas, s.x, s.y, s.w, s.h, 0, 0, s.w, s.h);
     return {
       imageBase64: sub.toDataURL('image/png'),
       offsetX: s.x,
@@ -240,8 +322,8 @@ async function runGeminiVisionDetection(params: {
   const batchSize = 8;
   const allCands: RawCandidate[] = [];
   let usedEngine = highAccuracy
-    ? 'AI Vision (Gemini Pro High-Accuracy Spatial)'
-    : 'AI Vision (Gemini Flash Spatial)';
+    ? 'AI Vision (Gemini 2.5 Pro · Dense WBF)'
+    : 'AI Vision (Gemini 2.5 Flash · Spatial WBF)';
 
   for (let i = 0; i < tilePayloads.length; i += batchSize) {
     if (signal?.aborted) {
@@ -268,6 +350,8 @@ async function runGeminiVisionDetection(params: {
           polygonRingPx,
           geoTransform: { worldOriginX, worldOriginY, zoom, mpp },
           highAccuracy,
+          confThresh,
+          minConf,
         }),
       });
       const data = (await resp.json().catch(() => ({}))) as {
@@ -852,7 +936,7 @@ export function runMorphologicalFourGateFallback(params: {
 
 export async function detectTreesHybrid(params: {
   rawCanvas: HTMLCanvasElement;
-  strictMaskedCanvas: HTMLCanvasElement;
+  visionCanvas: HTMLCanvasElement;
   rgba: Uint8ClampedArray;
   width: number;
   height: number;
@@ -865,6 +949,7 @@ export async function detectTreesHybrid(params: {
   mpp: number;
   species: string;
   highAccuracy: boolean;
+  confThresh?: number;
   maps: SpectralMaps;
   signal?: AbortSignal;
   onProgress?: (p: SatelliteProgress) => void;
@@ -879,7 +964,7 @@ export async function detectTreesHybrid(params: {
 }> {
   const {
     rawCanvas,
-    strictMaskedCanvas,
+    visionCanvas,
     rgba,
     width: w,
     height: h,
@@ -892,17 +977,25 @@ export async function detectTreesHybrid(params: {
     mpp,
     species,
     highAccuracy,
+    confThresh: reqConfThresh,
     maps,
     signal,
     onProgress,
   } = params;
 
+  const activeSliceSize = highAccuracy
+    ? DETECTION_CONFIG.highAccuracyTileSize
+    : DETECTION_CONFIG.sahiTileSize;
+  const activeOverlap = highAccuracy
+    ? DETECTION_CONFIG.highAccuracyOverlap
+    : DETECTION_CONFIG.sahiOverlap;
+
   const slices = generateSahiSlices(
     w,
     h,
     strictMask,
-    DETECTION_CONFIG.sahiTileSize,
-    DETECTION_CONFIG.sahiOverlap,
+    activeSliceSize,
+    activeOverlap,
     0.05
   );
   const modelStatus = await getModelStatus();
@@ -923,14 +1016,17 @@ export async function detectTreesHybrid(params: {
   let stage1ActivePct: number | undefined = stage1Diag.gate2ActivePct;
   let stage1AuditRejectedAi: number | undefined;
 
-  const confThresh = DETECTION_CONFIG.aiModelConfThresh;
+  const confThresh = Math.max(
+    0.3,
+    Math.min(0.85, reqConfThresh ?? DETECTION_CONFIG.aiModelConfThresh)
+  );
   const lowConfThresh = Math.max(0.25, confThresh - DETECTION_CONFIG.confIntervalDelta);
   const minCenterDistPx = Math.max(5, Math.round(2.0 / Math.max(mpp, 0.12)));
 
   // Tier 1: Gemini Spatial Vision (/api/detect-trees)
   if (slices.length > 0 && modelStatus.geminiReady) {
     const geminiRes = await runGeminiVisionDetection({
-      maskedCanvas: strictMaskedCanvas,
+      visionCanvas,
       slices,
       polygonRingPx: clippedRing,
       worldOriginX,
@@ -938,13 +1034,15 @@ export async function detectTreesHybrid(params: {
       zoom,
       mpp,
       highAccuracy,
+      confThresh,
+      minConf: lowConfThresh,
       signal,
       onProgress,
     });
 
     if (geminiRes.ok) {
       detectorMode = 'gemini';
-      detectorEngine = geminiRes.engine;
+      detectorEngine = `${geminiRes.engine} (${activeSliceSize}px · Conf>=${confThresh.toFixed(2)})`;
       allThresholdCandidates = geminiRes.candidates.filter((c) => {
         const cx = Math.round((c.xmin + c.xmax) / 2);
         const cy = Math.round((c.ymin + c.ymax) / 2);
@@ -952,7 +1050,7 @@ export async function detectTreesHybrid(params: {
       });
 
       const midCands = allThresholdCandidates.filter((c) => c.score >= confThresh);
-      const nms = mergeDetectionsNMS(midCands, DETECTION_CONFIG.nmsIouThresh, minCenterDistPx);
+      const nms = fuseDetectionsWBF(midCands, DETECTION_CONFIG.wbfIouThresh, minCenterDistPx);
 
       let stage1WouldDrop = 0;
       let nextId = 1;
@@ -1023,20 +1121,28 @@ export async function detectTreesHybrid(params: {
 
   // Tier 2: ONNX Runtime Web / FastAPI Batch YOLO (raw unmasked tiles -> strictMask post-filter)
   if (detectorMode !== 'gemini' && slices.length > 0) {
+    const yoloSlices = generateSahiSlices(
+      w,
+      h,
+      strictMask,
+      DETECTION_CONFIG.sahiTileSize,
+      activeOverlap,
+      0.05
+    );
     let yoloCandidates: RawCandidate[] = [];
     let usedYolo = false;
 
     if (modelStatus.onnxReady && modelStatus.onnxUrl) {
       const session = await getOnnxSession(modelStatus.onnxUrl);
       if (session) {
-        for (let i = 0; i < slices.length; i++) {
+        for (let i = 0; i < yoloSlices.length; i++) {
           if (signal?.aborted) throw new DOMException('Detection aborted.', 'AbortError');
-          const s = slices[i];
+          const s = yoloSlices[i];
           onProgress?.({
             stage: 'detect',
             loaded: i + 1,
-            total: slices.length,
-            message: `ONNX running tile ${i + 1}/${slices.length}`,
+            total: yoloSlices.length,
+            message: `ONNX running tile ${i + 1}/${yoloSlices.length}`,
           });
           const subCanvas = document.createElement('canvas');
           subCanvas.width = s.w;
@@ -1047,22 +1153,22 @@ export async function detectTreesHybrid(params: {
         }
         usedYolo = true;
         detectorMode = 'yolo';
-        detectorEngine = `YOLOv8 ONNX (SAHI ${DETECTION_CONFIG.sahiTileSize}px · Conf>=${confThresh})`;
+        detectorEngine = `YOLOv8 ONNX (SAHI ${DETECTION_CONFIG.sahiTileSize}px · Conf>=${confThresh.toFixed(2)})`;
       }
     }
 
     if (!usedYolo && modelStatus.backendYoloReady) {
-      for (let i = 0; i < slices.length; i += 12) {
+      for (let i = 0; i < yoloSlices.length; i += 12) {
         if (signal?.aborted) throw new DOMException('Detection aborted.', 'AbortError');
         onProgress?.({
           stage: 'detect',
           loaded: i,
-          total: slices.length,
-          message: `YOLO FastAPI batch ${i + 1}-${Math.min(i + 12, slices.length)}/${slices.length}`,
+          total: yoloSlices.length,
+          message: `YOLO FastAPI batch ${i + 1}-${Math.min(i + 12, yoloSlices.length)}/${yoloSlices.length}`,
         });
         const batchRes = await runBackendYoloBatch(
           rawCanvas,
-          slices.slice(i, i + 12),
+          yoloSlices.slice(i, i + 12),
           lowConfThresh,
           signal
         );
@@ -1073,7 +1179,7 @@ export async function detectTreesHybrid(params: {
         }
         usedYolo = true;
         detectorMode = 'yolo';
-        detectorEngine = `${batchRes.engine} (SAHI ${DETECTION_CONFIG.sahiTileSize}px · Conf>=${confThresh})`;
+        detectorEngine = `${batchRes.engine} (SAHI ${DETECTION_CONFIG.sahiTileSize}px · Conf>=${confThresh.toFixed(2)})`;
         yoloCandidates.push(...batchRes.cands);
       }
     }
@@ -1087,7 +1193,7 @@ export async function detectTreesHybrid(params: {
       });
 
       const midCands = allThresholdCandidates.filter((c) => c.score >= confThresh);
-      const nms = mergeDetectionsNMS(midCands, DETECTION_CONFIG.nmsIouThresh, minCenterDistPx);
+      const nms = fuseDetectionsWBF(midCands, DETECTION_CONFIG.wbfIouThresh, minCenterDistPx);
 
       let stage1WouldDrop = 0;
       let nextId = 1;
@@ -1119,8 +1225,6 @@ export async function detectTreesHybrid(params: {
         const onBoundary = Boolean(boundaryMask[cy * w + cx]);
         const [lon, lat] = worldPxToLonLat(worldOriginX + cx, worldOriginY + cy, zoom);
 
-        // Single source of truth: keep YOLO predicted classId (no species-text override),
-        // and bypass shadow-drop / Laplacian-var rejection heuristics on AI detections.
         boxes.push({
           id: nextId++,
           xmin: Math.round(cand.xmin),

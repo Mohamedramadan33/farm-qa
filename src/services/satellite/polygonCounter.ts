@@ -1,5 +1,5 @@
 import { DETECTION_CONFIG } from './config';
-import { mergeDetectionsNMS, type RawCandidate } from './treeDetector';
+import { fuseDetectionsWBF, type RawCandidate } from './treeDetector';
 import type { TreeDetectionBox } from '../../types/qa';
 
 export interface PolygonCountSummary {
@@ -25,6 +25,7 @@ export function countTreesInPolygon(params: {
   height: number;
   mpp: number;
   inwardBufferM: number;
+  confThresh?: number;
 }): PolygonCountSummary {
   const {
     boxes,
@@ -35,21 +36,21 @@ export function countTreesInPolygon(params: {
     height: h,
     mpp,
     inwardBufferM,
+    confThresh = DETECTION_CONFIG.aiModelConfThresh,
   } = params;
 
   const boundaryBoxes = boxes.filter((b) => b.onBoundary);
   const interiorBoxes = boxes.filter((b) => !b.onBoundary);
   const primaryBoxes = inwardBufferM < -0.5 ? boxes : boundaryBoxes;
 
-  const confThresh = DETECTION_CONFIG.aiModelConfThresh;
   const delta = DETECTION_CONFIG.confIntervalDelta;
   const minCenterDistPx = Math.max(5, Math.round(2.0 / Math.max(mpp, 0.12)));
 
   const countBand = (minScore: number): number => {
     if (allThresholdCandidates.length === 0) return primaryBoxes.length;
-    const subset = mergeDetectionsNMS(
+    const subset = fuseDetectionsWBF(
       allThresholdCandidates.filter((c) => c.score >= minScore),
-      DETECTION_CONFIG.nmsIouThresh,
+      DETECTION_CONFIG.wbfIouThresh,
       minCenterDistPx
     );
     let total = 0;

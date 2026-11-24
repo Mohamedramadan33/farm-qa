@@ -96,6 +96,50 @@ export function buildMaskedCanvas(srcCanvas: HTMLCanvasElement, mask: Uint8Array
 }
 
 /**
+ * Context-preserving Vision canvas for Gemini Spatial Vision: keeps surrounding terrain/shadows
+ * visible at 55% luminance outside the parcel instead of pitch-black clipping, and traces a
+ * subtle dashed cyan boundary guide so edge trees & cast shadows remain fully interpretable.
+ */
+export function buildContextPreservingVisionCanvas(
+  srcCanvas: HTMLCanvasElement,
+  mask: Uint8Array,
+  clippedRing: Array<[number, number]>
+): HTMLCanvasElement {
+  const w = srcCanvas.width;
+  const h = srcCanvas.height;
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const ctx = out.getContext('2d')!;
+  ctx.drawImage(srcCanvas, 0, 0);
+  const frame = ctx.getImageData(0, 0, w, h);
+  const px = frame.data;
+  for (let i = 0; i < w * h; i++) {
+    if (!mask[i]) {
+      const o = i * 4;
+      px[o] = Math.round(px[o] * 0.55);
+      px[o + 1] = Math.round(px[o + 1] * 0.55);
+      px[o + 2] = Math.round(px[o + 2] * 0.55);
+    }
+  }
+  ctx.putImageData(frame, 0, 0);
+
+  if (clippedRing.length >= 3) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 245, 255, 0.72)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    clippedRing.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+    ctx.closePath();
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+  return out;
+}
+
+/**
  * Exact O(W*H) 2-pass Meijster / Felzenszwalb Euclidean Distance Transform.
  */
 export function computeEuclideanDistanceTransform(mask: Uint8Array, w: number, h: number): Float32Array {

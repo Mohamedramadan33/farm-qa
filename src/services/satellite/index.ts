@@ -6,7 +6,9 @@ import {
 } from '../../lib/geometry';
 import { VEG_EXG } from '../../lib/farmQaCore';
 import { renderCleanAndAnnotatedCanvases, renderComparisonCanvasUrl } from './canvasRenderer';
+import { DETECTION_CONFIG } from './config';
 import {
+  buildContextPreservingVisionCanvas,
   buildMaskedCanvas,
   computeLuminanceAndLaplacianAsync,
   createBoundaryCorridorMask,
@@ -33,6 +35,7 @@ export async function analyzeFarmSatellite(params: {
   offsetY_m?: number;
   inwardBufferM?: number;
   highAccuracy?: boolean;
+  confThresh?: number;
   signal?: AbortSignal;
   onProgress?: (p: SatelliteProgress) => void;
 }): Promise<SatelliteAnalysisResult> {
@@ -46,6 +49,7 @@ export async function analyzeFarmSatellite(params: {
     offsetY_m = 0,
     inwardBufferM = -1.5,
     highAccuracy = false,
+    confThresh = DETECTION_CONFIG.aiModelConfThresh,
     signal,
     onProgress,
   } = params;
@@ -127,6 +131,11 @@ export async function analyzeFarmSatellite(params: {
   const { mask: boundaryMask } = createBoundaryCorridorMask(w, h, primaryMosaic.ring, primaryMosaic.mpp);
   const strictMaskedCanvas = buildMaskedCanvas(rawCanvas, strictMask);
   const maskedImageUrl = strictMaskedCanvas.toDataURL('image/png');
+  const visionCanvas = buildContextPreservingVisionCanvas(
+    rawCanvas,
+    strictMask,
+    primaryMosaic.clippedRing
+  );
 
   let polyPxCount = 0;
   let polyVegCount = 0;
@@ -144,7 +153,7 @@ export async function analyzeFarmSatellite(params: {
 
   const detectOut = await detectTreesHybrid({
     rawCanvas,
-    strictMaskedCanvas,
+    visionCanvas,
     rgba: imgData.data,
     width: w,
     height: h,
@@ -157,6 +166,7 @@ export async function analyzeFarmSatellite(params: {
     mpp: primaryMosaic.mpp,
     species,
     highAccuracy,
+    confThresh,
     maps,
     signal,
     onProgress,
@@ -173,6 +183,7 @@ export async function analyzeFarmSatellite(params: {
     height: h,
     mpp: primaryMosaic.mpp,
     inwardBufferM,
+    confThresh,
   });
 
   const { cleanImageUrl, annotatedImageUrl } = renderCleanAndAnnotatedCanvases(
@@ -230,6 +241,7 @@ export async function analyzeFarmSatellite(params: {
     inwardBufferM,
     offsetX_m,
     offsetY_m,
+    confThreshUsed: confThresh,
     canvasWidth: w,
     canvasHeight: h,
     worldOriginX: primaryMosaic.worldOriginX,

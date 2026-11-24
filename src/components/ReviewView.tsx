@@ -24,7 +24,7 @@ import { fmtVal, present } from '../lib/arabicNorm';
 import { downloadReviewsExcel } from '../lib/excelExport';
 import { pointInRingPx } from '../lib/geometry';
 import { worldPxToLonLat } from '../lib/satelliteAnalyzer';
-import { getDetectionAuthHeaders } from '../services/satellite/config';
+import { DETECTION_CONFIG, getDetectionAuthHeaders } from '../services/satellite/config';
 import {
   buildAttachmentLookup,
   findAttachment,
@@ -153,6 +153,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   const [offsetX_m, setOffsetX_m] = useState<number>(0);
   const [offsetY_m, setOffsetY_m] = useState<number>(0);
   const [inwardBufferM, setInwardBufferM] = useState<number>(-1.5);
+  const [confThresh, setConfThresh] = useState<number>(DETECTION_CONFIG.aiModelConfThresh);
   const [showCompactIds, setShowCompactIds] = useState<boolean>(false);
   const [highAccuracyMode, setHighAccuracyMode] = useState<boolean>(false);
   const [editTreesMode, setEditTreesMode] = useState<boolean>(false);
@@ -345,6 +346,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     setOffsetX_m(res?.offsetX_m ?? 0);
     setOffsetY_m(res?.offsetY_m ?? 0);
     setInwardBufferM(res?.inwardBufferM ?? -1.5);
+    setConfThresh(res?.confThreshUsed ?? DETECTION_CONFIG.aiModelConfThresh);
     setEditTreesMode(false);
     setHoveredTree(null);
     setPinnedTree(null);
@@ -571,7 +573,10 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     satRes !== undefined &&
     (Math.abs(offsetX_m - satRes.offsetX_m) >= 0.1 ||
       Math.abs(offsetY_m - satRes.offsetY_m) >= 0.1 ||
-      Math.abs(inwardBufferM - satRes.inwardBufferM) >= 0.1);
+      Math.abs(inwardBufferM - satRes.inwardBufferM) >= 0.1 ||
+      Math.abs(
+        confThresh - (satRes.confThreshUsed ?? DETECTION_CONFIG.aiModelConfThresh)
+      ) >= 0.02);
 
   const previewDxPx = satRes ? (offsetX_m - satRes.offsetX_m) / Math.max(satRes.mpp, 0.1) : 0;
   const previewDyPx = satRes ? -(offsetY_m - satRes.offsetY_m) / Math.max(satRes.mpp, 0.1) : 0;
@@ -589,6 +594,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
       offsetY_m,
       inwardBufferM,
       highAccuracy: nextHighAcc,
+      confThresh,
     });
   };
 
@@ -1248,7 +1254,10 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-3 text-[11px]">
-                  <label className="inline-flex items-center gap-1.5 text-slate-700 cursor-pointer select-none">
+                  <label
+                    className="inline-flex items-center gap-1.5 text-slate-700 cursor-pointer select-none"
+                    title="Uses Gemini 2.5 Pro with dense 384px overlapping tiles for small/young saplings"
+                  >
                     <input
                       type="checkbox"
                       checked={highAccuracyMode}
@@ -1257,7 +1266,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                     />
                     <span className="inline-flex items-center gap-1 font-medium text-indigo-900">
                       <Sparkles className="w-3 h-3 text-indigo-600" />
-                      High-Accuracy (Pro)
+                      High-Accuracy (Pro · Dense)
                     </span>
                   </label>
 
@@ -1647,9 +1656,9 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                     )}
                   </div>
 
-                  {/* X/Y Meter Offset Calibration (-10m..+10m) & Inward Boundary Buffer (-1.5m default) */}
+                  {/* X/Y Meter Offset Calibration (-10m..+10m), Boundary Buffer & AI Confidence Sensitivity */}
                   <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2 text-[11px]">
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2.5">
                       <label className="block">
                         <div className="flex justify-between text-slate-600 mb-0.5">
                           <span>Offset X (E/W)</span>
@@ -1703,6 +1712,27 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                           className="w-full accent-amber-600"
                         />
                       </label>
+
+                      <label
+                        className="block"
+                        title="Lower threshold (0.35-0.45) captures more small/young trees; higher (0.60-0.75) reduces false positives"
+                      >
+                        <div className="flex justify-between text-slate-600 mb-0.5">
+                          <span>AI Conf Threshold</span>
+                          <span className="font-mono-num font-semibold text-indigo-900">
+                            {confThresh.toFixed(2)}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.35}
+                          max={0.75}
+                          step={0.05}
+                          value={confThresh}
+                          onChange={(e) => setConfThresh(Number(e.target.value))}
+                          className="w-full accent-indigo-700"
+                        />
+                      </label>
                     </div>
 
                     <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
@@ -1727,14 +1757,18 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                           type="button"
                           disabled={isRunningSat}
                           onClick={() => {
+                            const defConf = DETECTION_CONFIG.aiModelConfThresh;
                             setOffsetX_m(0);
                             setOffsetY_m(0);
                             setInwardBufferM(-1.5);
+                            setConfThresh(defConf);
                             void onRunSatelliteAi(auditRec.farm_id, {
                               providerMode,
                               offsetX_m: 0,
                               offsetY_m: 0,
                               inwardBufferM: -1.5,
+                              highAccuracy: highAccuracyMode,
+                              confThresh: defConf,
                             });
                           }}
                           className="px-2 py-1 text-[11px] text-slate-600 hover:text-slate-900 border border-slate-300 bg-white rounded cursor-pointer"

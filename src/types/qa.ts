@@ -88,6 +88,7 @@ export interface SatelliteCalibrationOptions {
   offsetY_m: number;
   inwardBufferM: number;
   highAccuracy?: boolean;
+  confThresh?: number;
 }
 
 export interface SatelliteProgress {
@@ -142,6 +143,7 @@ export interface SatelliteAnalysisResult {
   inwardBufferM: number;
   offsetX_m: number;
   offsetY_m: number;
+  confThreshUsed?: number;
   canvasWidth: number;
   canvasHeight: number;
   worldOriginX?: number;
