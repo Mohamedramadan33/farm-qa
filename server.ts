@@ -24,6 +24,17 @@ const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 3000);
 const KOBO_SERVER = (process.env.KOBO_SERVER || 'https://kf.kobotoolbox.org').replace(/\/+$/, '');
 const KOBO_ASSET_UID = process.env.KOBO_ASSET_UID || 'aX4NJWgge6tooXjfSYXhrq';
+const ALLOWED_MEDIA_HOST = new URL(KOBO_SERVER).hostname;
+const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+
+function isAllowedMediaUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:' && u.hostname === ALLOWED_MEDIA_HOST;
+  } catch {
+    return false;
+  }
+}
 
 const TREE_CLASSES = ['orchard_tree', 'palm_tree', 'windbreak_tree'] as const;
 
@@ -220,9 +231,8 @@ async function startServer() {
   // 2. Kobo Media Proxy (Images & Videos)
   app.get('/api/kobo/media', async (req, res) => {
     const rawUrl = String(req.query.url || '').trim();
-    const maxMb = Number(req.query.maxMb || 15);
-    if (!rawUrl || !rawUrl.startsWith('http')) {
-      res.status(400).json({ error: 'Valid media URL is required' });
+    if (!rawUrl || !isAllowedMediaUrl(rawUrl)) {
+      res.status(400).json({ error: 'Media URL must point to the configured Kobo server' });
       return;
     }
 
@@ -241,14 +251,14 @@ async function startServer() {
         return;
       }
       const len = Number(upstream.headers.get('content-length') || 0);
-      if (len > 0 && len > maxMb * 1024 * 1024) {
-        res.status(413).json({ error: `Attachment exceeds ${maxMb}MB limit` });
+      if (len > 0 && len > MAX_MEDIA_BYTES) {
+        res.status(413).json({ error: 'Attachment exceeds 15MB limit' });
         return;
       }
       const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
       const arrBuf = await upstream.arrayBuffer();
-      if (arrBuf.byteLength > maxMb * 1024 * 1024) {
-        res.status(413).json({ error: `Attachment exceeds ${maxMb}MB limit` });
+      if (arrBuf.byteLength > MAX_MEDIA_BYTES) {
+        res.status(413).json({ error: 'Attachment exceeds 15MB limit' });
         return;
       }
       res.setHeader('Content-Type', contentType);
