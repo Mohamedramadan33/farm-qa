@@ -1127,7 +1127,7 @@ def analyze_farm_satellite_canopy(
             "imagery_date": "غير متاح",
             "annotated_img": None,
             "clean_img": None,
-            "ndvi_heatmap_img": None,
+            "pseudo_ndvi_heatmap_img": None,
             "spacing_m": spacing_m,
             "tree_points": [],
             "healthy_count": 0,
@@ -1269,7 +1269,7 @@ def analyze_farm_satellite_canopy(
     damaged_pct = cv_res["damaged_pct"]
     veg_pct = cv_res["parcel_veg_coverage_pct"]
     annotated_img = cv_res["annotated_image"]
-    ndvi_heatmap_img = cv_res["ndvi_heatmap_image"]
+    pseudo_ndvi_heatmap_img = cv_res["pseudo_ndvi_heatmap_image"]
     engine_used = cv_res.get("engine_used", "OpenCV Precision Spectral Morphology")
     trees_classified = cv_res.get("trees_classified", [])
 
@@ -1290,8 +1290,8 @@ def analyze_farm_satellite_canopy(
             "crown_radius": t.get("crown_radius", 4),
             "status": t["status"],
             "status_ar": t["status_ar"],
-            "mean_ndvi": t["mean_ndvi"],
-            "max_ndvi": t.get("max_ndvi", t["mean_ndvi"]),
+            "mean_pseudo_ndvi": t["mean_pseudo_ndvi"],
+            "max_pseudo_ndvi": t.get("max_pseudo_ndvi", t["mean_pseudo_ndvi"]),
         })
 
     # 3. RUN LOGISTIC TREE REQUIREMENT CALCULATION
@@ -1315,7 +1315,7 @@ def analyze_farm_satellite_canopy(
         "imagery_date": imagery_date or "حديث",
         "annotated_img": annotated_img,
         "clean_img": clean_img,
-        "ndvi_heatmap_img": ndvi_heatmap_img,
+        "pseudo_ndvi_heatmap_img": pseudo_ndvi_heatmap_img,
         "spacing_m": spacing_m,
         "tree_points": tree_points_coords,
         "healthy_count": healthy_count,
@@ -1327,6 +1327,7 @@ def analyze_farm_satellite_canopy(
         "engine_used": engine_used,
         "yolo_model_loaded": bool(cv_res.get("yolo_model_loaded", False)),
         "yolo_skipped_reason": cv_res.get("yolo_skipped_reason", ""),
+        "stage1_audit_dropped_count": cv_res.get("stage1_audit_dropped_count", 0),
         "has_satellite_imagery": has_tile,
         "tile_error": tile_error,
         "tiles_loaded": tiles_loaded,

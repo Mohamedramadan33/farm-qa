@@ -1,0 +1,19 @@
+{
+  "version": "1.0.0",
+  "classes": ["orchard_tree", "palm_tree", "windbreak_tree"],
+  "aiModelConfThresh": 0.55,
+  "confIntervalDelta": 0.10,
+  "sahiTileSize": 512,
+  "sahiOverlap": 0.20,
+  "nmsIouThresh": 0.40,
+  "classAwareNms": true,
+  "crossClassSuppressionIou": 0.85,
+  "minCastShadowDrop": 0.35,
+  "minWatershedCircularity": 0.68,
+  "minCrownDiamM": 1.8,
+  "maxCrownDiamM": 7.0,
+  "cropSheetAreaM2": 85.0,
+  "minCrownSpacingM": 2.5,
+  "smallCrownPxRange": [8, 25],
+  "fallbackImgSz": 1024
+}

@@ -77,6 +77,8 @@ export type PointLonLat = [number, number];
 export type PointLatLon = [number, number];
 
 export type TreeClassName = 'orchard_tree' | 'palm_tree' | 'windbreak_tree';
+export type TreeHealthStatus = 'healthy' | 'stressed' | 'dead';
+export type DetectorMode = 'gemini' | 'yolo' | 'morphological';
 export type BasemapProvider = 'google' | 'esri';
 export type BasemapViewMode = 'google' | 'esri' | 'compare';
 
@@ -85,6 +87,14 @@ export interface SatelliteCalibrationOptions {
   offsetX_m: number;
   offsetY_m: number;
   inwardBufferM: number;
+  highAccuracy?: boolean;
+}
+
+export interface SatelliteProgress {
+  stage: 'tiles' | 'detect' | 'postprocess';
+  loaded: number;
+  total: number;
+  message?: string;
 }
 
 export interface TreeDetectionBox {
@@ -99,11 +109,15 @@ export interface TreeDetectionBox {
   score: number;
   classId: 0 | 1 | 2;
   className: TreeClassName;
+  health?: TreeHealthStatus;
   onBoundary: boolean;
   shadowDrop: number;
   laplacianVar: number;
   circularity?: number;
   crownDiameterM?: number;
+  lat?: number;
+  lon?: number;
+  source?: 'ai' | 'manual';
 }
 
 export interface SatelliteAnalysisResult {
@@ -117,26 +131,33 @@ export interface SatelliteAnalysisResult {
   crownM: number | null;
   imageryDate: string | null;
   imgAge: number | null;
-  ndviRecent: number | null;
+  pseudoNdvi: number | null;
   zoomUsed: number;
   mpp: number;
   provider: string;
   providerId: BasemapProvider;
+  detectorMode: DetectorMode;
   detectorEngine: string;
+  aiVisionNotice?: string;
   inwardBufferM: number;
   offsetX_m: number;
   offsetY_m: number;
   canvasWidth: number;
   canvasHeight: number;
+  worldOriginX?: number;
+  worldOriginY?: number;
   ringPx: Array<[number, number]>;
   clippedRingPx: Array<[number, number]>;
   boxes: TreeDetectionBox[];
+  rawImageUrl?: string;
   cleanImageUrl: string;
+  maskedImageUrl?: string;
   annotatedImageUrl: string;
   compareImageUrl?: string | null;
   compareProvider?: string | null;
   compareZoomUsed?: number | null;
   stage1ActivePct?: number;
+  stage1AuditRejectedAi?: number;
   stage1CellsKept?: number;
   stage1CellsTotal?: number;
   aiError?: string;
@@ -189,7 +210,7 @@ export interface FarmAuditRecord {
   crown_m: number | null;
   imagery_date: string | null;
   img_age: number | null;
-  ndvi_recent: number | null;
+  pseudo_ndvi: number | null;
   zoom_used: number | null;
   ai_error: string;
   verdict: string;

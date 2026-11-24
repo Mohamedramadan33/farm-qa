@@ -280,7 +280,7 @@ def evaluate_pgs_rules(
                 "message": f"تفاوت بين المساحة المسجلة ({area_ent:.2f} فدان) ومساحة GPS ({area_gps:.2f} فدان) بنسبة {diff_pct:.1f}%."
             })
 
-    # 6. Tree Health & Windbreak Condition (NDVI Healthy vs Damaged Ratio)
+    # 6. Tree Health & Windbreak Condition (Pseudo-NDVI RGB Healthy vs Damaged Ratio)
     tree_damaged_pct = to_float(farm_record.get("tree_damaged_pct"))
     tree_healthy_pct = to_float(farm_record.get("tree_healthy_pct"))
     if tree_healthy_pct is None and tree_damaged_pct is not None:
@@ -289,14 +289,14 @@ def evaluate_pgs_rules(
         safe_healthy = tree_healthy_pct if tree_healthy_pct is not None else 0.0
         if tree_damaged_pct > 15.0:
             findings.append({
-                "rule": "الحالة الصحية للأشجار والمصدات (NDVI)",
+                "rule": "الحالة الصحية للأشجار والمصدات (Pseudo-NDVI RGB)",
                 "passed": False,
                 "severity": "warning",
                 "message": f"نسبة الأشجار التالفة أو الميتة مرتفعة ({tree_damaged_pct:.1f}%) وتتجاوز الحد المسموح به في PGS (15%). يلزم الترقيع لضمان عزل المزرعة ومصدات الرياح.",
             })
         else:
             findings.append({
-                "rule": "الحالة الصحية للأشجار والمصدات (NDVI)",
+                "rule": "الحالة الصحية للأشجار والمصدات (Pseudo-NDVI RGB)",
                 "passed": True,
                 "severity": "info",
                 "message": f"الحالة الصحية لأشجار المزرعة ممتازة ({safe_healthy:.1f}% سليمة خضراء) ونسبة التلف منخفضة ({tree_damaged_pct:.1f}%).",

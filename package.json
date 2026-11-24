@@ -10,7 +10,10 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@google/genai": "^3.6.1",
     "express": "^4.21.2",
+    "express-rate-limit": "^8.7.5",
+    "jszip": "^3.10.2",
     "lucide-react": "^0.475.0",
     "onnxruntime-web": "^1.31.1",
     "react": "^19.0.0",

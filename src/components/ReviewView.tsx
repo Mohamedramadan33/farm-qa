@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import JSZip from 'jszip';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -6,17 +7,24 @@ import {
   CheckCircle2,
   CloudUpload,
   Download,
+  Edit3,
   Image as ImageIcon,
   Maximize2,
+  PackageOpen,
   RefreshCw,
   Save,
   Search,
+  Sparkles,
+  Trash2,
   Video,
   X,
   XCircle,
 } from 'lucide-react';
 import { fmtVal, present } from '../lib/arabicNorm';
 import { downloadReviewsExcel } from '../lib/excelExport';
+import { pointInRingPx } from '../lib/geometry';
+import { worldPxToLonLat } from '../lib/satelliteAnalyzer';
+import { getDetectionAuthHeaders } from '../services/satellite/config';
 import {
   buildAttachmentLookup,
   findAttachment,
@@ -49,8 +57,10 @@ import {
   type RawKoboSubmission,
   type SatelliteAnalysisResult,
   type SatelliteCalibrationOptions,
+  type SatelliteProgress,
   type TreeClassName,
   type TreeDetectionBox,
+  type TreeHealthStatus,
 } from '../types/qa';
 
 interface ReviewViewProps {
@@ -64,10 +74,14 @@ interface ReviewViewProps {
   satelliteImages: Record<string, string>;
   satelliteResults: Record<string, SatelliteAnalysisResult>;
   runningSatelliteFarmId: string | null;
+  satProgress?: SatelliteProgress | null;
+  manualDelta?: { added: number; deleted: number; reclassified: number };
   onRunSatelliteAi: (
     farmId: string,
     calibration?: Partial<SatelliteCalibrationOptions>
   ) => Promise<void>;
+  onCancelSatelliteAi?: () => void;
+  onUpdateSatelliteBoxes?: (farmId: string, boxes: TreeDetectionBox[]) => void;
   savedFieldDecisions: Record<string, FieldDecisionRow[]>;
   onSaveDecision: (params: {
     master: MasterReviewRecord;
@@ -101,7 +115,11 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   satelliteImages,
   satelliteResults,
   runningSatelliteFarmId,
+  satProgress,
+  manualDelta,
   onRunSatelliteAi,
+  onCancelSatelliteAi,
+  onUpdateSatelliteBoxes,
   savedFieldDecisions,
   onSaveDecision,
   onSyncAirtable,
@@ -136,8 +154,26 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   const [offsetY_m, setOffsetY_m] = useState<number>(0);
   const [inwardBufferM, setInwardBufferM] = useState<number>(-1.5);
   const [showCompactIds, setShowCompactIds] = useState<boolean>(false);
+  const [highAccuracyMode, setHighAccuracyMode] = useState<boolean>(false);
+  const [editTreesMode, setEditTreesMode] = useState<boolean>(false);
+  const [exportingYolo, setExportingYolo] = useState<boolean>(false);
+  const [queuingFeedback, setQueuingFeedback] = useState<boolean>(false);
+  const [queuedTotal, setQueuedTotal] = useState<number | null>(null);
+  const [feedbackNotice, setFeedbackNotice] = useState<string | null>(null);
   const [hoveredTree, setHoveredTree] = useState<TreeDetectionBox | null>(null);
   const [pinnedTree, setPinnedTree] = useState<TreeDetectionBox | null>(null);
+  const svgOverlayRef = useRef<SVGSVGElement | null>(null);
+
+  useEffect(() => {
+    fetch('/api/dataset/feedback/stats')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { ok?: boolean; queuedTiles?: number } | null) => {
+        if (d?.ok && typeof d.queuedTiles === 'number') {
+          setQueuedTotal(d.queuedTiles);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
 
   const auditRec = useMemo(
     () => records.find((r) => r.farm_id === selectedFarmId) || records[0],
@@ -309,6 +345,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     setOffsetX_m(res?.offsetX_m ?? 0);
     setOffsetY_m(res?.offsetY_m ?? 0);
     setInwardBufferM(res?.inwardBufferM ?? -1.5);
+    setEditTreesMode(false);
     setHoveredTree(null);
     setPinnedTree(null);
   }, [auditRec?.farm_id]);
@@ -514,6 +551,22 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     { orchard_tree: 0, palm_tree: 0, windbreak_tree: 0 } as Record<TreeClassName, number>
   );
 
+  const healthCounts = (satRes?.boxes || []).reduce(
+    (acc, b) => {
+      const h = b.health || 'healthy';
+      acc[h] = (acc[h] || 0) + 1;
+      return acc;
+    },
+    { healthy: 0, stressed: 0, dead: 0 } as Record<TreeHealthStatus, number>
+  );
+  const totalBoxesCount = satRes?.boxes.length || 0;
+  const healthyPct =
+    totalBoxesCount > 0 ? ((healthCounts.healthy / totalBoxesCount) * 100).toFixed(1) : '0.0';
+  const stressedPct =
+    totalBoxesCount > 0 ? ((healthCounts.stressed / totalBoxesCount) * 100).toFixed(1) : '0.0';
+  const deadPct =
+    totalBoxesCount > 0 ? ((healthCounts.dead / totalBoxesCount) * 100).toFixed(1) : '0.0';
+
   const calibrationDirty =
     satRes !== undefined &&
     (Math.abs(offsetX_m - satRes.offsetX_m) >= 0.1 ||
@@ -523,7 +576,10 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   const previewDxPx = satRes ? (offsetX_m - satRes.offsetX_m) / Math.max(satRes.mpp, 0.1) : 0;
   const previewDyPx = satRes ? -(offsetY_m - satRes.offsetY_m) / Math.max(satRes.mpp, 0.1) : 0;
 
-  const triggerSatelliteWithCalib = (nextMode: BasemapViewMode = providerMode) => {
+  const triggerSatelliteWithCalib = (
+    nextMode: BasemapViewMode = providerMode,
+    nextHighAcc: boolean = highAccuracyMode
+  ) => {
     setProviderMode(nextMode);
     setHoveredTree(null);
     setPinnedTree(null);
@@ -532,7 +588,295 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
       offsetX_m,
       offsetY_m,
       inwardBufferM,
+      highAccuracy: nextHighAcc,
     });
+  };
+
+  const handleUpdateSingleTree = (
+    treeId: number,
+    patch: Partial<Pick<TreeDetectionBox, 'className' | 'classId' | 'health'>>
+  ) => {
+    if (!satRes || !onUpdateSatelliteBoxes) return;
+    const nextBoxes = satRes.boxes.map((b) => {
+      if (b.id !== treeId) return b;
+      const nextCls = patch.className ?? b.className;
+      const nextClsId: 0 | 1 | 2 =
+        nextCls === 'palm_tree' ? 1 : nextCls === 'windbreak_tree' ? 2 : 0;
+      return {
+        ...b,
+        ...patch,
+        className: nextCls,
+        classId: nextClsId,
+        source: 'manual' as const,
+      };
+    });
+    onUpdateSatelliteBoxes(auditRec.farm_id, nextBoxes);
+    const updatedPinned = nextBoxes.find((b) => b.id === treeId) || null;
+    setPinnedTree(updatedPinned);
+  };
+
+  const handleDeleteSingleTree = (treeId: number) => {
+    if (!satRes || !onUpdateSatelliteBoxes) return;
+    const nextBoxes = satRes.boxes.filter((b) => b.id !== treeId);
+    onUpdateSatelliteBoxes(auditRec.farm_id, nextBoxes);
+    if (pinnedTree?.id === treeId) setPinnedTree(null);
+    if (hoveredTree?.id === treeId) setHoveredTree(null);
+  };
+
+  const handleCanvasClickEdit = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!satRes) return;
+    if (!editTreesMode) {
+      setPinnedTree(null);
+      return;
+    }
+    if (!onUpdateSatelliteBoxes || !svgOverlayRef.current) return;
+    const rect = svgOverlayRef.current.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const cx = Math.max(2, Math.min(satRes.canvasWidth - 2, Math.round(((e.clientX - rect.left) / rect.width) * satRes.canvasWidth)));
+    const cy = Math.max(2, Math.min(satRes.canvasHeight - 2, Math.round(((e.clientY - rect.top) / rect.height) * satRes.canvasHeight)));
+    const radiusPx = Math.max(5, Math.round(1.6 / Math.max(satRes.mpp, 0.12)));
+    const maxId = satRes.boxes.reduce((mx, b) => Math.max(mx, b.id), 0);
+
+    let lat: number | undefined;
+    let lon: number | undefined;
+    if (satRes.worldOriginX !== undefined && satRes.worldOriginY !== undefined) {
+      const [lo, la] = worldPxToLonLat(
+        satRes.worldOriginX + cx,
+        satRes.worldOriginY + cy,
+        satRes.zoomUsed
+      );
+      lon = lo;
+      lat = la;
+    }
+
+    const newTree: TreeDetectionBox = {
+      id: maxId + 1,
+      xmin: Math.max(0, cx - radiusPx),
+      ymin: Math.max(0, cy - radiusPx),
+      xmax: Math.min(satRes.canvasWidth, cx + radiusPx),
+      ymax: Math.min(satRes.canvasHeight, cy + radiusPx),
+      cx,
+      cy,
+      radiusPx,
+      score: 1.0,
+      classId: 0,
+      className: 'orchard_tree',
+      health: 'healthy',
+      onBoundary: true,
+      shadowDrop: 0,
+      laplacianVar: 0,
+      crownDiameterM: Number((radiusPx * 2 * satRes.mpp).toFixed(2)),
+      lat,
+      lon,
+      source: 'manual',
+    };
+
+    const nextBoxes = [...satRes.boxes, newTree];
+    onUpdateSatelliteBoxes(auditRec.farm_id, nextBoxes);
+    setPinnedTree(newTree);
+  };
+
+  interface BuiltYoloTile {
+    baseName: string;
+    pngBlob: Blob;
+    dataUrl: string;
+    yoloLines: string[];
+    annotations: Array<{ classId: number; cx: number; cy: number; w: number; h: number }>;
+  }
+
+  const buildRawYoloTiles = async (): Promise<BuiltYoloTile[]> => {
+    if (!satRes) return [];
+    const srcUrl = satRes.rawImageUrl || satRes.cleanImageUrl;
+    if (!srcUrl) return [];
+
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('Failed to load raw satellite mosaic'));
+      el.src = srcUrl;
+    });
+
+    const w = img.naturalWidth || satRes.canvasWidth;
+    const h = img.naturalHeight || satRes.canvasHeight;
+    const mosaicCanvas = document.createElement('canvas');
+    mosaicCanvas.width = w;
+    mosaicCanvas.height = h;
+    const mCtx = mosaicCanvas.getContext('2d')!;
+    mCtx.drawImage(img, 0, 0, w, h);
+
+    // Compute farm polygon mask for tile selection & consistent label clipping (raw tiles remain unmasked)
+    const activeRing =
+      satRes.clippedRingPx && satRes.clippedRingPx.length >= 3 ? satRes.clippedRingPx : satRes.ringPx;
+    const clippedBoxes =
+      activeRing && activeRing.length >= 3
+        ? satRes.boxes.filter((b) => pointInRingPx(b.cx, b.cy, activeRing))
+        : satRes.boxes;
+
+    const tileSize = 512;
+    const overlap = 0.2;
+    const stride = Math.round(tileSize * (1 - overlap));
+    const sW = Math.min(tileSize, w);
+    const sH = Math.min(tileSize, h);
+
+    const xs: number[] = [];
+    for (let x = 0; x < w; x += stride) {
+      const c = Math.max(0, Math.min(x, w - sW));
+      if (xs.length === 0 || xs[xs.length - 1] !== c) xs.push(c);
+      if (c + sW >= w) break;
+    }
+    const ys: number[] = [];
+    for (let y = 0; y < h; y += stride) {
+      const c = Math.max(0, Math.min(y, h - sH));
+      if (ys.length === 0 || ys[ys.length - 1] !== c) ys.push(c);
+      if (c + sH >= h) break;
+    }
+
+    const tileCanvas = document.createElement('canvas');
+    tileCanvas.width = tileSize;
+    tileCanvas.height = tileSize;
+    const tCtx = tileCanvas.getContext('2d')!;
+
+    const out: BuiltYoloTile[] = [];
+    let tileCounter = 0;
+    for (const ty of ys) {
+      for (const tx of xs) {
+        // Check polygon overlap inside this tile (skip tiles <5% inside farm boundary)
+        if (activeRing && activeRing.length >= 3) {
+          let insideHits = 0;
+          let sampled = 0;
+          for (let sy = 8; sy < sH; sy += 16) {
+            for (let sx = 8; sx < sW; sx += 16) {
+              sampled++;
+              if (pointInRingPx(tx + sx, ty + sy, activeRing)) insideHits++;
+            }
+          }
+          if (sampled > 0 && insideHits / sampled < 0.05) continue;
+        }
+
+        tCtx.fillStyle = '#000000';
+        tCtx.fillRect(0, 0, tileSize, tileSize);
+        tCtx.drawImage(mosaicCanvas, tx, ty, sW, sH, 0, 0, sW, sH);
+
+        tileCounter++;
+        const baseName = `farm_${auditRec.farm_id}_${satRes.providerId}_tile_${String(tileCounter).padStart(3, '0')}`;
+        const pngBlob = await new Promise<Blob | null>((res) =>
+          tileCanvas.toBlob((b) => res(b), 'image/png')
+        );
+        if (!pngBlob) continue;
+        const dataUrl = tileCanvas.toDataURL('image/png');
+
+        const yoloLines: string[] = [];
+        const annotations: Array<{ classId: number; cx: number; cy: number; w: number; h: number }> = [];
+        for (const box of clippedBoxes) {
+          if (box.cx >= tx && box.cx < tx + sW && box.cy >= ty && box.cy < ty + sH) {
+            const bx1 = Math.max(0, box.xmin - tx);
+            const by1 = Math.max(0, box.ymin - ty);
+            const bx2 = Math.min(tileSize, box.xmax - tx);
+            const by2 = Math.min(tileSize, box.ymax - ty);
+            const bw = Math.max(2, bx2 - bx1);
+            const bh = Math.max(2, by2 - by1);
+            const ncx = Math.max(0, Math.min(1, (bx1 + bw / 2) / tileSize));
+            const ncy = Math.max(0, Math.min(1, (by1 + bh / 2) / tileSize));
+            const nw = Math.max(0.004, Math.min(1, bw / tileSize));
+            const nh = Math.max(0.004, Math.min(1, bh / tileSize));
+            yoloLines.push(
+              `${box.classId} ${ncx.toFixed(6)} ${ncy.toFixed(6)} ${nw.toFixed(6)} ${nh.toFixed(6)}`
+            );
+            annotations.push({ classId: box.classId, cx: ncx, cy: ncy, w: nw, h: nh });
+          }
+        }
+        out.push({ baseName, pngBlob, dataUrl, yoloLines, annotations });
+      }
+    }
+    return out;
+  };
+
+  const handleExportYoloZip = async () => {
+    if (!satRes || exportingYolo) return;
+    setExportingYolo(true);
+    try {
+      const tiles = await buildRawYoloTiles();
+      const zip = new JSZip();
+      const imagesFolder = zip.folder('images')!;
+      const labelsFolder = zip.folder('labels')!;
+
+      for (const t of tiles) {
+        imagesFolder.file(`${t.baseName}.png`, t.pngBlob);
+        labelsFolder.file(`${t.baseName}.txt`, t.yoloLines.join('\n'));
+      }
+
+      zip.file(
+        'data.yaml',
+        [
+          'path: .',
+          'train: images/train',
+          'val: images/val',
+          'nc: 3',
+          "names: ['orchard_tree', 'palm_tree', 'windbreak_tree']",
+          '',
+        ].join('\n')
+      );
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      const dlUrl = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = dlUrl;
+      a.download = `yolo_dataset_${auditRec.farm_id}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(dlUrl);
+    } finally {
+      setExportingYolo(false);
+    }
+  };
+
+  const handleQueueActiveLearning = async () => {
+    if (!satRes || queuingFeedback) return;
+    setQueuingFeedback(true);
+    setFeedbackNotice(null);
+    try {
+      const tiles = await buildRawYoloTiles();
+      if (tiles.length === 0) {
+        setFeedbackNotice('No overlapping tiles to queue.');
+        return;
+      }
+      const batch = tiles.slice(0, 48).map((t) => ({
+        imageBase64: t.dataUrl,
+        annotations: t.annotations,
+      }));
+      const resp = await fetch('/api/dataset/feedback', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getDetectionAuthHeaders(),
+        },
+        body: JSON.stringify({
+          farmId: auditRec.farm_id,
+          provider: satRes.providerId,
+          auditor: auditorName,
+          manualDelta: manualDelta ?? { added: 0, deleted: 0, reclassified: 0 },
+          tiles: batch,
+        }),
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        savedTiles?: number;
+        queuedTotal?: number;
+        error?: string;
+      };
+      if (!resp.ok || !data.ok) {
+        setFeedbackNotice(data.error || `Failed (${resp.status})`);
+        return;
+      }
+      if (typeof data.queuedTotal === 'number') setQueuedTotal(data.queuedTotal);
+      setFeedbackNotice(
+        `Queued ${data.savedTiles ?? batch.length} raw tiles + YOLO labels to feedback_queue/`
+      );
+    } finally {
+      setQueuingFeedback(false);
+    }
   };
 
   return (
@@ -742,21 +1086,33 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    disabled={isRunningSat || !hasValidGps}
-                    onClick={() => triggerSatelliteWithCalib(providerMode)}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isRunningSat ? 'animate-spin' : ''}`} />
-                    <span>
-                      {isRunningSat
-                        ? 'Analyzing Satellite...'
-                        : satImg
-                          ? 'Re-run Satellite AI'
-                          : 'Run Satellite AI Check'}
-                    </span>
-                  </button>
+                  <div className="flex items-center gap-2">
+                    {isRunningSat && onCancelSatelliteAi && (
+                      <button
+                        type="button"
+                        onClick={onCancelSatelliteAi}
+                        className="inline-flex items-center gap-1 px-2.5 py-2 bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 text-xs font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>Cancel</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={isRunningSat || !hasValidGps}
+                      onClick={() => triggerSatelliteWithCalib(providerMode)}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isRunningSat ? 'animate-spin' : ''}`} />
+                      <span>
+                        {isRunningSat
+                          ? 'Analyzing Satellite...'
+                          : satImg
+                            ? 'Re-run Satellite AI'
+                            : 'Run Satellite AI Check'}
+                      </span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Boundary Verdict Banner */}
@@ -820,9 +1176,9 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                       </strong>
                     </div>
                     <div>
-                      <span className="text-slate-500">Recent NDVI: </span>
+                      <span className="text-slate-500">Pseudo-NDVI (RGB): </span>
                       <strong className="font-mono-num text-slate-900">
-                        {fmtVal(auditRec.ndvi_recent)}
+                        {fmtVal(auditRec.pseudo_ndvi)}
                       </strong>
                     </div>
                     <div>
@@ -865,7 +1221,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
 
             {/* Satellite Mosaic Viewport & Geospatial Calibration */}
             <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between space-y-3">
-              {/* Basemap Switcher & Compact ID Toggle */}
+              {/* Basemap Switcher, Mode Badge & High-Accuracy Toggle */}
               <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100">
                 <div className="inline-flex items-center gap-1 p-0.5 bg-slate-100 rounded-lg text-[11px] font-medium">
                   {(
@@ -891,54 +1247,158 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                   ))}
                 </div>
 
-                <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-700 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={showCompactIds}
-                    onChange={(e) => setShowCompactIds(e.target.checked)}
-                    className="rounded border-slate-300 text-emerald-700 focus:ring-emerald-600"
-                  />
-                  <span>Compact IDs (أرقام الأشجار)</span>
-                </label>
+                <div className="flex flex-wrap items-center gap-3 text-[11px]">
+                  <label className="inline-flex items-center gap-1.5 text-slate-700 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={highAccuracyMode}
+                      onChange={(e) => setHighAccuracyMode(e.target.checked)}
+                      className="rounded border-slate-300 text-indigo-700 focus:ring-indigo-600"
+                    />
+                    <span className="inline-flex items-center gap-1 font-medium text-indigo-900">
+                      <Sparkles className="w-3 h-3 text-indigo-600" />
+                      High-Accuracy (Pro)
+                    </span>
+                  </label>
+
+                  <label className="inline-flex items-center gap-1.5 text-slate-700 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={showCompactIds}
+                      onChange={(e) => setShowCompactIds(e.target.checked)}
+                      className="rounded border-slate-300 text-emerald-700 focus:ring-emerald-600"
+                    />
+                    <span>Compact IDs (أرقام الأشجار)</span>
+                  </label>
+                </div>
               </div>
 
               {satRes ? (
                 <div className="space-y-2.5 flex-1 flex flex-col">
-                  {/* Crisp HTML/CSS Arabic & Numeric Telemetry HUD (zero canvas glyph boxes) */}
+                  {/* Detector Mode Status Strip + Edit Trees & YOLO Dataset Export */}
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold border ${
+                        satRes.detectorMode === 'gemini'
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                          : satRes.detectorMode === 'yolo'
+                            ? 'bg-sky-50 border-sky-200 text-sky-900'
+                            : 'bg-amber-50 border-amber-200 text-amber-900'
+                      }`}
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          satRes.detectorMode === 'gemini'
+                            ? 'bg-emerald-500'
+                            : satRes.detectorMode === 'yolo'
+                              ? 'bg-sky-500'
+                              : 'bg-amber-500'
+                        }`}
+                      />
+                      <span>
+                        {satRes.detectorMode === 'gemini'
+                          ? 'AI Vision (Gemini Spatial)'
+                          : satRes.detectorMode === 'yolo'
+                            ? 'YOLO Model'
+                            : 'Offline Morphological Fallback'}
+                      </span>
+                    </span>
+
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditTreesMode((v) => !v);
+                          setHoveredTree(null);
+                        }}
+                        className={`inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold rounded-md border transition-colors cursor-pointer ${
+                          editTreesMode
+                            ? 'bg-indigo-700 border-indigo-700 text-white'
+                            : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+                        }`}
+                      >
+                        <Edit3 className="w-3 h-3" />
+                        <span>{editTreesMode ? 'Editing Trees (Done)' : 'Edit Trees'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={exportingYolo}
+                        onClick={handleExportYoloZip}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold rounded-md border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-50 text-slate-800 transition-colors cursor-pointer"
+                      >
+                        <PackageOpen className="w-3 h-3 text-emerald-700" />
+                        <span>
+                          {exportingYolo ? 'Exporting Zip...' : 'Export YOLO Zip'}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={queuingFeedback}
+                        onClick={handleQueueActiveLearning}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold rounded-md border border-sky-300 bg-sky-50 hover:bg-sky-100 disabled:opacity-50 text-sky-900 transition-colors cursor-pointer"
+                        title="Send corrected raw tiles & YOLO annotations to dataset/feedback_queue/"
+                      >
+                        <CloudUpload className="w-3 h-3 text-sky-700" />
+                        <span>
+                          {queuingFeedback
+                            ? 'Queuing...'
+                            : `Queue Active Learning${queuedTotal !== null ? ` (${queuedTotal})` : ''}`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {feedbackNotice && (
+                    <div className="px-2.5 py-1.5 rounded-md bg-sky-50 border border-sky-200 text-[11px] text-sky-900">
+                      {feedbackNotice}
+                    </div>
+                  )}
+
+                  {satRes.aiVisionNotice && (
+                    <div className="px-2.5 py-1.5 rounded-md bg-amber-50 border border-amber-200 text-[11px] text-amber-900">
+                      {satRes.aiVisionNotice}
+                    </div>
+                  )}
+
+                  {editTreesMode && (
+                    <div className="px-2.5 py-1.5 rounded-md bg-indigo-50 border border-indigo-200 text-[11px] text-indigo-950">
+                      وضع التعديل اليدوي: اضغط كليك شمال في أي مكان لإضافة شجرة، أو اضغط على علامة لتعديل نوعها/حالتها، أو كليك يمين للحذف السريع.
+                    </div>
+                  )}
+
+                  {/* Crisp RTL HTML/CSS Arabic & Numeric Telemetry HUD (zero canvas glyph boxes) */}
                   <div
                     dir="rtl"
                     className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-slate-900 text-slate-100 text-[11px] border border-slate-800"
                   >
                     <div className="flex flex-wrap items-center gap-2.5">
                       <span className="font-semibold text-emerald-300">
-                        إجمالي الأشجار المرصودة:{' '}
-                        <strong className="font-mono-num text-white">{satRes.boxes.length}</strong>
+                        إجمالي الأشجار:{' '}
+                        <strong className="font-mono-num text-white">{totalBoxesCount}</strong>
                       </span>
                       <span className="text-slate-600">|</span>
                       <span className="text-slate-300">
-                        بستان:{' '}
+                        سليمة:{' '}
                         <strong className="font-mono-num text-emerald-400">
-                          {classCounts.orchard_tree}
+                          {healthCounts.healthy}
                         </strong>{' '}
-                        <span className="font-mono-num text-slate-400">
-                          (
-                          {satRes.boxes.length > 0
-                            ? ((classCounts.orchard_tree / satRes.boxes.length) * 100).toFixed(1)
-                            : '0.0'}
-                          %)
-                        </span>
+                        <span className="font-mono-num text-slate-400">({healthyPct}%)</span>
                       </span>
                       <span className="text-slate-300">
-                        نخيل:{' '}
+                        مجهدة:{' '}
                         <strong className="font-mono-num text-amber-400">
-                          {classCounts.palm_tree}
-                        </strong>
+                          {healthCounts.stressed}
+                        </strong>{' '}
+                        <span className="font-mono-num text-slate-400">({stressedPct}%)</span>
                       </span>
                       <span className="text-slate-300">
-                        مصدات:{' '}
-                        <strong className="font-mono-num text-cyan-400">
-                          {classCounts.windbreak_tree}
-                        </strong>
+                        تالفة:{' '}
+                        <strong className="font-mono-num text-red-400">
+                          {healthCounts.dead}
+                        </strong>{' '}
+                        <span className="font-mono-num text-slate-400">({deadPct}%)</span>
                       </span>
                     </div>
 
@@ -946,11 +1406,6 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                       <span>
                         {satRes.provider} · Z{satRes.zoomUsed} ({satRes.mpp} m/px)
                       </span>
-                      {typeof satRes.stage1ActivePct === 'number' && (
-                        <span className="text-slate-400">
-                          · Stage-1 Kept: {satRes.stage1ActivePct}%
-                        </span>
-                      )}
                     </div>
                   </div>
 
@@ -962,10 +1417,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                     }`}
                   >
                     {/* Primary Interactive Viewport (Clean Image + Interactive SVG Canopy Circles) */}
-                    <div
-                      className="relative min-h-[260px] bg-slate-950 rounded-lg overflow-hidden border border-slate-800"
-                      onClick={() => setPinnedTree(null)}
-                    >
+                    <div className="relative min-h-[260px] bg-slate-950 rounded-lg overflow-hidden border border-slate-800">
                       <div
                         className="relative w-full h-full flex items-center justify-center"
                         style={{ aspectRatio: `${satRes.canvasWidth} / ${satRes.canvasHeight}` }}
@@ -977,8 +1429,12 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                           className="w-full h-full object-contain select-none"
                         />
                         <svg
+                          ref={svgOverlayRef}
                           viewBox={`0 0 ${satRes.canvasWidth} ${satRes.canvasHeight}`}
-                          className="absolute inset-0 w-full h-full"
+                          onClick={handleCanvasClickEdit}
+                          className={`absolute inset-0 w-full h-full ${
+                            editTreesMode ? 'cursor-crosshair' : ''
+                          }`}
                         >
                           {/* Live preview outline when dragging X/Y calibration sliders */}
                           {calibrationDirty && satRes.ringPx.length >= 3 && (
@@ -993,23 +1449,38 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                             />
                           )}
 
-                          {/* Clean Canopy Circles with Interactive Hover/Click */}
+                          {/* Clean Canopy Circles with Interactive Hover/Click/Right-Click Delete */}
                           {satRes.boxes.map((tree) => {
-                            const stroke = classStroke[tree.className] || '#10b981';
+                            const stroke =
+                              tree.health === 'dead'
+                                ? '#ef4444'
+                                : tree.health === 'stressed'
+                                  ? '#eab308'
+                                  : classStroke[tree.className] || '#10b981';
                             const isSelected = activeTree?.id === tree.id;
                             const r = Math.max(4, tree.radiusPx);
                             return (
                               <g
                                 key={tree.id}
                                 className="cursor-pointer"
-                                onMouseEnter={() => setHoveredTree(tree)}
-                                onMouseLeave={() => setHoveredTree(null)}
+                                onMouseEnter={() => {
+                                  if (!editTreesMode) setHoveredTree(tree);
+                                }}
+                                onMouseLeave={() => {
+                                  if (!editTreesMode) setHoveredTree(null);
+                                }}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   setPinnedTree((cur) => (cur?.id === tree.id ? null : tree));
                                 }}
+                                onContextMenu={(e) => {
+                                  if (editTreesMode) {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    handleDeleteSingleTree(tree.id);
+                                  }
+                                }}
                               >
-                                {/* Larger invisible hit area */}
                                 <circle cx={tree.cx} cy={tree.cy} r={Math.max(10, r + 4)} fill="transparent" />
                                 <circle
                                   cx={tree.cx}
@@ -1018,6 +1489,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                                   fill={isSelected ? `${stroke}44` : `${stroke}22`}
                                   stroke={isSelected ? '#ffffff' : stroke}
                                   strokeWidth={isSelected ? 2.4 : 1.7}
+                                  strokeDasharray={tree.source === 'manual' ? '3 2' : undefined}
                                 />
                                 <circle cx={tree.cx} cy={tree.cy} r={2} fill={stroke} />
                                 {showCompactIds && (
@@ -1040,18 +1512,21 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                           })}
                         </svg>
 
-                        {/* Interactive Hover / Click Tooltip */}
+                        {/* Interactive Hover / Click Inspector & Edit Popover */}
                         {activeTree && (
                           <div
-                            className="absolute z-20 pointer-events-none px-2.5 py-2 rounded-lg bg-slate-900/95 border border-slate-700 text-white text-[11px] shadow-lg max-w-[250px]"
+                            onClick={(e) => e.stopPropagation()}
+                            className={`absolute z-20 px-2.5 py-2 rounded-lg bg-slate-900/95 border border-slate-700 text-white text-[11px] shadow-lg w-[240px] ${
+                              pinnedTree ? 'pointer-events-auto' : 'pointer-events-none'
+                            }`}
                             style={{
-                              left: `${Math.min(70, Math.max(4, (activeTree.cx / satRes.canvasWidth) * 100))}%`,
-                              top: `${Math.min(70, Math.max(4, (activeTree.cy / satRes.canvasHeight) * 100))}%`,
+                              left: `${Math.min(62, Math.max(4, (activeTree.cx / satRes.canvasWidth) * 100))}%`,
+                              top: `${Math.min(58, Math.max(4, (activeTree.cy / satRes.canvasHeight) * 100))}%`,
                             }}
                           >
-                            <div className="flex items-center justify-between gap-3 font-semibold">
+                            <div className="flex items-center justify-between gap-2 font-semibold">
                               <span className="font-mono-num text-emerald-300">
-                                Tree #{activeTree.id}
+                                Tree #{activeTree.id} {activeTree.source === 'manual' ? '(Manual)' : ''}
                               </span>
                               <span className="font-mono-num text-sky-300">
                                 {Math.round(activeTree.score * 100)}% conf
@@ -1061,19 +1536,73 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                               {classLabelAr[activeTree.className]}
                             </div>
                             <div className="text-[10px] font-mono-num text-slate-300 mt-0.5">
-                              Shadow Drop: {Math.round(activeTree.shadowDrop * 100)}% · Lap Var:{' '}
-                              {activeTree.laplacianVar}
+                              Shadow Drop: {Math.round(activeTree.shadowDrop * 100)}% · Health:{' '}
+                              {activeTree.health || 'healthy'}
                             </div>
-                            {(activeTree.crownDiameterM !== undefined ||
-                              activeTree.circularity !== undefined) && (
+                            {activeTree.lat !== undefined && activeTree.lon !== undefined && (
                               <div className="text-[10px] font-mono-num text-slate-400 mt-0.5">
-                                {activeTree.crownDiameterM !== undefined &&
-                                  `Crown: ${activeTree.crownDiameterM}m`}
-                                {activeTree.crownDiameterM !== undefined &&
-                                  activeTree.circularity !== undefined &&
-                                  ' · '}
-                                {activeTree.circularity !== undefined &&
-                                  `Circularity: ${activeTree.circularity}`}
+                                {activeTree.lat.toFixed(6)}, {activeTree.lon.toFixed(6)}
+                              </div>
+                            )}
+
+                            {pinnedTree && pinnedTree.id === activeTree.id && onUpdateSatelliteBoxes && (
+                              <div className="mt-2 pt-2 border-t border-slate-700 space-y-1.5">
+                                <div className="grid grid-cols-3 gap-1 text-[10px]">
+                                  {(
+                                    [
+                                      { id: 'orchard_tree', lbl: 'بستان' },
+                                      { id: 'palm_tree', lbl: 'نخيل' },
+                                      { id: 'windbreak_tree', lbl: 'مصدات' },
+                                    ] as Array<{ id: TreeClassName; lbl: string }>
+                                  ).map((cOpt) => (
+                                    <button
+                                      key={cOpt.id}
+                                      type="button"
+                                      onClick={() =>
+                                        handleUpdateSingleTree(activeTree.id, { className: cOpt.id })
+                                      }
+                                      className={`px-1 py-0.5 rounded border cursor-pointer ${
+                                        activeTree.className === cOpt.id
+                                          ? 'bg-emerald-600 border-emerald-500 text-white'
+                                          : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
+                                      }`}
+                                    >
+                                      {cOpt.lbl}
+                                    </button>
+                                  ))}
+                                </div>
+                                <div className="grid grid-cols-3 gap-1 text-[10px]">
+                                  {(
+                                    [
+                                      { id: 'healthy', lbl: 'سليمة' },
+                                      { id: 'stressed', lbl: 'مجهدة' },
+                                      { id: 'dead', lbl: 'تالفة' },
+                                    ] as Array<{ id: TreeHealthStatus; lbl: string }>
+                                  ).map((hOpt) => (
+                                    <button
+                                      key={hOpt.id}
+                                      type="button"
+                                      onClick={() =>
+                                        handleUpdateSingleTree(activeTree.id, { health: hOpt.id })
+                                      }
+                                      className={`px-1 py-0.5 rounded border cursor-pointer ${
+                                        (activeTree.health || 'healthy') === hOpt.id
+                                          ? 'bg-indigo-600 border-indigo-500 text-white'
+                                          : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
+                                      }`}
+                                    >
+                                      {hOpt.lbl}
+                                    </button>
+                                  ))}
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteSingleTree(activeTree.id)}
+                                  className="w-full inline-flex items-center justify-center gap-1 py-1 rounded bg-red-600/90 hover:bg-red-600 text-white text-[10px] font-semibold cursor-pointer"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                  <span>حذف الشجرة (Delete)</span>
+                                </button>
                               </div>
                             )}
                           </div>
@@ -1258,15 +1787,47 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                   </button>
                 </div>
               ) : (
-                <div className="h-full min-h-[260px] flex flex-col items-center justify-center text-center p-6 bg-slate-50 rounded-lg border border-slate-200">
+                <div className="h-full min-h-[260px] flex flex-col items-center justify-center text-center p-6 bg-slate-50 rounded-lg border border-slate-200 space-y-3">
                   <RefreshCw
-                    className={`w-6 h-6 text-slate-400 mb-2 ${isRunningSat ? 'animate-spin' : ''}`}
+                    className={`w-6 h-6 text-slate-400 ${isRunningSat ? 'animate-spin' : ''}`}
                   />
                   <p className="text-xs text-slate-600 max-w-xs">
                     {isRunningSat
-                      ? `Fetching ${providerMode === 'esri' ? 'Esri Z18-19' : 'Google Z19-20'} imagery & running SAHI + Shadow/Texture filter for Farm ${auditRec.farm_id}...`
+                      ? satProgress?.message ||
+                        `Fetching ${providerMode === 'esri' ? 'Esri Z18-19' : 'Google Z19-20'} imagery & running SAHI detection for Farm ${auditRec.farm_id}...`
                       : "Click 'Run Satellite AI Check' to load satellite boundary & tree detections."}
                   </p>
+                  {isRunningSat && satProgress && satProgress.total > 0 && (
+                    <div className="w-full max-w-xs space-y-1.5">
+                      <div className="w-full h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-emerald-600 transition-all duration-200"
+                          style={{
+                            width: `${Math.min(
+                              100,
+                              Math.round((satProgress.loaded / Math.max(1, satProgress.total)) * 100)
+                            )}%`,
+                          }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[10px] font-mono-num text-slate-500">
+                        <span className="uppercase">{satProgress.stage}</span>
+                        <span>
+                          {satProgress.loaded}/{satProgress.total}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                  {isRunningSat && onCancelSatelliteAi && (
+                    <button
+                      type="button"
+                      onClick={onCancelSatelliteAi}
+                      className="inline-flex items-center gap-1 px-3 py-1 bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 text-[11px] font-medium rounded-md cursor-pointer"
+                    >
+                      <X className="w-3 h-3" />
+                      <span>Cancel Analysis</span>
+                    </button>
+                  )}
                 </div>
               )}
             </div>

@@ -308,7 +308,7 @@ export function gpsQuality(raw: unknown, pts: PointLonLat[]): string[] {
   return warns;
 }
 
-function pointInRingXY(x: number, y: number, ring: PointLonLat[]): boolean {
+export function pointInRingPx(x: number, y: number, ring: Array<[number, number]>): boolean {
   let inside = false;
   for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
     const xi = ring[i][0];
@@ -319,6 +319,10 @@ function pointInRingXY(x: number, y: number, ring: PointLonLat[]): boolean {
     if (intersect) inside = !inside;
   }
   return inside;
+}
+
+function pointInRingXY(x: number, y: number, ring: PointLonLat[]): boolean {
+  return pointInRingPx(x, y, ring);
 }
 
 export function polygonIoU(polyA: PointLonLat[], polyB: PointLonLat[]): number {

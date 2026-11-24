@@ -354,7 +354,7 @@ def run_cached_satellite_canopy(
         else:
             out[f"{img_key}_bytes"] = None
         out.pop(img_key, None)
-    out.pop("ndvi_heatmap_img", None)
+    out.pop("pseudo_ndvi_heatmap_img", None)
     return out
 
 
@@ -992,8 +992,8 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         with tr_c4:
             st.metric("مسافة النظام الثابتة", f"{canopy_result['spacing_m']} متر")
 
-        # 2. Tree Health Classification (NDVI Canopy Health)
-        st.markdown("##### 🩺 تصنيف الحالة الصحية للأشجار والمجموع الخضري (NDVI Analysis):")
+        # 2. Tree Health Classification (Pseudo-NDVI RGB Canopy Health)
+        st.markdown("##### 🩺 تصنيف الحالة الصحية للأشجار والمجموع الخضري (Pseudo-NDVI RGB):")
         h_c1, h_c2, h_c3, h_c4 = st.columns(4)
         with h_c1:
             st.metric(
@@ -1105,7 +1105,7 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
         t_points = canopy_result.get("tree_points") or []
         if t_points and len(t_points) > 0:
             with st.expander(f"📋 كشف وسجل تدقيق الأشجار المرصودة تفصيلياً ({len(t_points)} شجرة)", expanded=False):
-                st.caption("يمكنك استعراض بيانات كل شجرة مرصودة، تصنيف صحتها، ومتوسط مؤشر الغطاء النباتي (NDVI) الخاص بكل تاج.")
+                st.caption("يمكنك استعراض بيانات كل شجرة مرصودة، تصنيف صحتها، ومتوسط مؤشر Pseudo-NDVI (RGB) الخاص بكل تاج.")
 
                 f_c1, f_c2 = st.columns([1.5, 1.5])
                 with f_c1:
@@ -1132,8 +1132,8 @@ elif nav_choice == "🌾 فحص المزرعة الشامل والصور وال�
                     rows_to_show.append({
                         "رقم الشجرة (#)": f"#{tid_val}",
                         "الحالة الصحية": tp.get("status_ar", ""),
-                        "مؤشر NDVI للتاج": tp.get("mean_ndvi", 0.0),
-                        "أقصى حيوية خضرية": tp.get("max_ndvi", tp.get("mean_ndvi", 0.0)),
+                        "مؤشر Pseudo-NDVI للتاج": tp.get("mean_pseudo_ndvi", 0.0),
+                        "أقصى حيوية خضرية": tp.get("max_pseudo_ndvi", tp.get("mean_pseudo_ndvi", 0.0)),
                         "قطر التاج التقديري (بكسل)": tp.get("crown_radius", 4) * 2,
                         "إحداثيات المركز بالصورة": f"X:{center_xy[0]}, Y:{center_xy[1]}",
                     })

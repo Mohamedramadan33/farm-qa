@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, Menu, AlertCircle } from 'lucide-react';
 import { LoginScreen } from './components/LoginScreen';
 import { ReviewView } from './components/ReviewView';
@@ -18,6 +18,7 @@ import {
   runCrossChecks,
 } from './lib/farmQaCore';
 import { analyzeFarmSatellite } from './lib/satelliteAnalyzer';
+import { setDetectionAuthToken } from './services/satellite/config';
 import { displayName } from './lib/workDivider';
 import {
   STATUS_PENDING,
@@ -31,7 +32,9 @@ import {
   type RawKoboSubmission,
   type SatelliteAnalysisResult,
   type SatelliteCalibrationOptions,
+  type SatelliteProgress,
   type TeamMemberKey,
+  type TreeDetectionBox,
   type UserSession,
   type WorklistItem,
 } from './types/qa';
@@ -107,9 +110,15 @@ export function App() {
   // Satellite options & cached results
   const [autoSat, setAutoSat] = useState(true);
   const [useNdvi, setUseNdvi] = useState(false);
+  const [satAuthReady, setSatAuthReady] = useState(false);
   const [satelliteImages, setSatelliteImages] = useState<Record<string, string>>({});
   const [satelliteResults, setSatelliteResults] = useState<Record<string, SatelliteAnalysisResult>>({});
   const [runningSatelliteFarmId, setRunningSatelliteFarmId] = useState<string | null>(null);
+  const [satProgress, setSatProgress] = useState<SatelliteProgress | null>(null);
+  const satAbortRef = useRef<AbortController | null>(null);
+  const [manualEditsDeltaByFarm, setManualEditsDeltaByFarm] = useState<
+    Record<string, { added: number; deleted: number; reclassified: number }>
+  >({});
 
   // Toast feedback
   const [toast, setToast] = useState<FlashToast | null>(null);
@@ -186,9 +195,32 @@ export function App() {
   );
 
   useEffect(() => {
+    let active = true;
     if (user && !user.mustChangePassword) {
       fetchAllWorkspaceData(false);
+      fetch('/api/auth/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userKey: user.key }),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data: { ok?: boolean; token?: string } | null) => {
+          if (!active) return;
+          if (data?.ok && data.token) {
+            setDetectionAuthToken(data.token);
+          }
+          setSatAuthReady(true);
+        })
+        .catch(() => {
+          if (active) setSatAuthReady(true);
+        });
+    } else {
+      setDetectionAuthToken(null);
+      setSatAuthReady(false);
     }
+    return () => {
+      active = false;
+    };
   }, [user, fetchAllWorkspaceData]);
 
   // Derived column mappings
@@ -261,16 +293,32 @@ export function App() {
     [flatRows, colsMap, regionCols, farmerCols, masterReviews, pushToast]
   );
 
+  const handleCancelSatelliteAi = useCallback(() => {
+    if (satAbortRef.current) {
+      satAbortRef.current.abort();
+      satAbortRef.current = null;
+    }
+    setRunningSatelliteFarmId(null);
+    setSatProgress(null);
+  }, []);
+
   // Satellite AI execution
   const handleRunSatelliteAi = useCallback(
     async (farmId: string, calibration?: Partial<SatelliteCalibrationOptions>) => {
       const target = loadedRecords.find((r) => r.farm_id === farmId);
       if (!target || !target._poly) return;
 
+      if (satAbortRef.current) {
+        satAbortRef.current.abort();
+      }
+      const controller = new AbortController();
+      satAbortRef.current = controller;
+
       setLoadedRecords((prev) =>
         prev.map((rec) => (rec.farm_id === farmId ? { ...rec, ai_error: '' } : rec))
       );
       setRunningSatelliteFarmId(farmId);
+      setSatProgress({ stage: 'tiles', loaded: 0, total: 1, message: 'Starting satellite tile download...' });
       try {
         const prevRes = satelliteResults[farmId];
         const res = await analyzeFarmSatellite({
@@ -282,10 +330,17 @@ export function App() {
           offsetX_m: calibration?.offsetX_m ?? prevRes?.offsetX_m ?? 0,
           offsetY_m: calibration?.offsetY_m ?? prevRes?.offsetY_m ?? 0,
           inwardBufferM: calibration?.inwardBufferM ?? prevRes?.inwardBufferM ?? -1.5,
+          highAccuracy: calibration?.highAccuracy ?? false,
+          signal: controller.signal,
+          onProgress: (p) => setSatProgress(p),
         });
 
         setSatelliteImages((prev) => ({ ...prev, [farmId]: res.annotatedImageUrl }));
         setSatelliteResults((prev) => ({ ...prev, [farmId]: res }));
+        setManualEditsDeltaByFarm((prev) => ({
+          ...prev,
+          [farmId]: { added: 0, deleted: 0, reclassified: 0 },
+        }));
 
         setLoadedRecords((prev) =>
           prev.map((rec) => {
@@ -300,7 +355,7 @@ export function App() {
               imgAge: res.imgAge,
               crownM: res.crownM,
             });
-            vText = applyNdvi(vText, res.ndviRecent, res.vegPct, res.imgAge);
+            vText = applyNdvi(vText, res.pseudoNdvi, res.vegPct, res.imgAge);
 
             const updated: FarmAuditRecord = {
               ...rec,
@@ -314,7 +369,7 @@ export function App() {
               crown_m: res.crownM,
               imagery_date: res.imageryDate,
               img_age: res.imgAge,
-              ndvi_recent: res.ndviRecent,
+              pseudo_ndvi: res.pseudoNdvi,
               zoom_used: res.zoomUsed,
               ai_error: '',
               verdict: vText,
@@ -324,21 +379,127 @@ export function App() {
           })
         );
       } catch (err) {
+        if (controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+          pushToast('warn', 'تم إلغاء تحليل القمر الصناعي.');
+          return;
+        }
         const msg = err instanceof Error ? err.message : String(err);
         setLoadedRecords((prev) =>
           prev.map((rec) => (rec.farm_id === farmId ? { ...rec, ai_error: msg } : rec))
         );
         pushToast('warn', `Satellite AI: ${msg}`);
       } finally {
-        setRunningSatelliteFarmId(null);
+        if (satAbortRef.current === controller) {
+          satAbortRef.current = null;
+          setRunningSatelliteFarmId(null);
+          setSatProgress(null);
+        }
       }
     },
     [loadedRecords, satelliteResults, useNdvi, pushToast]
   );
 
+  // Live Human-in-the-Loop tree edit handler (add / delete / reclassify / health update)
+  const handleUpdateSatelliteBoxes = useCallback(
+    (farmId: string, updatedBoxes: TreeDetectionBox[]) => {
+      const curSat = satelliteResults[farmId];
+      if (!curSat) return;
+
+      const prevById = new Map(curSat.boxes.map((b) => [b.id, b]));
+      const nextById = new Map(updatedBoxes.map((b) => [b.id, b]));
+      let addedDelta = 0;
+      let deletedDelta = 0;
+      let reclassDelta = 0;
+      for (const b of updatedBoxes) {
+        const old = prevById.get(b.id);
+        if (!old) addedDelta++;
+        else if (old.classId !== b.classId || old.health !== b.health) reclassDelta++;
+      }
+      for (const b of curSat.boxes) {
+        if (!nextById.has(b.id)) deletedDelta++;
+      }
+      if (addedDelta > 0 || deletedDelta > 0 || reclassDelta > 0) {
+        setManualEditsDeltaByFarm((prev) => {
+          const cur = prev[farmId] || { added: 0, deleted: 0, reclassified: 0 };
+          return {
+            ...prev,
+            [farmId]: {
+              added: cur.added + addedDelta,
+              deleted: cur.deleted + deletedDelta,
+              reclassified: cur.reclassified + reclassDelta,
+            },
+          };
+        });
+      }
+
+      const boundaryBoxes = updatedBoxes.filter((b) => b.onBoundary);
+      const interiorBoxes = updatedBoxes.filter((b) => !b.onBoundary);
+      const primaryBoxes = curSat.inwardBufferM < -0.5 ? updatedBoxes : boundaryBoxes;
+      const factor = curSat.aiFactor || 1.0;
+      const aiCount = Math.round(primaryBoxes.length * factor);
+      const aiLow = aiCount;
+      const aiHigh = aiCount;
+
+      let crownM = curSat.crownM;
+      if (primaryBoxes.length > 0) {
+        const diams = primaryBoxes
+          .map((b) => b.crownDiameterM ?? Math.sqrt((b.xmax - b.xmin) * (b.ymax - b.ymin)) * curSat.mpp)
+          .sort((a, b) => a - b);
+        crownM = Number(diams[Math.floor(diams.length / 2)].toFixed(2));
+      } else {
+        crownM = null;
+      }
+
+      setSatelliteResults((prev) => ({
+        ...prev,
+        [farmId]: {
+          ...curSat,
+          boxes: updatedBoxes,
+          aiCount,
+          aiLow,
+          aiHigh,
+          aiInteriorTrees: interiorBoxes.length,
+          aiRaw: primaryBoxes.length,
+          crownM,
+        },
+      }));
+
+      setLoadedRecords((prev) =>
+        prev.map((rec) => {
+          if (rec.farm_id !== farmId) return rec;
+          let vText = computeVerdict({
+            E: rec.engineer_count,
+            A: aiCount,
+            F: rec.forecast,
+            band: [aiLow, aiHigh],
+            vegPct: curSat.vegPct,
+            imgAge: curSat.imgAge,
+            crownM,
+          });
+          vText = applyNdvi(vText, curSat.pseudoNdvi, curSat.vegPct, curSat.imgAge);
+          const updated: FarmAuditRecord = {
+            ...rec,
+            ai_count: aiCount,
+            ai_low: aiLow,
+            ai_high: aiHigh,
+            ai_interior_trees: interiorBoxes.length,
+            ai_raw: primaryBoxes.length,
+            crown_m: crownM,
+            verdict: vText,
+          };
+          updated.confidence = computeConfidence(updated);
+          return updated;
+        })
+      );
+    },
+    [satelliteResults]
+  );
+
   // Auto-run satellite AI when opening a farm if enabled and not yet analyzed/errored
   useEffect(() => {
-    if (view !== 'review' || !autoSat || !selectedFarmId || runningSatelliteFarmId) return;
+    if (view !== 'review' || !autoSat || !satAuthReady || !selectedFarmId || runningSatelliteFarmId) {
+      return;
+    }
     const rec = loadedRecords.find((r) => r.farm_id === selectedFarmId);
     if (!rec || !rec._poly) return;
     const alreadyAttempted =
@@ -349,6 +510,7 @@ export function App() {
   }, [
     view,
     autoSat,
+    satAuthReady,
     selectedFarmId,
     loadedRecords,
     satelliteImages,
@@ -376,6 +538,9 @@ export function App() {
   };
 
   const handleLogout = () => {
+    handleCancelSatelliteAi();
+    setDetectionAuthToken(null);
+    setSatAuthReady(false);
     setUser(null);
     localStorage.removeItem(LS_SESSION_KEY);
     setLoadedRecords([]);
@@ -727,7 +892,11 @@ export function App() {
                 satelliteImages={satelliteImages}
                 satelliteResults={satelliteResults}
                 runningSatelliteFarmId={runningSatelliteFarmId}
+                satProgress={satProgress}
+                manualDelta={manualEditsDeltaByFarm[selectedFarmId]}
                 onRunSatelliteAi={handleRunSatelliteAi}
+                onCancelSatelliteAi={handleCancelSatelliteAi}
+                onUpdateSatelliteBoxes={handleUpdateSatelliteBoxes}
                 savedFieldDecisions={fieldReviews}
                 onSaveDecision={handleSaveDecision}
                 onSyncAirtable={handleSyncAirtable}

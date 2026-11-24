@@ -397,11 +397,11 @@ export function computeVerdict(params: {
 
 export function applyNdvi(
   verdictText: string,
-  _ndvi: number | null,
+  _pseudoNdvi: number | null,
   _veg: number | null,
   _imgAge: number | null
 ): string {
-  // NDVI Heatmap and generic greenness must NOT change or override the audit decision.
+  // RGB Pseudo-NDVI and generic greenness must NOT change or override the audit decision.
   // The decision is based strictly on real tree counts and physical geometry.
   return verdictText;
 }
@@ -602,7 +602,7 @@ export function auditRow(
     crown_m: null,
     imagery_date: null,
     img_age: null,
-    ndvi_recent: null,
+    pseudo_ndvi: null,
     zoom_used: null,
     ai_error: '',
     verdict: initialVerdict,
