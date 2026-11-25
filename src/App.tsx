@@ -28,6 +28,7 @@ import {
   type FieldDecisionRow,
   type FlattenedRow,
   type LabelMap,
+  type LibraryEngineId,
   type MasterReviewRecord,
   type RawKoboSubmission,
   type SatelliteAnalysisResult,
@@ -120,8 +121,15 @@ export function App() {
     Record<string, { added: number; deleted: number; reclassified: number }>
   >({});
 
-  // Toast feedback
+  // Toast feedback & Google Maps quota defense (Case A)
   const [toast, setToast] = useState<FlashToast | null>(null);
+  const [mapsQuotaExceeded, setMapsQuotaExceeded] = useState(false);
+
+  useEffect(() => {
+    const onQuotaExceeded = () => setMapsQuotaExceeded(true);
+    window.addEventListener('gmp-quota-exceeded', onQuotaExceeded);
+    return () => window.removeEventListener('gmp-quota-exceeded', onQuotaExceeded);
+  }, []);
 
   const pushToast = useCallback((type: FlashToast['type'], text: string) => {
     const id = Date.now();
@@ -322,15 +330,20 @@ export function App() {
       try {
         const prevRes = satelliteResults[farmId];
         const res = await analyzeFarmSatellite({
+          farmId: target.farm_id,
           poly: target._poly,
           species: target.species,
+          cropType: target.crop_type,
+          engineerCount: target.engineer_count,
+          forecast: target.forecast,
           submissionTime: target.submission_time,
           useNdvi,
           providerMode: calibration?.providerMode ?? prevRes?.providerId ?? 'google',
           offsetX_m: calibration?.offsetX_m ?? prevRes?.offsetX_m ?? 0,
           offsetY_m: calibration?.offsetY_m ?? prevRes?.offsetY_m ?? 0,
           inwardBufferM: calibration?.inwardBufferM ?? prevRes?.inwardBufferM ?? -1.5,
-          highAccuracy: calibration?.highAccuracy ?? false,
+          highRes: calibration?.highRes ?? calibration?.highAccuracy ?? prevRes?.highResMode ?? false,
+          highAccuracy: calibration?.highRes ?? calibration?.highAccuracy ?? prevRes?.highResMode ?? false,
           confThresh:
             calibration?.confThresh ?? prevRes?.confThreshUsed ?? DETECTION_CONFIG.aiModelConfThresh,
           signal: controller.signal,
@@ -495,6 +508,73 @@ export function App() {
       );
     },
     [satelliteResults]
+  );
+
+  // Adopt a specific detection library's boxes & count from the Multi-Library Comparison table
+  const handleAdoptLibraryEngine = useCallback(
+    (farmId: string, engineId: LibraryEngineId) => {
+      const curSat = satelliteResults[farmId];
+      const lib = curSat?.libraryComparison?.libraries.find(
+        (l) => l.id === engineId && l.status === 'ran'
+      );
+      if (!curSat || !lib || !curSat.libraryComparison) return;
+
+      const adoptedBoxes = lib.boxes;
+      const boundaryBoxes = adoptedBoxes.filter((b) => b.onBoundary);
+      const interiorBoxes = adoptedBoxes.filter((b) => !b.onBoundary);
+      const primaryBoxes = curSat.inwardBufferM < -0.5 ? adoptedBoxes : boundaryBoxes;
+      const aiCount = primaryBoxes.length;
+      const crownM = lib.medianCrownM;
+
+      setSatelliteResults((prev) => ({
+        ...prev,
+        [farmId]: {
+          ...curSat,
+          detectorEngine: `${lib.name} (${lib.libraryBadge})`,
+          boxes: adoptedBoxes,
+          aiCount,
+          aiLow: Math.max(0, Math.round(aiCount * 0.9)),
+          aiHigh: Math.round(aiCount * 1.1),
+          aiInteriorTrees: interiorBoxes.length,
+          aiRaw: aiCount,
+          crownM,
+          libraryComparison: {
+            ...curSat.libraryComparison!,
+            activeEngineId: engineId,
+          },
+        },
+      }));
+
+      setLoadedRecords((prev) =>
+        prev.map((rec) => {
+          if (rec.farm_id !== farmId) return rec;
+          let vText = computeVerdict({
+            E: rec.engineer_count,
+            A: aiCount,
+            F: rec.forecast,
+            band: [Math.max(0, Math.round(aiCount * 0.9)), Math.round(aiCount * 1.1)],
+            vegPct: curSat.vegPct,
+            imgAge: curSat.imgAge,
+            crownM,
+          });
+          vText = applyNdvi(vText, curSat.pseudoNdvi, curSat.vegPct, curSat.imgAge);
+          const updated: FarmAuditRecord = {
+            ...rec,
+            ai_count: aiCount,
+            ai_low: Math.max(0, Math.round(aiCount * 0.9)),
+            ai_high: Math.round(aiCount * 1.1),
+            ai_interior_trees: interiorBoxes.length,
+            ai_raw: aiCount,
+            crown_m: crownM,
+            verdict: vText,
+          };
+          updated.confidence = computeConfidence(updated);
+          return updated;
+        })
+      );
+      pushToast('success', `تم اعتماد نتيجة "${lib.nameAr}" (${aiCount} شجرة) للمزرعة ${farmId}.`);
+    },
+    [satelliteResults, pushToast]
   );
 
   // Auto-run satellite AI when opening a farm if enabled and not yet analyzed/errored
@@ -828,6 +908,34 @@ export function App() {
           </div>
         </header>
 
+        {/* Google Maps Platform Case A Quota Exceeded Sticky Banner */}
+        {mapsQuotaExceeded && (
+          <div className="bg-amber-100 border-b border-amber-300 text-amber-950 px-6 py-2.5 text-xs flex items-center justify-between gap-4 shrink-0">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+              <span>
+                Google Maps Platform demo quota was reached or blocked. Live Google Maps tiles are temporarily paused —{' '}
+                <a
+                  href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline font-semibold text-amber-900 hover:text-amber-700"
+                >
+                  Quota &amp; Billing details
+                </a>
+                .
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setMapsQuotaExceeded(false)}
+              className="text-amber-900 hover:underline font-medium shrink-0 cursor-pointer"
+            >
+              إغلاق
+            </button>
+          </div>
+        )}
+
         {/* Flash Toast Notification */}
         {toast && (
           <div className="px-6 pt-4 shrink-0">
@@ -899,6 +1007,7 @@ export function App() {
                 onRunSatelliteAi={handleRunSatelliteAi}
                 onCancelSatelliteAi={handleCancelSatelliteAi}
                 onUpdateSatelliteBoxes={handleUpdateSatelliteBoxes}
+                onAdoptLibraryEngine={handleAdoptLibraryEngine}
                 savedFieldDecisions={fieldReviews}
                 onSaveDecision={handleSaveDecision}
                 onSyncAirtable={handleSyncAirtable}

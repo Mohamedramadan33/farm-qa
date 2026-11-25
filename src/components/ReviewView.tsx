@@ -4,11 +4,13 @@ import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  BrainCircuit,
   CheckCircle2,
   CloudUpload,
   Download,
   Edit3,
   Image as ImageIcon,
+  MapPin,
   Maximize2,
   PackageOpen,
   RefreshCw,
@@ -23,8 +25,14 @@ import {
 import { fmtVal, present } from '../lib/arabicNorm';
 import { downloadReviewsExcel } from '../lib/excelExport';
 import { pointInRingPx } from '../lib/geometry';
-import { worldPxToLonLat } from '../lib/satelliteAnalyzer';
+import {
+  computeSpatialOrchardMetrics,
+  lonLatToWorldPx,
+  requestSmartAiTreeAudit,
+  worldPxToLonLat,
+} from '../lib/satelliteAnalyzer';
 import { DETECTION_CONFIG, getDetectionAuthHeaders } from '../services/satellite/config';
+import { GoogleMapsTreeInspector } from './GoogleMapsTreeInspector';
 import {
   buildAttachmentLookup,
   findAttachment,
@@ -50,6 +58,7 @@ import {
   type FormStatus,
   type ItemDecision,
   type LabelMap,
+  type LibraryEngineId,
   type BasemapViewMode,
   type MasterReviewRecord,
   type MediaQuestionItem,
@@ -58,6 +67,7 @@ import {
   type SatelliteAnalysisResult,
   type SatelliteCalibrationOptions,
   type SatelliteProgress,
+  type SmartTreeAuditReport,
   type TreeClassName,
   type TreeDetectionBox,
   type TreeHealthStatus,
@@ -82,6 +92,7 @@ interface ReviewViewProps {
   ) => Promise<void>;
   onCancelSatelliteAi?: () => void;
   onUpdateSatelliteBoxes?: (farmId: string, boxes: TreeDetectionBox[]) => void;
+  onAdoptLibraryEngine?: (farmId: string, engineId: LibraryEngineId) => void;
   savedFieldDecisions: Record<string, FieldDecisionRow[]>;
   onSaveDecision: (params: {
     master: MasterReviewRecord;
@@ -120,6 +131,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   onRunSatelliteAi,
   onCancelSatelliteAi,
   onUpdateSatelliteBoxes,
+  onAdoptLibraryEngine,
   savedFieldDecisions,
   onSaveDecision,
   onSyncAirtable,
@@ -155,7 +167,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   const [inwardBufferM, setInwardBufferM] = useState<number>(-1.5);
   const [confThresh, setConfThresh] = useState<number>(DETECTION_CONFIG.aiModelConfThresh);
   const [showCompactIds, setShowCompactIds] = useState<boolean>(false);
-  const [highAccuracyMode, setHighAccuracyMode] = useState<boolean>(false);
+  const [highResMode, setHighResMode] = useState<boolean>(false);
   const [editTreesMode, setEditTreesMode] = useState<boolean>(false);
   const [exportingYolo, setExportingYolo] = useState<boolean>(false);
   const [queuingFeedback, setQueuingFeedback] = useState<boolean>(false);
@@ -163,6 +175,10 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   const [feedbackNotice, setFeedbackNotice] = useState<string | null>(null);
   const [hoveredTree, setHoveredTree] = useState<TreeDetectionBox | null>(null);
   const [pinnedTree, setPinnedTree] = useState<TreeDetectionBox | null>(null);
+  const [previewEngineId, setPreviewEngineId] = useState<LibraryEngineId | null>(null);
+  const [smartAuditByFarm, setSmartAuditByFarm] = useState<Record<string, SmartTreeAuditReport>>({});
+  const [runningSmartAudit, setRunningSmartAudit] = useState<boolean>(false);
+  const [smartAuditError, setSmartAuditError] = useState<string | null>(null);
   const svgOverlayRef = useRef<SVGSVGElement | null>(null);
 
   useEffect(() => {
@@ -347,9 +363,12 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     setOffsetY_m(res?.offsetY_m ?? 0);
     setInwardBufferM(res?.inwardBufferM ?? -1.5);
     setConfThresh(res?.confThreshUsed ?? DETECTION_CONFIG.aiModelConfThresh);
+    setHighResMode(Boolean(res?.highResMode ?? false));
     setEditTreesMode(false);
     setHoveredTree(null);
     setPinnedTree(null);
+    setPreviewEngineId(null);
+    setSmartAuditError(null);
   }, [auditRec?.farm_id]);
 
   // Run PGS Business Rules Audit (independent of UI display toggles, matching app.py line 919)
@@ -545,7 +564,15 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     windbreak_tree: '#06b6d4',
   };
 
-  const classCounts = (satRes?.boxes || []).reduce(
+  const previewLibrary =
+    previewEngineId && satRes?.libraryComparison
+      ? satRes.libraryComparison.libraries.find(
+          (l) => l.id === previewEngineId && l.status === 'ran'
+        ) || null
+      : null;
+  const displayedBoxes = previewLibrary ? previewLibrary.boxes : satRes?.boxes || [];
+
+  const classCounts = displayedBoxes.reduce(
     (acc, b) => {
       acc[b.className] = (acc[b.className] || 0) + 1;
       return acc;
@@ -553,7 +580,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     { orchard_tree: 0, palm_tree: 0, windbreak_tree: 0 } as Record<TreeClassName, number>
   );
 
-  const healthCounts = (satRes?.boxes || []).reduce(
+  const healthCounts = displayedBoxes.reduce(
     (acc, b) => {
       const h = b.health || 'healthy';
       acc[h] = (acc[h] || 0) + 1;
@@ -561,7 +588,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     },
     { healthy: 0, stressed: 0, dead: 0 } as Record<TreeHealthStatus, number>
   );
-  const totalBoxesCount = satRes?.boxes.length || 0;
+  const totalBoxesCount = displayedBoxes.length;
   const healthyPct =
     totalBoxesCount > 0 ? ((healthCounts.healthy / totalBoxesCount) * 100).toFixed(1) : '0.0';
   const stressedPct =
@@ -574,6 +601,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     (Math.abs(offsetX_m - satRes.offsetX_m) >= 0.1 ||
       Math.abs(offsetY_m - satRes.offsetY_m) >= 0.1 ||
       Math.abs(inwardBufferM - satRes.inwardBufferM) >= 0.1 ||
+      highResMode !== Boolean(satRes.highResMode) ||
       Math.abs(
         confThresh - (satRes.confThreshUsed ?? DETECTION_CONFIG.aiModelConfThresh)
       ) >= 0.02);
@@ -581,19 +609,55 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
   const previewDxPx = satRes ? (offsetX_m - satRes.offsetX_m) / Math.max(satRes.mpp, 0.1) : 0;
   const previewDyPx = satRes ? -(offsetY_m - satRes.offsetY_m) / Math.max(satRes.mpp, 0.1) : 0;
 
+  const spatialMetrics = useMemo(() => {
+    if (!satRes) return null;
+    return computeSpatialOrchardMetrics({
+      boxes: satRes.boxes,
+      mpp: satRes.mpp,
+      vegPct: satRes.vegPct,
+      engineerCount: auditRec.engineer_count,
+      aiCount: auditRec.ai_count,
+      forecast: auditRec.forecast,
+      inwardBufferM: satRes.inwardBufferM,
+    });
+  }, [satRes, auditRec.engineer_count, auditRec.ai_count, auditRec.forecast]);
+
+  const smartAuditReport = smartAuditByFarm[auditRec.farm_id] || null;
+
+  const handleRunSmartAudit = async () => {
+    if (!spatialMetrics || runningSmartAudit) return;
+    setRunningSmartAudit(true);
+    setSmartAuditError(null);
+    try {
+      const report = await requestSmartAiTreeAudit({
+        record: auditRec,
+        satResult: satRes,
+        spatialMetrics,
+      });
+      setSmartAuditByFarm((prev) => ({ ...prev, [auditRec.farm_id]: report }));
+    } catch (err) {
+      setSmartAuditError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunningSmartAudit(false);
+    }
+  };
+
   const triggerSatelliteWithCalib = (
     nextMode: BasemapViewMode = providerMode,
-    nextHighAcc: boolean = highAccuracyMode
+    nextHighRes: boolean = highResMode
   ) => {
     setProviderMode(nextMode);
     setHoveredTree(null);
     setPinnedTree(null);
+    setPreviewEngineId(null);
+    const fetchMode: BasemapViewMode = nextMode === 'gmaps' ? 'google' : nextMode;
     void onRunSatelliteAi(auditRec.farm_id, {
-      providerMode: nextMode,
+      providerMode: fetchMode,
       offsetX_m,
       offsetY_m,
       inwardBufferM,
-      highAccuracy: nextHighAcc,
+      highRes: nextHighRes,
+      highAccuracy: nextHighRes,
       confThresh,
     });
   };
@@ -681,6 +745,41 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
     const nextBoxes = [...satRes.boxes, newTree];
     onUpdateSatelliteBoxes(auditRec.farm_id, nextBoxes);
     setPinnedTree(newTree);
+  };
+
+  const handleAddTreeAtLatLng = (lat: number, lng: number) => {
+    if (!satRes || !onUpdateSatelliteBoxes) return;
+    let cx = Math.round(satRes.canvasWidth / 2);
+    let cy = Math.round(satRes.canvasHeight / 2);
+    if (satRes.worldOriginX !== undefined && satRes.worldOriginY !== undefined) {
+      const [wx, wy] = lonLatToWorldPx(lng, lat, satRes.zoomUsed);
+      cx = Math.max(2, Math.min(satRes.canvasWidth - 2, Math.round(wx - satRes.worldOriginX)));
+      cy = Math.max(2, Math.min(satRes.canvasHeight - 2, Math.round(wy - satRes.worldOriginY)));
+    }
+    const radiusPx = Math.max(5, Math.round(1.6 / Math.max(satRes.mpp, 0.12)));
+    const maxId = satRes.boxes.reduce((mx, b) => Math.max(mx, b.id), 0);
+    const newTree: TreeDetectionBox = {
+      id: maxId + 1,
+      xmin: Math.max(0, cx - radiusPx),
+      ymin: Math.max(0, cy - radiusPx),
+      xmax: Math.min(satRes.canvasWidth, cx + radiusPx),
+      ymax: Math.min(satRes.canvasHeight, cy + radiusPx),
+      cx,
+      cy,
+      radiusPx,
+      score: 1.0,
+      classId: 0,
+      className: 'orchard_tree',
+      health: 'healthy',
+      onBoundary: true,
+      shadowDrop: 0,
+      laplacianVar: 0,
+      crownDiameterM: Number((radiusPx * 2 * satRes.mpp).toFixed(2)),
+      lat: Number(lat.toFixed(7)),
+      lon: Number(lng.toFixed(7)),
+      source: 'manual',
+    };
+    onUpdateSatelliteBoxes(auditRec.farm_id, [...satRes.boxes, newTree]);
   };
 
   interface BuiltYoloTile {
@@ -1222,6 +1321,141 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                     </div>
                   </div>
                 )}
+
+                {/* Smart Tree Audit & Spatial Orchard Intelligence */}
+                {spatialMetrics && (
+                  <div
+                    dir="rtl"
+                    className="p-3.5 rounded-lg bg-indigo-50/70 border border-indigo-200/90 space-y-2.5 text-xs"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 font-bold text-indigo-950">
+                        <BrainCircuit className="w-4 h-4 text-indigo-700 shrink-0" />
+                        <span>التدقيق الذكي للأشجار (Spatial Tree Intelligence)</span>
+                      </div>
+
+                      <button
+                        type="button"
+                        disabled={runningSmartAudit}
+                        onClick={handleRunSmartAudit}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-indigo-700 hover:bg-indigo-800 disabled:opacity-50 text-white text-[11px] font-semibold transition-colors cursor-pointer"
+                      >
+                        <Sparkles className={`w-3 h-3 ${runningSmartAudit ? 'animate-pulse' : ''}`} />
+                        <span>
+                          {runningSmartAudit
+                            ? 'جاري التحليل الذكي...'
+                            : smartAuditReport
+                              ? 'تحديث التحليل الاستنتاجي'
+                              : 'تحليل التباين بالذكاء الاصطناعي'}
+                        </span>
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                      <div className="bg-white/80 rounded-md px-2.5 py-1.5 border border-indigo-100">
+                        <div className="text-slate-500">نمط البستان</div>
+                        <div className="font-semibold text-slate-900">
+                          {spatialMetrics.pattern === 'row_grid'
+                            ? 'صفوف منتظمة'
+                            : spatialMetrics.pattern === 'perimeter_windbreak'
+                              ? 'مصدات حدودية'
+                              : spatialMetrics.pattern === 'mixed_orchard'
+                                ? 'مختلط (داخلي+حواف)'
+                                : 'متفرق / بدون غرس'}
+                        </div>
+                      </div>
+                      <div className="bg-white/80 rounded-md px-2.5 py-1.5 border border-indigo-100">
+                        <div className="text-slate-500">المسافة البينية</div>
+                        <div className="font-mono-num font-semibold text-slate-900">
+                          {spatialMetrics.medianSpacingM !== null
+                            ? `${spatialMetrics.medianSpacingM}m`
+                            : '—'}
+                        </div>
+                      </div>
+                      <div className="bg-white/80 rounded-md px-2.5 py-1.5 border border-indigo-100">
+                        <div className="text-slate-500">انتظام الغرس</div>
+                        <div className="font-mono-num font-semibold text-slate-900">
+                          {spatialMetrics.spacingRegularityPct !== null
+                            ? `${spatialMetrics.spacingRegularityPct}%`
+                            : '—'}
+                        </div>
+                      </div>
+                      <div className="bg-white/80 rounded-md px-2.5 py-1.5 border border-indigo-100">
+                        <div className="text-slate-500">تيجان ضخمة مشتبهة</div>
+                        <div className="font-mono-num font-semibold text-amber-800">
+                          {spatialMetrics.oversizedCrownIds.length}
+                        </div>
+                      </div>
+                    </div>
+
+                    <ul className="space-y-1 text-[11px] text-indigo-950 list-disc list-inside">
+                      {spatialMetrics.diagnosticsAr.map((msg, i) => (
+                        <li key={i}>{msg}</li>
+                      ))}
+                    </ul>
+
+                    {spatialMetrics.oversizedCrownIds.length > 0 && satRes && (
+                      <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+                        <span className="text-slate-600">فحص سريع للتيجان الكبيرة:</span>
+                        {spatialMetrics.oversizedCrownIds.slice(0, 6).map((tid) => (
+                          <button
+                            key={tid}
+                            type="button"
+                            onClick={() => {
+                              const found = satRes.boxes.find((b) => b.id === tid);
+                              if (found) setPinnedTree(found);
+                            }}
+                            className="px-1.5 py-0.5 rounded bg-amber-100 hover:bg-amber-200 text-amber-950 font-mono-num font-semibold cursor-pointer"
+                          >
+                            #{tid}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {smartAuditError && (
+                      <div className="p-2 rounded bg-red-50 border border-red-200 text-[11px] text-red-800">
+                        {smartAuditError}
+                      </div>
+                    )}
+
+                    {smartAuditReport && (
+                      <div className="p-2.5 rounded-md bg-white border border-indigo-200 space-y-1.5 text-[11px]">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-bold text-indigo-950">
+                            خلاصة الذكاء الاصطناعي ({smartAuditReport.confidencePct}% ثقة)
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setGeneralNote((prev) =>
+                                prev.trim()
+                                  ? `${prev.trim()} | ${smartAuditReport.suggestedAuditorComment}`
+                                  : smartAuditReport.suggestedAuditorComment
+                              );
+                            }}
+                            className="px-2 py-0.5 rounded bg-emerald-700 hover:bg-emerald-800 text-white text-[10px] font-semibold cursor-pointer"
+                          >
+                            إدراج كملاحظة مراجع
+                          </button>
+                        </div>
+                        <p className="text-slate-800 leading-relaxed">
+                          <strong>سبب الفارق/التطابق:</strong> {smartAuditReport.discrepancyCauseAr}
+                        </p>
+                        <p className="text-slate-700 leading-relaxed">
+                          <strong>حالة الغطاء:</strong> {smartAuditReport.canopyQualitySummaryAr}
+                        </p>
+                        {smartAuditReport.fieldCheckRecommendationsAr.length > 0 && (
+                          <ul className="list-disc list-inside text-slate-600 space-y-0.5 pt-0.5">
+                            {smartAuditReport.fieldCheckRecommendationsAr.map((rec, idx) => (
+                              <li key={idx}>{rec}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1229,26 +1463,36 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
             <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between space-y-3">
               {/* Basemap Switcher, Mode Badge & High-Accuracy Toggle */}
               <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100">
-                <div className="inline-flex items-center gap-1 p-0.5 bg-slate-100 rounded-lg text-[11px] font-medium">
+                <div className="inline-flex flex-wrap items-center gap-1 p-0.5 bg-slate-100 rounded-lg text-[11px] font-medium">
                   {(
                     [
-                      { id: 'google', label: 'Google (Z19)' },
+                      { id: 'google', label: 'Google (Z19-20)' },
                       { id: 'esri', label: 'Esri (Z18-19)' },
-                      { id: 'compare', label: 'Side-by-Side Compare' },
+                      { id: 'compare', label: 'Side-by-Side' },
+                      { id: 'gmaps', label: 'Google Maps Live' },
                     ] as Array<{ id: BasemapViewMode; label: string }>
                   ).map((opt) => (
                     <button
                       key={opt.id}
                       type="button"
                       disabled={isRunningSat || !hasValidGps}
-                      onClick={() => triggerSatelliteWithCalib(opt.id)}
-                      className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                      onClick={() => {
+                        if (opt.id === 'gmaps') {
+                          setProviderMode('gmaps');
+                          setHoveredTree(null);
+                          setPinnedTree(null);
+                        } else {
+                          triggerSatelliteWithCalib(opt.id);
+                        }
+                      }}
+                      className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer inline-flex items-center gap-1 ${
                         providerMode === opt.id
                           ? 'bg-white text-slate-900 shadow-xs font-semibold'
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
-                      {opt.label}
+                      {opt.id === 'gmaps' && <MapPin className="w-3 h-3 text-emerald-700" />}
+                      <span>{opt.label}</span>
                     </button>
                   ))}
                 </div>
@@ -1256,17 +1500,24 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                 <div className="flex flex-wrap items-center gap-3 text-[11px]">
                   <label
                     className="inline-flex items-center gap-1.5 text-slate-700 cursor-pointer select-none"
-                    title="Uses Gemini 2.5 Pro with dense 384px overlapping tiles for small/young saplings"
+                    title="Splits the farm polygon into smaller overlapping 288px tiles (40% overlap) with polygon-filtered Z20 fetch & Gemini High-Reasoning to minimize crop scale distortion"
                   >
                     <input
                       type="checkbox"
-                      checked={highAccuracyMode}
-                      onChange={(e) => setHighAccuracyMode(e.target.checked)}
+                      checked={highResMode}
+                      disabled={isRunningSat}
+                      onChange={(e) => {
+                        const next = e.target.checked;
+                        setHighResMode(next);
+                        if (satRes && hasValidGps && !isRunningSat) {
+                          triggerSatelliteWithCalib(providerMode, next);
+                        }
+                      }}
                       className="rounded border-slate-300 text-indigo-700 focus:ring-indigo-600"
                     />
                     <span className="inline-flex items-center gap-1 font-medium text-indigo-900">
                       <Sparkles className="w-3 h-3 text-indigo-600" />
-                      High-Accuracy (Pro · Dense)
+                      High-Res Mode (288px · 40% Overlap)
                     </span>
                   </label>
 
@@ -1286,32 +1537,43 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                 <div className="space-y-2.5 flex-1 flex flex-col">
                   {/* Detector Mode Status Strip + Edit Trees & YOLO Dataset Export */}
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span
-                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold border ${
-                        satRes.detectorMode === 'gemini'
-                          ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
-                          : satRes.detectorMode === 'yolo'
-                            ? 'bg-sky-50 border-sky-200 text-sky-900'
-                            : 'bg-amber-50 border-amber-200 text-amber-900'
-                      }`}
-                    >
+                    <div className="flex flex-wrap items-center gap-1.5">
                       <span
-                        className={`w-2 h-2 rounded-full ${
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold border ${
                           satRes.detectorMode === 'gemini'
-                            ? 'bg-emerald-500'
+                            ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
                             : satRes.detectorMode === 'yolo'
-                              ? 'bg-sky-500'
-                              : 'bg-amber-500'
+                              ? 'bg-sky-50 border-sky-200 text-sky-900'
+                              : 'bg-amber-50 border-amber-200 text-amber-900'
                         }`}
-                      />
-                      <span>
-                        {satRes.detectorMode === 'gemini'
-                          ? 'AI Vision (Gemini Spatial)'
-                          : satRes.detectorMode === 'yolo'
-                            ? 'YOLO Model'
-                            : 'Offline Morphological Fallback'}
+                      >
+                        <span
+                          className={`w-2 h-2 rounded-full ${
+                            satRes.detectorMode === 'gemini'
+                              ? 'bg-emerald-500'
+                              : satRes.detectorMode === 'yolo'
+                                ? 'bg-sky-500'
+                                : 'bg-amber-500'
+                          }`}
+                        />
+                        <span>
+                          {satRes.detectorMode === 'gemini'
+                            ? 'AI Vision (Gemini Spatial)'
+                            : satRes.detectorMode === 'yolo'
+                              ? 'YOLO Model'
+                              : 'Offline Morphological Fallback'}
+                        </span>
                       </span>
-                    </span>
+                      {satRes.highResMode && (
+                        <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-mono-num font-semibold bg-indigo-50 border border-indigo-200 text-indigo-900">
+                          High-Res · {satRes.sahiTileSizeUsed ?? DETECTION_CONFIG.highResTileSize}px ·{' '}
+                          {Math.round(
+                            (satRes.sahiOverlapUsed ?? DETECTION_CONFIG.highResOverlap) * 100
+                          )}
+                          % overlap · {satRes.sahiTilesCount ?? '—'} tiles
+                        </span>
+                      )}
+                    </div>
 
                     <div className="flex flex-wrap items-center gap-1.5">
                       <button
@@ -1418,6 +1680,54 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                     </div>
                   </div>
 
+                  {previewLibrary && (
+                    <div
+                      dir="rtl"
+                      className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 rounded-lg bg-sky-50 border border-sky-200 text-[11px] text-sky-950"
+                    >
+                      <span>
+                        معاينة مؤقتة على الخريطة: <strong>{previewLibrary.nameAr}</strong> ·{' '}
+                        <span className="font-mono-num font-bold">{previewLibrary.count}</span> شجرة
+                      </span>
+                      <div className="flex items-center gap-2">
+                        {onAdoptLibraryEngine && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onAdoptLibraryEngine(auditRec.farm_id, previewLibrary.id);
+                              setPreviewEngineId(null);
+                            }}
+                            className="px-2.5 py-0.5 rounded bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-semibold cursor-pointer"
+                          >
+                            اعتماد هذه النتيجة
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setPreviewEngineId(null)}
+                          className="px-2 py-0.5 rounded border border-sky-300 bg-white hover:bg-sky-100 text-sky-900 text-[11px] cursor-pointer"
+                        >
+                          العودة للنتيجة المعتمدة
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {providerMode === 'gmaps' && hasValidGps && auditRec._poly ? (
+                    <GoogleMapsTreeInspector
+                      farmId={auditRec.farm_id}
+                      poly={auditRec._poly}
+                      offsetX_m={offsetX_m}
+                      offsetY_m={offsetY_m}
+                      inwardBufferM={inwardBufferM}
+                      satRes={satRes}
+                      boxes={displayedBoxes}
+                      editTreesMode={editTreesMode && !previewLibrary}
+                      onUpdateTree={onUpdateSatelliteBoxes ? handleUpdateSingleTree : undefined}
+                      onDeleteTree={onUpdateSatelliteBoxes ? handleDeleteSingleTree : undefined}
+                      onAddTreeAtLatLng={onUpdateSatelliteBoxes ? handleAddTreeAtLatLng : undefined}
+                    />
+                  ) : (
                   <div
                     className={`grid gap-2.5 flex-1 ${
                       providerMode === 'compare' && satRes.compareImageUrl
@@ -1459,7 +1769,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                           )}
 
                           {/* Clean Canopy Circles with Interactive Hover/Click/Right-Click Delete */}
-                          {satRes.boxes.map((tree) => {
+                          {displayedBoxes.map((tree) => {
                             const stroke =
                               tree.health === 'dead'
                                 ? '#ef4444'
@@ -1655,6 +1965,7 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                       </div>
                     )}
                   </div>
+                  )}
 
                   {/* X/Y Meter Offset Calibration (-10m..+10m), Boundary Buffer & AI Confidence Sensitivity */}
                   <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2 text-[11px]">
@@ -1767,7 +2078,8 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                               offsetX_m: 0,
                               offsetY_m: 0,
                               inwardBufferM: -1.5,
-                              highAccuracy: highAccuracyMode,
+                              highRes: highResMode,
+                              highAccuracy: highResMode,
                               confThresh: defConf,
                             });
                           }}
@@ -1804,6 +2116,16 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
                     No valid GPS polygon recorded in Kobo for this farm to fetch satellite imagery.
                   </p>
                 </div>
+              ) : providerMode === 'gmaps' && auditRec._poly ? (
+                <GoogleMapsTreeInspector
+                  farmId={auditRec.farm_id}
+                  poly={auditRec._poly}
+                  offsetX_m={offsetX_m}
+                  offsetY_m={offsetY_m}
+                  inwardBufferM={inwardBufferM}
+                  boxes={[]}
+                  editTreesMode={false}
+                />
               ) : auditRec.ai_error && !isRunningSat ? (
                 <div className="h-full min-h-[260px] flex flex-col items-center justify-center text-center p-6 bg-red-50/70 rounded-lg border border-red-200 space-y-3">
                   <AlertTriangle className="w-6 h-6 text-red-600" />
@@ -1866,6 +2188,219 @@ export const ReviewView: React.FC<ReviewViewProps> = ({
               )}
             </div>
           </div>
+
+          {/* Multi-Library Benchmark, Geospatial Consensus & AI Arbitration */}
+          {satRes?.libraryComparison && (
+            <section
+              dir="rtl"
+              className="bg-white border border-slate-200 rounded-xl p-5 space-y-4"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-4 pb-3 border-b border-slate-200">
+                <div className="space-y-1">
+                  <h3 className="text-sm font-bold text-slate-900">
+                    مقارنة مكتبات عدّ الأشجار والتوافق بالذكاء الاصطناعي
+                  </h3>
+                  <div className="text-xs text-slate-500">
+                    <span>
+                      المكتبات النشطة:{' '}
+                      <strong className="font-mono-num text-slate-800">
+                        {
+                          satRes.libraryComparison.libraries.filter((l) => l.status === 'ran')
+                            .length
+                        }
+                        /{satRes.libraryComparison.libraries.length}
+                      </strong>
+                    </span>
+                    <span className="mx-2" aria-hidden="true">
+                      ·
+                    </span>
+                    <span>
+                      نسبة التوافق:{' '}
+                      <strong className="font-mono-num text-emerald-700">
+                        {satRes.libraryComparison.agreementPct}%
+                      </strong>
+                    </span>
+                    <span className="mx-2" aria-hidden="true">
+                      ·
+                    </span>
+                    <span>
+                      الوسيط الإحصائي:{' '}
+                      <strong className="font-mono-num text-slate-800">
+                        {satRes.libraryComparison.medianCount}
+                      </strong>
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-6">
+                  <div>
+                    <div className="text-[11px] text-slate-500">العدد الأصح المُوصى به</div>
+                    <div className="text-2xl font-bold font-mono-num text-emerald-700 leading-tight">
+                      {satRes.libraryComparison.recommendedCount}{' '}
+                      <span className="text-xs font-medium text-slate-600">شجرة</span>
+                    </div>
+                  </div>
+                  {satRes.libraryComparison.aiArbitration && (
+                    <div>
+                      <div className="text-[11px] text-slate-500">ثقة التحكيم بالذكاء الاصطناعي</div>
+                      <div className="text-lg font-bold font-mono-num text-slate-900 leading-tight">
+                        {satRes.libraryComparison.aiArbitration.confidencePct}%
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {satRes.libraryComparison.aiArbitration && (
+                <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-1.5">
+                  <div className="font-semibold text-slate-900">
+                    حُكم الذكاء الاصطناعي (Gemini 4 Hydrogen Arbitrator):
+                  </div>
+                  <p className="text-slate-700 leading-relaxed">
+                    {satRes.libraryComparison.aiArbitration.explanationAr}
+                  </p>
+                  {satRes.libraryComparison.aiArbitration.cropRiskWarningAr && (
+                    <p className="text-amber-800 font-medium">
+                      تنبيه غطاء أرضي: {satRes.libraryComparison.aiArbitration.cropRiskWarningAr}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-right border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50 text-slate-600 font-semibold">
+                      <th className="py-2.5 px-3 whitespace-nowrap">المحرّك والمكتبة</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap">الحالة</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-left">إجمالي الأشجار</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-left">داخلي / حدود</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-left">متوسط التاج</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-left">الثقة</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-left">الزمن</th>
+                      <th className="py-2.5 px-3">ملاحظة الفحص</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-left">تحكم</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {satRes.libraryComparison.libraries.map((lib) => {
+                      const isActive = satRes.libraryComparison?.activeEngineId === lib.id;
+                      const isRec = satRes.libraryComparison?.recommendedEngineId === lib.id;
+                      const isPreview = previewEngineId === lib.id;
+                      const statusText =
+                        lib.status === 'ran'
+                          ? 'نشط'
+                          : lib.status === 'error'
+                            ? 'تعذّر'
+                            : 'غير محمل';
+                      return (
+                        <tr
+                          key={lib.id}
+                          className={
+                            isActive
+                              ? 'bg-emerald-50/60'
+                              : isPreview
+                                ? 'bg-sky-50/70'
+                                : 'hover:bg-slate-50'
+                          }
+                        >
+                          <td className="py-2.5 px-3">
+                            <div className="font-semibold text-slate-900">
+                              {lib.nameAr}
+                              {isRec && (
+                                <span className="mr-2 text-[11px] font-bold text-emerald-700">
+                                  · الأصح
+                                </span>
+                              )}
+                            </div>
+                            <div
+                              dir="ltr"
+                              className="text-[11px] font-mono-num text-slate-500 text-right"
+                            >
+                              {lib.libraryBadge}
+                            </div>
+                          </td>
+                          <td className="py-2.5 px-3 whitespace-nowrap">
+                            <span
+                              className={`text-xs font-medium ${
+                                lib.status === 'ran'
+                                  ? 'text-emerald-700'
+                                  : lib.status === 'error'
+                                    ? 'text-red-700'
+                                    : 'text-slate-500'
+                              }`}
+                            >
+                              {statusText}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 font-mono-num font-bold text-slate-900 text-left whitespace-nowrap">
+                            {lib.status === 'ran' ? lib.count : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono-num text-slate-700 text-left whitespace-nowrap">
+                            {lib.status === 'ran'
+                              ? `${lib.interiorCount} / ${lib.boundaryCount}`
+                              : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono-num text-slate-700 text-left whitespace-nowrap">
+                            {lib.medianCrownM !== null ? `${lib.medianCrownM}m` : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono-num text-slate-700 text-left whitespace-nowrap">
+                            {lib.status === 'ran' && lib.avgConfidence > 0
+                              ? `${Math.round(lib.avgConfidence * 100)}%`
+                              : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono-num text-slate-500 text-left whitespace-nowrap">
+                            {lib.status === 'ran' ? `${lib.durationMs}ms` : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-600 max-w-xs">
+                            {lib.unavailableReason || lib.notesAr}
+                          </td>
+                          <td className="py-2.5 px-3 text-left whitespace-nowrap">
+                            {lib.status === 'ran' ? (
+                              <div className="inline-flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setPreviewEngineId((cur) => (cur === lib.id ? null : lib.id))
+                                  }
+                                  className={`px-2.5 py-1 rounded text-[11px] font-medium border transition-colors cursor-pointer whitespace-nowrap ${
+                                    isPreview
+                                      ? 'bg-sky-700 border-sky-700 text-white'
+                                      : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+                                  }`}
+                                >
+                                  {isPreview ? 'إخفاء المعاينة' : 'معاينة'}
+                                </button>
+                                {onAdoptLibraryEngine && !isActive && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      onAdoptLibraryEngine(auditRec.farm_id, lib.id);
+                                      setPreviewEngineId(null);
+                                    }}
+                                    className="px-2.5 py-1 rounded text-[11px] font-semibold bg-emerald-700 hover:bg-emerald-800 text-white transition-colors cursor-pointer whitespace-nowrap"
+                                  >
+                                    اعتماد
+                                  </button>
+                                )}
+                                {isActive && (
+                                  <span className="text-[11px] font-semibold text-emerald-700 px-1.5">
+                                    مُعتمد
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="text-[11px] text-slate-400">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
 
           {/* PGS Business Rules Audit */}
           <div className="bg-white border border-slate-200 rounded-xl p-5">

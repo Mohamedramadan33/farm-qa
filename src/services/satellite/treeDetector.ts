@@ -5,11 +5,20 @@ import {
   computeEuclideanDistanceTransform,
   computeStage1VegetationMask,
   evaluateCrownShadowAndHealth,
+  verifyAndScoreAiCandidate,
   type SpectralMaps,
 } from './imageProcessing';
 import { worldPxToLonLat } from './tileFetcher';
+import {
+  buildConsensusEnsemble,
+  runMultiScaleDoGDetector,
+  runShadowTexturePairDetector,
+  summarizeLibraryResult,
+} from './multiLibraryEngine';
 import type {
   DetectorMode,
+  LibraryDetectionSummary,
+  MultiLibraryComparisonReport,
   SatelliteProgress,
   TreeClassName,
   TreeDetectionBox,
@@ -86,6 +95,64 @@ export function inferFallbackTreeClass(
   return { classId: 0, className: 'orchard_tree' };
 }
 
+export interface SquareTilePaddingSpec {
+  targetSize: number;
+  srcX: number;
+  srcY: number;
+  copyW: number;
+  copyH: number;
+  padRight: number;
+  padBottom: number;
+}
+
+export function computeSquareTilePadding(
+  slice: SahiSlice,
+  targetSize: number
+): SquareTilePaddingSpec {
+  const safeTarget = Math.max(64, Math.round(targetSize));
+  const copyW = Math.max(1, Math.min(safeTarget, Math.round(slice.w)));
+  const copyH = Math.max(1, Math.min(safeTarget, Math.round(slice.h)));
+  return {
+    targetSize: safeTarget,
+    srcX: slice.x,
+    srcY: slice.y,
+    copyW,
+    copyH,
+    padRight: safeTarget - copyW,
+    padBottom: safeTarget - copyH,
+  };
+}
+
+/**
+ * Copies a SAHI slice onto a 1:1 square `targetSize x targetSize` canvas without stretching.
+ * Small parcels or edge slices are zero-stretch padded with `#0f172a` to prevent crop scale distortion.
+ */
+export function extractSquarePaddedTile(
+  srcCanvas: HTMLCanvasElement,
+  slice: SahiSlice,
+  targetSize: number
+): HTMLCanvasElement {
+  const spec = computeSquareTilePadding(slice, targetSize);
+  const sub = document.createElement('canvas');
+  sub.width = spec.targetSize;
+  sub.height = spec.targetSize;
+  const ctx = sub.getContext('2d')!;
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(0, 0, spec.targetSize, spec.targetSize);
+  ctx.drawImage(
+    srcCanvas,
+    spec.srcX,
+    spec.srcY,
+    spec.copyW,
+    spec.copyH,
+    0,
+    0,
+    spec.copyW,
+    spec.copyH
+  );
+  return sub;
+}
+
 export function generateSahiSlices(
   imgW: number,
   imgH: number,
@@ -145,15 +212,14 @@ export function boxIoU(a: RawCandidate, b: RawCandidate): number {
 }
 
 /**
- * Class-aware Weighted Box Fusion (WBF).
- * Confidence-weights overlapping detections across SAHI tile seams so box coordinates
- * and centers tighten rather than dropping edge candidates, while keeping distinct classes
- * unless cross-class IoU exceeds `crossClassIou`.
+ * Class-aware Consensus Weighted Box Fusion (WBF).
+ * Quadratic confidence-weighting tightens crown centers across SAHI tile seams while
+ * rewarding candidates confirmed across multiple overlapping SAHI windows.
  */
 export function fuseDetectionsWBF(
   candidates: RawCandidate[],
   iouThresh = DETECTION_CONFIG.wbfIouThresh,
-  minCenterDistPx = 6,
+  minCenterDistPx = 5,
   classAware = DETECTION_CONFIG.classAwareNms,
   crossClassIou = DETECTION_CONFIG.crossClassSuppressionIou
 ): RawCandidate[] {
@@ -161,6 +227,7 @@ export function fuseDetectionsWBF(
   interface Cluster {
     wSum: number;
     maxScore: number;
+    votes: number;
     wxmin: number;
     wymin: number;
     wxmax: number;
@@ -197,11 +264,12 @@ export function fuseDetectionsWBF(
       }
     }
 
-    const w = Math.max(0.05, cand.score);
+    const w = Math.max(0.04, cand.score * cand.score);
     if (!target) {
       clusters.push({
         wSum: w,
         maxScore: cand.score,
+        votes: 1,
         wxmin: cand.xmin * w,
         wymin: cand.ymin * w,
         wxmax: cand.xmax * w,
@@ -224,6 +292,7 @@ export function fuseDetectionsWBF(
         target.lat = cand.lat ?? target.lat;
         target.lon = cand.lon ?? target.lon;
       }
+      target.votes += 1;
       target.wSum += w;
       target.maxScore = Math.max(target.maxScore, cand.score);
       target.wxmin += cand.xmin * w;
@@ -241,19 +310,23 @@ export function fuseDetectionsWBF(
     }
   }
 
-  return clusters.map((cl) => ({
-    xmin: cl.rep.xmin,
-    ymin: cl.rep.ymin,
-    xmax: cl.rep.xmax,
-    ymax: cl.rep.ymax,
-    score: cl.maxScore,
-    classId: cl.classId,
-    health: cl.health,
-    circularity: cl.circularity,
-    crownDiameterM: cl.crownDiameterM,
-    lat: cl.lat,
-    lon: cl.lon,
-  }));
+  return clusters.map((cl) => {
+    const consensusBoost = Math.min(0.08, Math.max(0, cl.votes - 1) * 0.04);
+    const calibratedScore = Number(Math.min(0.98, cl.maxScore + consensusBoost).toFixed(3));
+    return {
+      xmin: cl.rep.xmin,
+      ymin: cl.rep.ymin,
+      xmax: cl.rep.xmax,
+      ymax: cl.rep.ymax,
+      score: calibratedScore,
+      classId: cl.classId,
+      health: cl.health,
+      circularity: cl.circularity,
+      crownDiameterM: cl.crownDiameterM,
+      lat: cl.lat,
+      lon: cl.lon,
+    };
+  });
 }
 
 export const mergeDetectionsNMS = fuseDetectionsWBF;
@@ -265,12 +338,13 @@ export const mergeDetectionsNMS = fuseDetectionsWBF;
 async function runGeminiVisionDetection(params: {
   visionCanvas: HTMLCanvasElement;
   slices: SahiSlice[];
+  targetTileSize: number;
   polygonRingPx: Array<[number, number]>;
   worldOriginX: number;
   worldOriginY: number;
   zoom: number;
   mpp: number;
-  highAccuracy: boolean;
+  highRes: boolean;
   confThresh: number;
   minConf: number;
   signal?: AbortSignal;
@@ -284,12 +358,13 @@ async function runGeminiVisionDetection(params: {
   const {
     visionCanvas,
     slices,
+    targetTileSize,
     polygonRingPx,
     worldOriginX,
     worldOriginY,
     zoom,
     mpp,
-    highAccuracy,
+    highRes,
     confThresh,
     minConf,
     signal,
@@ -306,24 +381,21 @@ async function runGeminiVisionDetection(params: {
   }
 
   const tilePayloads = slices.map((s) => {
-    const sub = document.createElement('canvas');
-    sub.width = s.w;
-    sub.height = s.h;
-    sub.getContext('2d')!.drawImage(visionCanvas, s.x, s.y, s.w, s.h, 0, 0, s.w, s.h);
+    const sub = extractSquarePaddedTile(visionCanvas, s, targetTileSize);
     return {
       imageBase64: sub.toDataURL('image/png'),
       offsetX: s.x,
       offsetY: s.y,
-      width: s.w,
-      height: s.h,
+      width: targetTileSize,
+      height: targetTileSize,
     };
   });
 
   const batchSize = 8;
   const allCands: RawCandidate[] = [];
-  let usedEngine = highAccuracy
-    ? 'AI Vision (Gemini 2.5 Pro · Dense WBF)'
-    : 'AI Vision (Gemini 2.5 Flash · Spatial WBF)';
+  let usedEngine = highRes
+    ? 'AI Vision (Gemini 4 Hydrogen · High-Res SAHI WBF)'
+    : 'AI Vision (Gemini 4 Hydrogen · Spatial WBF)';
 
   for (let i = 0; i < tilePayloads.length; i += batchSize) {
     if (signal?.aborted) {
@@ -334,7 +406,7 @@ async function runGeminiVisionDetection(params: {
       stage: 'detect',
       loaded: i,
       total: tilePayloads.length,
-      message: `AI Vision scanning tiles ${i + 1}-${Math.min(i + batch.length, tilePayloads.length)}/${tilePayloads.length}`,
+      message: `${highRes ? 'High-Res ' : ''}AI Vision scanning tiles ${i + 1}-${Math.min(i + batch.length, tilePayloads.length)}/${tilePayloads.length}`,
     });
 
     try {
@@ -349,7 +421,8 @@ async function runGeminiVisionDetection(params: {
           tiles: batch,
           polygonRingPx,
           geoTransform: { worldOriginX, worldOriginY, zoom, mpp },
-          highAccuracy,
+          highRes,
+          highAccuracy: highRes,
           confThresh,
           minConf,
         }),
@@ -490,7 +563,17 @@ async function runOnnxTileInference(
   resized.width = inputSize;
   resized.height = inputSize;
   const rCtx = resized.getContext('2d')!;
-  rCtx.drawImage(tileCanvas, 0, 0, inputSize, inputSize);
+  rCtx.fillStyle = '#0f172a';
+  rCtx.fillRect(0, 0, inputSize, inputSize);
+
+  // Preserve 1:1 aspect ratio via uniform scaling + dark padding (never stretch rectangular tiles)
+  const uniformScale = Math.min(
+    inputSize / Math.max(1, tileCanvas.width),
+    inputSize / Math.max(1, tileCanvas.height)
+  );
+  const drawW = Math.max(1, Math.round(tileCanvas.width * uniformScale));
+  const drawH = Math.max(1, Math.round(tileCanvas.height * uniformScale));
+  rCtx.drawImage(tileCanvas, 0, 0, tileCanvas.width, tileCanvas.height, 0, 0, drawW, drawH);
   const rgba = rCtx.getImageData(0, 0, inputSize, inputSize).data;
 
   const floatData = new Float32Array(3 * inputSize * inputSize);
@@ -510,8 +593,9 @@ async function runOnnxTileInference(
   const raw = outTensor.data as Float32Array;
   const dims = outTensor.dims;
 
-  const scaleX = tileCanvas.width / inputSize;
-  const scaleY = tileCanvas.height / inputSize;
+  const invScale = 1 / Math.max(uniformScale, 1e-6);
+  const scaleX = invScale;
+  const scaleY = invScale;
   const cands: RawCandidate[] = [];
 
   if (dims.length === 3 && dims[1] >= 5 && dims[2] > dims[1]) {
@@ -580,16 +664,14 @@ async function runOnnxTileInference(
 async function runBackendYoloBatch(
   rawCanvas: HTMLCanvasElement,
   slices: SahiSlice[],
+  targetTileSize: number,
   confThresh: number,
   signal?: AbortSignal
 ): Promise<{ ok: boolean; engine: string; cands: RawCandidate[] }> {
   try {
     const tiles = slices.map((s) => {
-      const sub = document.createElement('canvas');
-      sub.width = s.w;
-      sub.height = s.h;
-      // Domain alignment: pass raw unmasked tile matching YOLO training imagery
-      sub.getContext('2d')!.drawImage(rawCanvas, s.x, s.y, s.w, s.h, 0, 0, s.w, s.h);
+      // Domain alignment: pass raw unmasked 1:1 padded square tile matching YOLO training imagery
+      const sub = extractSquarePaddedTile(rawCanvas, s, targetTileSize);
       return {
         imageBase64: sub.toDataURL('image/png'),
         offsetX: s.x,
@@ -931,7 +1013,7 @@ export function runMorphologicalFourGateFallback(params: {
 }
 
 // ---------------------------------------------------------------------------
-// Hybrid 3-Tier Orchestrator
+// Multi-Library Hybrid Orchestrator + Geospatial Consensus Ensemble
 // ---------------------------------------------------------------------------
 
 export async function detectTreesHybrid(params: {
@@ -948,8 +1030,10 @@ export async function detectTreesHybrid(params: {
   zoom: number;
   mpp: number;
   species: string;
-  highAccuracy: boolean;
+  highRes?: boolean;
+  highAccuracy?: boolean;
   confThresh?: number;
+  inwardBufferM?: number;
   maps: SpectralMaps;
   signal?: AbortSignal;
   onProgress?: (p: SatelliteProgress) => void;
@@ -961,6 +1045,11 @@ export async function detectTreesHybrid(params: {
   allThresholdCandidates: RawCandidate[];
   stage1ActivePct?: number;
   stage1AuditRejectedAi?: number;
+  highResMode: boolean;
+  sahiTileSizeUsed: number;
+  sahiOverlapUsed: number;
+  sahiTilesCount: number;
+  libraryComparison: MultiLibraryComparisonReport;
 }> {
   const {
     rawCanvas,
@@ -976,19 +1065,23 @@ export async function detectTreesHybrid(params: {
     zoom,
     mpp,
     species,
+    highRes,
     highAccuracy,
     confThresh: reqConfThresh,
+    inwardBufferM = -1.5,
     maps,
     signal,
     onProgress,
   } = params;
 
-  const activeSliceSize = highAccuracy
-    ? DETECTION_CONFIG.highAccuracyTileSize
+  const isHighRes = Boolean(highRes ?? highAccuracy);
+  const activeSliceSize = isHighRes
+    ? DETECTION_CONFIG.highResTileSize
     : DETECTION_CONFIG.sahiTileSize;
-  const activeOverlap = highAccuracy
-    ? DETECTION_CONFIG.highAccuracyOverlap
+  const activeOverlap = isHighRes
+    ? DETECTION_CONFIG.highResOverlap
     : DETECTION_CONFIG.sahiOverlap;
+  const minActiveRatio = isHighRes ? 0.03 : 0.05;
 
   const slices = generateSahiSlices(
     w,
@@ -996,7 +1089,7 @@ export async function detectTreesHybrid(params: {
     strictMask,
     activeSliceSize,
     activeOverlap,
-    0.05
+    minActiveRatio
   );
   const modelStatus = await getModelStatus();
   const stage1Diag = computeStage1VegetationMask({
@@ -1008,32 +1101,40 @@ export async function detectTreesHybrid(params: {
     maps,
   });
 
-  let detectorMode: DetectorMode = 'morphological';
-  let detectorEngine = '4-Gate Canopy Watershed Fallback';
-  let aiVisionNotice: string | undefined;
-  let allThresholdCandidates: RawCandidate[] = [];
-  let boxes: TreeDetectionBox[] = [];
-  let stage1ActivePct: number | undefined = stage1Diag.gate2ActivePct;
-  let stage1AuditRejectedAi: number | undefined;
-
   const confThresh = Math.max(
     0.3,
     Math.min(0.85, reqConfThresh ?? DETECTION_CONFIG.aiModelConfThresh)
   );
   const lowConfThresh = Math.max(0.25, confThresh - DETECTION_CONFIG.confIntervalDelta);
-  const minCenterDistPx = Math.max(5, Math.round(2.0 / Math.max(mpp, 0.12)));
+  const minCenterDistPx = Math.max(
+    3,
+    Math.round((isHighRes ? 1.3 : 1.6) / Math.max(mpp, 0.1))
+  );
 
-  // Tier 1: Gemini Spatial Vision (/api/detect-trees)
+  const stage1ActivePct: number | undefined = stage1Diag.gate2ActivePct;
+  const baseLibraries: LibraryDetectionSummary[] = [];
+
+  let geminiBoxes: TreeDetectionBox[] = [];
+  let geminiCandidates: RawCandidate[] = [];
+  let geminiEngineLabel = '';
+  let aiVisionNotice: string | undefined;
+  let stage1AuditRejectedAi: number | undefined;
+
+  // -------------------------------------------------------------------------
+  // Library 1: @google/genai (Gemini 4 Hydrogen Spatial Vision SAHI)
+  // -------------------------------------------------------------------------
+  const tGemini = performance.now();
   if (slices.length > 0 && modelStatus.geminiReady) {
     const geminiRes = await runGeminiVisionDetection({
       visionCanvas,
       slices,
+      targetTileSize: activeSliceSize,
       polygonRingPx: clippedRing,
       worldOriginX,
       worldOriginY,
       zoom,
       mpp,
-      highAccuracy,
+      highRes: isHighRes,
       confThresh,
       minConf: lowConfThresh,
       signal,
@@ -1041,45 +1142,60 @@ export async function detectTreesHybrid(params: {
     });
 
     if (geminiRes.ok) {
-      detectorMode = 'gemini';
-      detectorEngine = `${geminiRes.engine} (${activeSliceSize}px · Conf>=${confThresh.toFixed(2)})`;
-      allThresholdCandidates = geminiRes.candidates.filter((c) => {
+      geminiEngineLabel = `${geminiRes.engine} (${activeSliceSize}px · ${Math.round(activeOverlap * 100)}% ov · Conf>=${confThresh.toFixed(2)})`;
+
+      const insidePolygon = geminiRes.candidates.filter((c) => {
         const cx = Math.round((c.xmin + c.xmax) / 2);
         const cy = Math.round((c.ymin + c.ymax) / 2);
         return cx >= 0 && cx < w && cy >= 0 && cy < h && Boolean(strictMask[cy * w + cx]);
       });
 
-      const midCands = allThresholdCandidates.filter((c) => c.score >= confThresh);
-      const nms = fuseDetectionsWBF(midCands, DETECTION_CONFIG.wbfIouThresh, minCenterDistPx);
+      const fusedAll = fuseDetectionsWBF(
+        insidePolygon,
+        DETECTION_CONFIG.wbfIouThresh,
+        minCenterDistPx
+      );
+
+      const verifiedAll: Array<{
+        cand: RawCandidate;
+        evalRes: ReturnType<typeof evaluateCrownShadowAndHealth>;
+      }> = [];
+      for (const cand of fusedAll) {
+        const check = verifyAndScoreAiCandidate({
+          xmin: cand.xmin,
+          ymin: cand.ymin,
+          xmax: cand.xmax,
+          ymax: cand.ymax,
+          aiScore: cand.score,
+          width: w,
+          height: h,
+          rgba,
+          strictMask,
+          maps,
+        });
+        if (!check.keep || check.adjustedScore < lowConfThresh) continue;
+        verifiedAll.push({
+          cand: { ...cand, score: check.adjustedScore },
+          evalRes: check.evalRes,
+        });
+      }
+
+      geminiCandidates = verifiedAll.map((v) => v.cand);
 
       let stage1WouldDrop = 0;
       let nextId = 1;
-      for (const cand of nms) {
+      for (const { cand, evalRes } of verifiedAll) {
+        if (cand.score < confThresh) continue;
         const cx = Math.round((cand.xmin + cand.xmax) / 2);
         const cy = Math.round((cand.ymin + cand.ymax) / 2);
         if (!stage1Diag.vegMask[cy * w + cx]) {
           stage1WouldDrop++;
         }
 
-        const radiusPx = Math.max(4, Math.round((cand.xmax - cand.xmin + (cand.ymax - cand.ymin)) / 4));
-        const evalRes = evaluateCrownShadowAndHealth(
-          cx,
-          cy,
-          radiusPx,
-          Math.max(0, Math.floor(cand.xmin)),
-          Math.max(0, Math.floor(cand.ymin)),
-          Math.min(w - 1, Math.ceil(cand.xmax)),
-          Math.min(h - 1, Math.ceil(cand.ymax)),
-          w,
-          h,
-          rgba,
-          strictMask,
-          maps.lum,
-          maps.hsvV,
-          maps.exg,
-          maps.lapMag
+        const radiusPx = Math.max(
+          4,
+          Math.round((cand.xmax - cand.xmin + (cand.ymax - cand.ymin)) / 4)
         );
-
         const onBoundary = Boolean(boundaryMask[cy * w + cx]);
         const className = TREE_CLASSES[cand.classId] || 'orchard_tree';
         const diamM = cand.crownDiameterM ?? Number((radiusPx * 2 * mpp).toFixed(2));
@@ -1088,7 +1204,7 @@ export async function detectTreesHybrid(params: {
             ? [cand.lon, cand.lat]
             : worldPxToLonLat(worldOriginX + cx, worldOriginY + cy, zoom);
 
-        boxes.push({
+        geminiBoxes.push({
           id: nextId++,
           xmin: Math.round(cand.xmin),
           ymin: Math.round(cand.ymin),
@@ -1111,26 +1227,81 @@ export async function detectTreesHybrid(params: {
         });
       }
       stage1AuditRejectedAi = stage1WouldDrop;
-    } else if (geminiRes.errorNotice) {
+
+      baseLibraries.push(
+        summarizeLibraryResult({
+          id: 'gemini_vision',
+          name: 'Gemini 4 Hydrogen Spatial Vision',
+          nameAr: 'رؤية الذكاء الاصطناعي (Gemini 4 Hydrogen)',
+          libraryBadge: '@google/genai',
+          category: 'ai_vision',
+          status: 'ran',
+          boxes: geminiBoxes,
+          inwardBufferM,
+          mpp,
+          durationMs: Math.round(performance.now() - tGemini),
+          notesAr: isHighRes
+            ? `تحليل دلالي فائق الدقة (${activeSliceSize}px · تداخل ${Math.round(activeOverlap * 100)}% + تفكير عميق).`
+            : `تحليل دلالي بالذكاء الاصطناعي يفرّق بين تيجان الأشجار والمحاصيل المسطحة.`,
+        })
+      );
+    } else {
       aiVisionNotice = geminiRes.errorNotice;
+      baseLibraries.push(
+        summarizeLibraryResult({
+          id: 'gemini_vision',
+          name: 'Gemini 4 Hydrogen Spatial Vision',
+          nameAr: 'رؤية الذكاء الاصطناعي (Gemini 4 Hydrogen)',
+          libraryBadge: '@google/genai',
+          category: 'ai_vision',
+          status: 'error',
+          unavailableReason: geminiRes.errorNotice || 'تعذر الاتصال بنموذج Gemini',
+          boxes: [],
+          inwardBufferM,
+          mpp,
+          durationMs: Math.round(performance.now() - tGemini),
+          notesAr: geminiRes.errorNotice || 'تعذر تشغيل نموذج Gemini في هذه الجولة.',
+        })
+      );
     }
-  } else if (!modelStatus.geminiReady) {
-    aiVisionNotice =
-      'GEMINI_API_KEY غير مفعّل في الخادم — تم تشغيل وضع التحليل المورفولوجي المحلي (4-Gate Watershed).';
+  } else {
+    const reason = !modelStatus.geminiReady
+      ? 'GEMINI_API_KEY غير مفعّل في الخادم'
+      : 'لا توجد مربعات صالحة داخل المضلع';
+    if (!modelStatus.geminiReady) {
+      aiVisionNotice =
+        'GEMINI_API_KEY غير مفعّل في الخادم — تم تشغيل محركات التحليل المكاني والبصري والمقارنة بين المكتبات.';
+    }
+    baseLibraries.push(
+      summarizeLibraryResult({
+        id: 'gemini_vision',
+        name: 'Gemini 4 Hydrogen Spatial Vision',
+        nameAr: 'رؤية الذكاء الاصطناعي (Gemini 4 Hydrogen)',
+        libraryBadge: '@google/genai',
+        category: 'ai_vision',
+        status: 'unavailable',
+        unavailableReason: reason,
+        boxes: [],
+        inwardBufferM,
+        mpp,
+        durationMs: 0,
+        notesAr: reason,
+      })
+    );
   }
 
-  // Tier 2: ONNX Runtime Web / FastAPI Batch YOLO (raw unmasked tiles -> strictMask post-filter)
-  if (detectorMode !== 'gemini' && slices.length > 0) {
-    const yoloSlices = generateSahiSlices(
-      w,
-      h,
-      strictMask,
-      DETECTION_CONFIG.sahiTileSize,
-      activeOverlap,
-      0.05
-    );
-    let yoloCandidates: RawCandidate[] = [];
-    let usedYolo = false;
+  // -------------------------------------------------------------------------
+  // Library 2: ONNX Runtime Web / FastAPI Batch YOLOv8 (runs whenever weights loaded)
+  // -------------------------------------------------------------------------
+  const tYolo = performance.now();
+  let yoloBoxes: TreeDetectionBox[] = [];
+  let yoloCandidates: RawCandidate[] = [];
+  let yoloEngineLabel = '';
+  let yoloRan = false;
+
+  if (slices.length > 0 && (modelStatus.onnxReady || modelStatus.backendYoloReady)) {
+    const yoloSlices = slices;
+    let rawYoloCands: RawCandidate[] = [];
 
     if (modelStatus.onnxReady && modelStatus.onnxUrl) {
       const session = await getOnnxSession(modelStatus.onnxUrl);
@@ -1142,22 +1313,18 @@ export async function detectTreesHybrid(params: {
             stage: 'detect',
             loaded: i + 1,
             total: yoloSlices.length,
-            message: `ONNX running tile ${i + 1}/${yoloSlices.length}`,
+            message: `YOLOv8 ONNX scanning tile ${i + 1}/${yoloSlices.length}`,
           });
-          const subCanvas = document.createElement('canvas');
-          subCanvas.width = s.w;
-          subCanvas.height = s.h;
-          subCanvas.getContext('2d')!.drawImage(rawCanvas, s.x, s.y, s.w, s.h, 0, 0, s.w, s.h);
+          const subCanvas = extractSquarePaddedTile(rawCanvas, s, activeSliceSize);
           const tileCands = await runOnnxTileInference(session, subCanvas, s.x, s.y, lowConfThresh);
-          yoloCandidates.push(...tileCands);
+          rawYoloCands.push(...tileCands);
         }
-        usedYolo = true;
-        detectorMode = 'yolo';
-        detectorEngine = `YOLOv8 ONNX (SAHI ${DETECTION_CONFIG.sahiTileSize}px · Conf>=${confThresh.toFixed(2)})`;
+        yoloRan = true;
+        yoloEngineLabel = `YOLOv8 ONNX (${isHighRes ? 'High-Res ' : ''}SAHI ${activeSliceSize}px)`;
       }
     }
 
-    if (!usedYolo && modelStatus.backendYoloReady) {
+    if (!yoloRan && modelStatus.backendYoloReady) {
       for (let i = 0; i < yoloSlices.length; i += 12) {
         if (signal?.aborted) throw new DOMException('Detection aborted.', 'AbortError');
         onProgress?.({
@@ -1169,63 +1336,73 @@ export async function detectTreesHybrid(params: {
         const batchRes = await runBackendYoloBatch(
           rawCanvas,
           yoloSlices.slice(i, i + 12),
+          activeSliceSize,
           lowConfThresh,
           signal
         );
         if (!batchRes.ok) {
-          yoloCandidates = [];
-          usedYolo = false;
+          rawYoloCands = [];
+          yoloRan = false;
           break;
         }
-        usedYolo = true;
-        detectorMode = 'yolo';
-        detectorEngine = `${batchRes.engine} (SAHI ${DETECTION_CONFIG.sahiTileSize}px · Conf>=${confThresh.toFixed(2)})`;
-        yoloCandidates.push(...batchRes.cands);
+        yoloRan = true;
+        yoloEngineLabel = `${batchRes.engine} (${isHighRes ? 'High-Res ' : ''}SAHI ${activeSliceSize}px)`;
+        rawYoloCands.push(...batchRes.cands);
       }
     }
 
-    if (usedYolo) {
-      // Strictly apply polygon mask ONLY as a post-processing spatial filter
-      allThresholdCandidates = yoloCandidates.filter((cand) => {
+    if (yoloRan) {
+      const insidePolygon = rawYoloCands.filter((cand) => {
         const cx = Math.round((cand.xmin + cand.xmax) / 2);
         const cy = Math.round((cand.ymin + cand.ymax) / 2);
         return cx >= 0 && cx < w && cy >= 0 && cy < h && Boolean(strictMask[cy * w + cx]);
       });
 
-      const midCands = allThresholdCandidates.filter((c) => c.score >= confThresh);
-      const nms = fuseDetectionsWBF(midCands, DETECTION_CONFIG.wbfIouThresh, minCenterDistPx);
+      const fusedAll = fuseDetectionsWBF(
+        insidePolygon,
+        DETECTION_CONFIG.wbfIouThresh,
+        minCenterDistPx
+      );
 
-      let stage1WouldDrop = 0;
-      let nextId = 1;
-      for (const cand of nms) {
-        const cx = Math.round((cand.xmin + cand.xmax) / 2);
-        const cy = Math.round((cand.ymin + cand.ymax) / 2);
-        if (!stage1Diag.vegMask[cy * w + cx]) {
-          stage1WouldDrop++;
-        }
-
-        const radiusPx = Math.max(4, Math.round((cand.xmax - cand.xmin + (cand.ymax - cand.ymin)) / 4));
-        const evalRes = evaluateCrownShadowAndHealth(
-          cx,
-          cy,
-          radiusPx,
-          Math.max(0, Math.floor(cand.xmin)),
-          Math.max(0, Math.floor(cand.ymin)),
-          Math.min(w - 1, Math.ceil(cand.xmax)),
-          Math.min(h - 1, Math.ceil(cand.ymax)),
-          w,
-          h,
+      const verifiedAll: Array<{
+        cand: RawCandidate;
+        evalRes: ReturnType<typeof evaluateCrownShadowAndHealth>;
+      }> = [];
+      for (const cand of fusedAll) {
+        const check = verifyAndScoreAiCandidate({
+          xmin: cand.xmin,
+          ymin: cand.ymin,
+          xmax: cand.xmax,
+          ymax: cand.ymax,
+          aiScore: cand.score,
+          width: w,
+          height: h,
           rgba,
           strictMask,
-          maps.lum,
-          maps.hsvV,
-          maps.exg,
-          maps.lapMag
+          maps,
+        });
+        if (!check.keep || check.adjustedScore < lowConfThresh) continue;
+        verifiedAll.push({
+          cand: { ...cand, score: check.adjustedScore },
+          evalRes: check.evalRes,
+        });
+      }
+
+      yoloCandidates = verifiedAll.map((v) => v.cand);
+
+      let nextId = 1;
+      for (const { cand, evalRes } of verifiedAll) {
+        if (cand.score < confThresh) continue;
+        const cx = Math.round((cand.xmin + cand.xmax) / 2);
+        const cy = Math.round((cand.ymin + cand.ymax) / 2);
+        const radiusPx = Math.max(
+          4,
+          Math.round((cand.xmax - cand.xmin + (cand.ymax - cand.ymin)) / 4)
         );
         const onBoundary = Boolean(boundaryMask[cy * w + cx]);
         const [lon, lat] = worldPxToLonLat(worldOriginX + cx, worldOriginY + cy, zoom);
 
-        boxes.push({
+        yoloBoxes.push({
           id: nextId++,
           xmin: Math.round(cand.xmin),
           ymin: Math.round(cand.ymin),
@@ -1247,33 +1424,221 @@ export async function detectTreesHybrid(params: {
           source: 'ai',
         });
       }
-      stage1AuditRejectedAi = stage1WouldDrop;
+
+      baseLibraries.push(
+        summarizeLibraryResult({
+          id: 'yolov8_onnx',
+          name: 'YOLOv8 Tree Detector',
+          nameAr: 'نموذج التعلم العميق (YOLOv8)',
+          libraryBadge: modelStatus.onnxReady ? 'onnxruntime-web' : 'YOLOv8 FastAPI',
+          category: 'deep_learning',
+          status: 'ran',
+          boxes: yoloBoxes,
+          inwardBufferM,
+          mpp,
+          durationMs: Math.round(performance.now() - tYolo),
+          notesAr: 'كشف تيجان الأشجار باستخدام أوزان YOLO المدربة على البساتين المصرية.',
+        })
+      );
     }
   }
 
-  // Tier 3: Classical 4-Gate Morphological Fallback
-  if (detectorMode === 'morphological') {
-    const morph = runMorphologicalFourGateFallback({
-      rgba,
-      width: w,
-      height: h,
-      strictMask,
-      boundaryMask,
+  if (!yoloRan) {
+    baseLibraries.push(
+      summarizeLibraryResult({
+        id: 'yolov8_onnx',
+        name: 'YOLOv8 Tree Detector',
+        nameAr: 'نموذج التعلم العميق (YOLOv8)',
+        libraryBadge: 'onnxruntime-web',
+        category: 'deep_learning',
+        status: 'unavailable',
+        unavailableReason: 'أوزان best.onnx / خدمة FastAPI YOLO غير متوفرة حالياً',
+        boxes: [],
+        inwardBufferM,
+        mpp,
+        durationMs: 0,
+        notesAr: 'يتفعّل تلقائياً عند وجود ملف models/best.onnx أو تشغيل خادم YOLO_INFER_URL.',
+      })
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Library 3: 4-Gate Morphological EDT Watershed (Always runs for benchmark!)
+  // -------------------------------------------------------------------------
+  onProgress?.({
+    stage: 'postprocess',
+    loaded: 1,
+    total: 4,
+    message: 'Running 4-Gate Morphological EDT Watershed...',
+  });
+  const tMorph = performance.now();
+  const morph = runMorphologicalFourGateFallback({
+    rgba,
+    width: w,
+    height: h,
+    strictMask,
+    boundaryMask,
+    mpp,
+    species,
+    maps,
+    stage1MaskResult: stage1Diag,
+  });
+  const morphBoxes = morph.boxes.map((b) => {
+    const [lon, lat] = worldPxToLonLat(worldOriginX + b.cx, worldOriginY + b.cy, zoom);
+    return { ...b, lat, lon };
+  });
+  baseLibraries.push(
+    summarizeLibraryResult({
+      id: 'morphological_watershed',
+      name: '4-Gate Morphological EDT Watershed',
+      nameAr: 'التحليل المورفولوجي وتقسيم الأحواض (EDT Watershed)',
+      libraryBadge: 'Meijster EDT + MarchingSquares',
+      category: 'cv_classical',
+      status: 'ran',
+      boxes: morphBoxes,
+      inwardBufferM,
       mpp,
-      species,
-      maps,
-      stage1MaskResult: stage1Diag,
-    });
-    stage1ActivePct = morph.gate2ActivePct;
-    boxes = morph.boxes.map((b) => {
-      const [lon, lat] = worldPxToLonLat(worldOriginX + b.cx, worldOriginY + b.cy, zoom);
-      return { ...b, lat, lon };
-    });
+      durationMs: Math.round(performance.now() - tMorph),
+      notesAr: `فصل التيجان عبر مسافة أقليدس واستبعاد حقول البرسيم المتصلة (${morph.gate2ComponentsRejected} منطقة مستبعدة).`,
+    })
+  );
+
+  // -------------------------------------------------------------------------
+  // Library 4: Multi-Scale DoG / Scale-Space Blob Detector (Always runs!)
+  // -------------------------------------------------------------------------
+  onProgress?.({
+    stage: 'postprocess',
+    loaded: 2,
+    total: 4,
+    message: 'Running Multi-Scale Scale-Space DoG Detector...',
+  });
+  const dogRes = runMultiScaleDoGDetector({
+    rgba,
+    width: w,
+    height: h,
+    strictMask,
+    boundaryMask,
+    mpp,
+    species,
+    maps,
+    stage1MaskResult: stage1Diag,
+    worldOriginX,
+    worldOriginY,
+    zoom,
+  });
+  baseLibraries.push(
+    summarizeLibraryResult({
+      id: 'multiscale_dog',
+      name: 'Multi-Scale DoG Scale-Space',
+      nameAr: 'كاشف القمم متعددة المقاييس (Scale-Space DoG)',
+      libraryBadge: 'Gaussian Pyramid DoG',
+      category: 'cv_classical',
+      status: 'ran',
+      boxes: dogRes.boxes,
+      inwardBufferM,
+      mpp,
+      durationMs: dogRes.durationMs,
+      notesAr: 'يرصد التيجان الصغيرة والمتوسطة والكبيرة عند 3 مقاييس جاوسية لتقليل دمج الأشجار المتلاصقة.',
+    })
+  );
+
+  // -------------------------------------------------------------------------
+  // Library 5: Cast-Shadow Azimuth Pair & Texture Detector (Always runs!)
+  // -------------------------------------------------------------------------
+  onProgress?.({
+    stage: 'postprocess',
+    loaded: 3,
+    total: 4,
+    message: 'Running Cast-Shadow Azimuth & Texture Pairing...',
+  });
+  const shadowRes = runShadowTexturePairDetector({
+    rgba,
+    width: w,
+    height: h,
+    strictMask,
+    boundaryMask,
+    mpp,
+    species,
+    maps,
+    worldOriginX,
+    worldOriginY,
+    zoom,
+  });
+  baseLibraries.push(
+    summarizeLibraryResult({
+      id: 'shadow_texture_pair',
+      name: 'Cast-Shadow Azimuth & Texture Pair',
+      nameAr: 'مطابقة الظل الاتجاهي ونسيج التاج (Shadow-Texture)',
+      libraryBadge: 'Azimuthal Shadow-Crown CV',
+      category: 'cv_classical',
+      status: 'ran',
+      boxes: shadowRes.boxes,
+      inwardBufferM,
+      mpp,
+      durationMs: shadowRes.durationMs,
+      notesAr: `يربط بؤر الظل الأرضي (${shadowRes.shadowClustersFound}) بالتيجان المضاءة لمناعة عالية ضد الحشائش.`,
+    })
+  );
+
+  // -------------------------------------------------------------------------
+  // Library 6: Geo-DBSCAN Multi-Library Consensus Ensemble (@turf/clusters-dbscan)
+  // -------------------------------------------------------------------------
+  onProgress?.({
+    stage: 'postprocess',
+    loaded: 4,
+    total: 4,
+    message: 'Fusing libraries with Geo-DBSCAN Consensus...',
+  });
+  const { ensembleSummary, report } = buildConsensusEnsemble({
+    baseLibraries,
+    mpp,
+    width: w,
+    height: h,
+    strictMask,
+    boundaryMask,
+    inwardBufferM,
+    confThresh,
+    highRes: isHighRes,
+    worldOriginX,
+    worldOriginY,
+    zoom,
+  });
+
+  // Determine primary detectorMode / boxes / threshold candidates
+  const geminiRan = geminiEngineLabel.length > 0;
+  let detectorMode: DetectorMode = 'morphological';
+  let detectorEngine = `Multi-Library Consensus (${report.libraries.filter((l) => l.status === 'ran').length} engines · Geo-DBSCAN)`;
+  let boxes: TreeDetectionBox[] = ensembleSummary.boxes;
+  let allThresholdCandidates: RawCandidate[] = [];
+
+  if (geminiRan) {
+    detectorMode = 'gemini';
+    detectorEngine = `${geminiEngineLabel} + Geo-DBSCAN Ensemble`;
+    allThresholdCandidates = geminiCandidates;
+  } else if (yoloRan) {
+    detectorMode = 'yolo';
+    detectorEngine = `${yoloEngineLabel} + Geo-DBSCAN Ensemble`;
+    allThresholdCandidates = yoloCandidates;
+  } else {
+    detectorMode = 'morphological';
+    boxes = ensembleSummary.boxes;
+    allThresholdCandidates = ensembleSummary.boxes.map((b) => ({
+      xmin: b.xmin,
+      ymin: b.ymin,
+      xmax: b.xmax,
+      ymax: b.ymax,
+      score: b.score,
+      classId: b.classId,
+      health: b.health,
+      crownDiameterM: b.crownDiameterM,
+      lat: b.lat,
+      lon: b.lon,
+    }));
   }
 
   if (stage1AuditRejectedAi !== undefined && stage1AuditRejectedAi > 0) {
     console.info(
-      `[TreeDetector] Stage-1 diagnostic audit: ${stage1AuditRejectedAi}/${boxes.length} AI detections sit outside Stage-1 mask (kept via decoupled AI path).`
+      `[TreeDetector] Stage-1 diagnostic audit: ${stage1AuditRejectedAi}/${geminiBoxes.length} AI detections sit outside Stage-1 mask (kept via decoupled AI path).`
     );
   }
 
@@ -1285,5 +1650,10 @@ export async function detectTreesHybrid(params: {
     allThresholdCandidates,
     stage1ActivePct,
     stage1AuditRejectedAi,
+    highResMode: isHighRes,
+    sahiTileSizeUsed: activeSliceSize,
+    sahiOverlapUsed: activeOverlap,
+    sahiTilesCount: slices.length,
+    libraryComparison: report,
   };
 }

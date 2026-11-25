@@ -11,6 +11,11 @@
   },
   "dependencies": {
     "@google/genai": "^3.6.1",
+    "@googlemaps/markerclusterer": "^2.6.2",
+    "@turf/clusters-dbscan": "^7.4.0",
+    "@turf/distance": "^7.4.0",
+    "@turf/helpers": "^7.4.0",
+    "@vis.gl/react-google-maps": "^1.10.2",
     "express": "^4.21.2",
     "express-rate-limit": "^8.7.5",
     "jszip": "^3.10.2",

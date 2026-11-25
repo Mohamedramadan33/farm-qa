@@ -36,6 +36,8 @@ class TestPipelineIntegrity(unittest.TestCase):
         self.assertLessEqual(cfg["aiModelConfThresh"], 0.90)
         self.assertEqual(cfg["smallCrownPxRange"], [8, 25])
         self.assertTrue(cfg["classAwareNms"])
+        self.assertEqual(cfg["highResTileSize"], 288)
+        self.assertAlmostEqual(cfg["highResOverlap"], 0.40)
 
     def test_farm_group_split_zero_leakage(self):
         with tempfile.TemporaryDirectory() as tmp:

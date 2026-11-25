@@ -80,13 +80,52 @@ export type TreeClassName = 'orchard_tree' | 'palm_tree' | 'windbreak_tree';
 export type TreeHealthStatus = 'healthy' | 'stressed' | 'dead';
 export type DetectorMode = 'gemini' | 'yolo' | 'morphological';
 export type BasemapProvider = 'google' | 'esri';
-export type BasemapViewMode = 'google' | 'esri' | 'compare';
+export type BasemapViewMode = 'google' | 'esri' | 'compare' | 'gmaps';
+
+export type OrchardSpatialPattern =
+  | 'row_grid'
+  | 'perimeter_windbreak'
+  | 'mixed_orchard'
+  | 'sparse_or_none';
+
+export interface SpatialOrchardMetrics {
+  totalTrees: number;
+  interiorTrees: number;
+  boundaryTrees: number;
+  medianCrownM: number | null;
+  medianSpacingM: number | null;
+  p25SpacingM: number | null;
+  p75SpacingM: number | null;
+  spacingRegularityPct: number | null;
+  pattern: OrchardSpatialPattern;
+  oversizedCrownIds: number[];
+  estimatedMissingGapCount: number;
+  denseFlatCropDetected: boolean;
+  discrepancyRatio: number | null;
+  diagnosticsAr: string[];
+}
+
+export interface SmartTreeAuditReport {
+  alignmentVerdict:
+    | 'aligned'
+    | 'under_counted_by_ai'
+    | 'over_counted_by_engineer'
+    | 'boundary_mismatch'
+    | 'crop_confusion_risk';
+  confidencePct: number;
+  discrepancyCauseAr: string;
+  canopyQualitySummaryAr: string;
+  fieldCheckRecommendationsAr: string[];
+  suggestedAuditorComment: string;
+  generatedAt: string;
+}
 
 export interface SatelliteCalibrationOptions {
   providerMode: BasemapViewMode;
   offsetX_m: number;
   offsetY_m: number;
   inwardBufferM: number;
+  highRes?: boolean;
   highAccuracy?: boolean;
   confThresh?: number;
 }
@@ -119,6 +158,52 @@ export interface TreeDetectionBox {
   lat?: number;
   lon?: number;
   source?: 'ai' | 'manual';
+}
+
+export type LibraryEngineId =
+  | 'gemini_vision'
+  | 'yolov8_onnx'
+  | 'morphological_watershed'
+  | 'multiscale_dog'
+  | 'shadow_texture_pair'
+  | 'turf_consensus_ensemble';
+
+export interface LibraryDetectionSummary {
+  id: LibraryEngineId;
+  name: string;
+  nameAr: string;
+  libraryBadge: string;
+  category: 'ai_vision' | 'deep_learning' | 'cv_classical' | 'geospatial_ensemble';
+  status: 'ran' | 'unavailable' | 'error';
+  unavailableReason?: string;
+  count: number;
+  interiorCount: number;
+  boundaryCount: number;
+  avgConfidence: number;
+  medianCrownM: number | null;
+  durationMs: number;
+  boxes: TreeDetectionBox[];
+  notesAr: string;
+}
+
+export interface AiLibraryArbitration {
+  winnerEngineId: LibraryEngineId;
+  recommendedCount: number;
+  confidencePct: number;
+  explanationAr: string;
+  cropRiskWarningAr?: string;
+  generatedAt: string;
+}
+
+export interface MultiLibraryComparisonReport {
+  libraries: LibraryDetectionSummary[];
+  activeEngineId: LibraryEngineId;
+  recommendedEngineId: LibraryEngineId;
+  recommendedCount: number;
+  consensusCount: number;
+  medianCount: number;
+  agreementPct: number;
+  aiArbitration?: AiLibraryArbitration;
 }
 
 export interface SatelliteAnalysisResult {
@@ -162,7 +247,13 @@ export interface SatelliteAnalysisResult {
   stage1AuditRejectedAi?: number;
   stage1CellsKept?: number;
   stage1CellsTotal?: number;
+  highResMode?: boolean;
+  sahiTileSizeUsed?: number;
+  sahiOverlapUsed?: number;
+  sahiTilesCount?: number;
+  xyzTilesSavedByPolyFilter?: number;
   aiError?: string;
+  libraryComparison?: MultiLibraryComparisonReport;
 }
 
 export interface FarmAuditRecord {

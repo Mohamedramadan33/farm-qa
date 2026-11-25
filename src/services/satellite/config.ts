@@ -8,6 +8,8 @@ export interface DetectionConfig {
   confIntervalDelta: number;
   sahiTileSize: number;
   sahiOverlap: number;
+  highResTileSize: number;
+  highResOverlap: number;
   highAccuracyTileSize: number;
   highAccuracyOverlap: number;
   nmsIouThresh: number;
@@ -31,10 +33,12 @@ export const DETECTION_CONFIG: DetectionConfig = {
   confIntervalDelta: detectionConfigJson.confIntervalDelta,
   sahiTileSize: detectionConfigJson.sahiTileSize,
   sahiOverlap: detectionConfigJson.sahiOverlap,
-  highAccuracyTileSize: detectionConfigJson.highAccuracyTileSize ?? 384,
-  highAccuracyOverlap: detectionConfigJson.highAccuracyOverlap ?? 0.30,
+  highResTileSize: detectionConfigJson.highResTileSize ?? 288,
+  highResOverlap: detectionConfigJson.highResOverlap ?? 0.4,
+  highAccuracyTileSize: detectionConfigJson.highAccuracyTileSize ?? 288,
+  highAccuracyOverlap: detectionConfigJson.highAccuracyOverlap ?? 0.4,
   nmsIouThresh: detectionConfigJson.nmsIouThresh,
-  wbfIouThresh: detectionConfigJson.wbfIouThresh ?? 0.45,
+  wbfIouThresh: detectionConfigJson.wbfIouThresh ?? 0.42,
   classAwareNms: detectionConfigJson.classAwareNms,
   crossClassSuppressionIou: detectionConfigJson.crossClassSuppressionIou,
   minCastShadowDrop: detectionConfigJson.minCastShadowDrop,

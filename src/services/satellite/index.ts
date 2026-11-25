@@ -10,10 +10,12 @@ import { DETECTION_CONFIG } from './config';
 import {
   buildContextPreservingVisionCanvas,
   buildMaskedCanvas,
+  buildSharpenedVisionCanvas,
   computeLuminanceAndLaplacianAsync,
   createBoundaryCorridorMask,
   createPolygonMask,
 } from './imageProcessing';
+import { requestAiLibraryArbitration } from './multiLibraryEngine';
 import { computePseudoNdviFromMosaic, countTreesInPolygon } from './polygonCounter';
 import { fetchProviderMosaic } from './tileFetcher';
 import { detectTreesHybrid } from './treeDetector';
@@ -23,36 +25,48 @@ import type {
   PointLonLat,
   SatelliteAnalysisResult,
   SatelliteProgress,
+  TreeDetectionBox,
 } from '../../types/qa';
 
 export async function analyzeFarmSatellite(params: {
+  farmId?: string;
   poly: PointLonLat[];
   species: string;
+  cropType?: string;
+  engineerCount?: number | null;
+  forecast?: number | null;
   submissionTime: string;
   useNdvi: boolean;
   providerMode?: BasemapViewMode;
   offsetX_m?: number;
   offsetY_m?: number;
   inwardBufferM?: number;
+  highRes?: boolean;
   highAccuracy?: boolean;
   confThresh?: number;
   signal?: AbortSignal;
   onProgress?: (p: SatelliteProgress) => void;
 }): Promise<SatelliteAnalysisResult> {
   const {
+    farmId = 'FARM',
     poly,
     species,
+    cropType = '',
+    engineerCount = null,
+    forecast = null,
     submissionTime,
     useNdvi,
     providerMode = 'google',
     offsetX_m = 0,
     offsetY_m = 0,
     inwardBufferM = -1.5,
+    highRes,
     highAccuracy = false,
     confThresh = DETECTION_CONFIG.aiModelConfThresh,
     signal,
     onProgress,
   } = params;
+  const isHighRes = Boolean(highRes ?? highAccuracy);
 
   const calibratedPoly = shiftPolygonMeters(poly, offsetX_m, offsetY_m);
   const clippedPoly =
@@ -83,7 +97,7 @@ export async function analyzeFarmSatellite(params: {
     clippedPoly,
     primaryPref,
     strictSingleProvider,
-    { signal, onProgress }
+    { preferUltraZoom: true, highRes: isHighRes, highAccuracy: isHighRes, signal, onProgress }
   );
   if (!primaryMosaic) {
     primaryMosaic = await fetchProviderMosaic(
@@ -92,7 +106,7 @@ export async function analyzeFarmSatellite(params: {
       clippedPoly,
       secondaryPref,
       false,
-      { signal, onProgress }
+      { preferUltraZoom: true, highRes: isHighRes, highAccuracy: isHighRes, signal, onProgress }
     );
   }
   if (!primaryMosaic) {
@@ -131,11 +145,13 @@ export async function analyzeFarmSatellite(params: {
   const { mask: boundaryMask } = createBoundaryCorridorMask(w, h, primaryMosaic.ring, primaryMosaic.mpp);
   const strictMaskedCanvas = buildMaskedCanvas(rawCanvas, strictMask);
   const maskedImageUrl = strictMaskedCanvas.toDataURL('image/png');
-  const visionCanvas = buildContextPreservingVisionCanvas(
+  const contextCanvas = buildContextPreservingVisionCanvas(
     rawCanvas,
     strictMask,
-    primaryMosaic.clippedRing
+    primaryMosaic.clippedRing,
+    false
   );
+  const visionCanvas = buildSharpenedVisionCanvas(contextCanvas, isHighRes ? 0.34 : 0.28);
 
   let polyPxCount = 0;
   let polyVegCount = 0;
@@ -165,17 +181,52 @@ export async function analyzeFarmSatellite(params: {
     zoom: primaryMosaic.zoom,
     mpp: primaryMosaic.mpp,
     species,
-    highAccuracy,
+    highRes: isHighRes,
+    highAccuracy: isHighRes,
     confThresh,
+    inwardBufferM,
     maps,
     signal,
     onProgress,
   });
 
+  onProgress?.({ stage: 'postprocess', loaded: 4, total: 4, message: 'AI Arbitrator comparing libraries...' });
+
+  const comparison = detectOut.libraryComparison;
+  let finalBoxes: TreeDetectionBox[] = detectOut.boxes;
+
+  const arbitration = await requestAiLibraryArbitration({
+    farmId,
+    species,
+    cropType,
+    vegPct,
+    mpp: primaryMosaic.mpp,
+    engineerCount,
+    forecast,
+    inwardBufferM,
+    highResMode: isHighRes,
+    provider: primaryMosaic.provider,
+    comparison,
+    signal,
+  });
+
+  if (arbitration) {
+    comparison.aiArbitration = arbitration;
+    const winnerLib = comparison.libraries.find(
+      (l) => l.id === arbitration.winnerEngineId && l.status === 'ran'
+    );
+    if (winnerLib) {
+      comparison.recommendedEngineId = winnerLib.id;
+      comparison.activeEngineId = winnerLib.id;
+      comparison.recommendedCount = winnerLib.count;
+      finalBoxes = winnerLib.boxes;
+    }
+  }
+
   onProgress?.({ stage: 'postprocess', loaded: 1, total: 1, message: 'Counting & rendering overlays...' });
 
   const countOut = countTreesInPolygon({
-    boxes: detectOut.boxes,
+    boxes: finalBoxes,
     allThresholdCandidates: detectOut.allThresholdCandidates,
     strictMask,
     boundaryMask,
@@ -191,7 +242,7 @@ export async function analyzeFarmSatellite(params: {
     strictMask,
     primaryMosaic.ring,
     primaryMosaic.clippedRing,
-    detectOut.boxes,
+    finalBoxes,
     inwardBufferM
   );
 
@@ -248,7 +299,7 @@ export async function analyzeFarmSatellite(params: {
     worldOriginY: primaryMosaic.worldOriginY,
     ringPx: primaryMosaic.ring,
     clippedRingPx: primaryMosaic.clippedRing,
-    boxes: detectOut.boxes,
+    boxes: finalBoxes,
     rawImageUrl,
     cleanImageUrl,
     maskedImageUrl,
@@ -258,6 +309,12 @@ export async function analyzeFarmSatellite(params: {
     compareZoomUsed,
     stage1ActivePct: detectOut.stage1ActivePct,
     stage1AuditRejectedAi: detectOut.stage1AuditRejectedAi,
+    highResMode: detectOut.highResMode,
+    sahiTileSizeUsed: detectOut.sahiTileSizeUsed,
+    sahiOverlapUsed: detectOut.sahiOverlapUsed,
+    sahiTilesCount: detectOut.sahiTilesCount,
+    xyzTilesSavedByPolyFilter: primaryMosaic.tilesSkipped ?? 0,
+    libraryComparison: comparison,
   };
 }
 
@@ -265,5 +322,8 @@ export * from './config';
 export * from './tileFetcher';
 export * from './imageProcessing';
 export * from './treeDetector';
+export * from './multiLibraryEngine';
 export * from './polygonCounter';
 export * from './canvasRenderer';
+export * from './auditorIntelligence';
+

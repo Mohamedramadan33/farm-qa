@@ -97,13 +97,14 @@ export function buildMaskedCanvas(srcCanvas: HTMLCanvasElement, mask: Uint8Array
 
 /**
  * Context-preserving Vision canvas for Gemini Spatial Vision: keeps surrounding terrain/shadows
- * visible at 55% luminance outside the parcel instead of pitch-black clipping, and traces a
- * subtle dashed cyan boundary guide so edge trees & cast shadows remain fully interpretable.
+ * visible at 58% luminance outside the parcel instead of pitch-black clipping, and avoids
+ * painting bright overlay lines directly over boundary windbreak crowns by default.
  */
 export function buildContextPreservingVisionCanvas(
   srcCanvas: HTMLCanvasElement,
   mask: Uint8Array,
-  clippedRing: Array<[number, number]>
+  clippedRing: Array<[number, number]>,
+  drawGuide = false
 ): HTMLCanvasElement {
   const w = srcCanvas.width;
   const h = srcCanvas.height;
@@ -117,17 +118,17 @@ export function buildContextPreservingVisionCanvas(
   for (let i = 0; i < w * h; i++) {
     if (!mask[i]) {
       const o = i * 4;
-      px[o] = Math.round(px[o] * 0.55);
-      px[o + 1] = Math.round(px[o + 1] * 0.55);
-      px[o + 2] = Math.round(px[o + 2] * 0.55);
+      px[o] = Math.round(px[o] * 0.58);
+      px[o + 1] = Math.round(px[o + 1] * 0.58);
+      px[o + 2] = Math.round(px[o + 2] * 0.58);
     }
   }
   ctx.putImageData(frame, 0, 0);
 
-  if (clippedRing.length >= 3) {
+  if (drawGuide && clippedRing.length >= 3) {
     ctx.save();
-    ctx.strokeStyle = 'rgba(0, 245, 255, 0.72)';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(0, 245, 255, 0.55)';
+    ctx.lineWidth = 1.25;
     ctx.setLineDash([5, 4]);
     ctx.beginPath();
     clippedRing.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
@@ -136,6 +137,50 @@ export function buildContextPreservingVisionCanvas(
     ctx.setLineDash([]);
     ctx.restore();
   }
+  return out;
+}
+
+/**
+ * Applies a subtle 3x3 unsharp micro-contrast filter ONLY to the Vision canvas sent to
+ * Gemini Spatial Vision so faint young saplings and cast-shadow edges stand out cleanly.
+ */
+export function buildSharpenedVisionCanvas(
+  srcCanvas: HTMLCanvasElement,
+  strength = 0.28
+): HTMLCanvasElement {
+  const w = srcCanvas.width;
+  const h = srcCanvas.height;
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const ctx = out.getContext('2d')!;
+  ctx.drawImage(srcCanvas, 0, 0);
+  if (w < 4 || h < 4 || strength <= 0) return out;
+
+  const srcFrame = ctx.getImageData(0, 0, w, h);
+  const src = srcFrame.data;
+  const dstFrame = ctx.createImageData(w, h);
+  const dst = dstFrame.data;
+  dst.set(src);
+
+  const k = Math.max(0, Math.min(0.6, strength));
+  for (let y = 1; y < h - 1; y++) {
+    const row = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const i = (row + x) * 4;
+      const up = ((y - 1) * w + x) * 4;
+      const dn = ((y + 1) * w + x) * 4;
+      const lt = i - 4;
+      const rt = i + 4;
+      for (let c = 0; c < 3; c++) {
+        const blur = (src[up + c] + src[dn + c] + src[lt + c] + src[rt + c]) * 0.25;
+        const val = src[i + c] + (src[i + c] - blur) * k;
+        dst[i + c] = val < 0 ? 0 : val > 255 ? 255 : Math.round(val);
+      }
+      dst[i + 3] = src[i + 3];
+    }
+  }
+  ctx.putImageData(dstFrame, 0, 0);
   return out;
 }
 
@@ -682,4 +727,124 @@ export function evaluateCrownShadowAndHealth(
     hasPairedCastShadow,
     health,
   };
+}
+
+export interface AiPhysicalCheckResult {
+  keep: boolean;
+  adjustedScore: number;
+  reason: 'ok' | 'achromatic_roof_or_sand' | 'water_or_dark_void' | 'flat_uniform_crop';
+  evalRes: ReturnType<typeof evaluateCrownShadowAndHealth>;
+}
+
+/**
+ * Non-destructive physical & spectral sanity check for AI Vision / YOLO candidate boxes.
+ * Preserves stressed/dry orchard and olive crowns cleanly while filtering physical
+ * impossibilities (bright bare concrete/metal roofs, water ponds, and low-confidence flat
+ * uniform berseem/alfalfa crop blobs) and calibrating ensemble confidence.
+ */
+export function verifyAndScoreAiCandidate(params: {
+  xmin: number;
+  ymin: number;
+  xmax: number;
+  ymax: number;
+  aiScore: number;
+  width: number;
+  height: number;
+  rgba: Uint8ClampedArray;
+  strictMask: Uint8Array;
+  maps: SpectralMaps;
+}): AiPhysicalCheckResult {
+  const { xmin, ymin, xmax, ymax, aiScore, width: w, height: h, rgba, strictMask, maps } = params;
+  const x1 = Math.max(0, Math.floor(xmin));
+  const y1 = Math.max(0, Math.floor(ymin));
+  const x2 = Math.min(w - 1, Math.ceil(xmax));
+  const y2 = Math.min(h - 1, Math.ceil(ymax));
+  const cx = Math.max(0, Math.min(w - 1, Math.round((xmin + xmax) / 2)));
+  const cy = Math.max(0, Math.min(h - 1, Math.round((ymin + ymax) / 2)));
+  const radiusPx = Math.max(3, Math.round((xmax - xmin + (ymax - ymin)) / 4));
+
+  let cnt = 0;
+  let lumSum = 0;
+  let exgSum = 0;
+  let satSum = 0;
+  let bDomCnt = 0;
+  let trueGreenCnt = 0;
+  for (let y = y1; y <= y2; y++) {
+    const row = y * w;
+    for (let x = x1; x <= x2; x++) {
+      const idx = row + x;
+      const o = idx * 4;
+      const r = rgba[o];
+      const g = rgba[o + 1];
+      const b = rgba[o + 2];
+      lumSum += maps.lum[idx];
+      exgSum += maps.exg[idx];
+      satSum += maps.hsvS[idx];
+      if (maps.exg[idx] > 0.035 && g > r * 0.98 && g >= b) trueGreenCnt++;
+      if (b > g * 1.12 && b > r * 1.08) bDomCnt++;
+      cnt++;
+    }
+  }
+
+  const evalRes = evaluateCrownShadowAndHealth(
+    cx,
+    cy,
+    radiusPx,
+    x1,
+    y1,
+    x2,
+    y2,
+    w,
+    h,
+    rgba,
+    strictMask,
+    maps.lum,
+    maps.hsvV,
+    maps.exg,
+    maps.lapMag
+  );
+
+  if (cnt === 0) {
+    return { keep: false, adjustedScore: 0, reason: 'water_or_dark_void', evalRes };
+  }
+
+  const meanLum = lumSum / cnt;
+  const meanExg = exgSum / cnt;
+  const meanSat = satSum / cnt;
+  const trueGreenRatio = trueGreenCnt / cnt;
+  const bDomRatio = bDomCnt / cnt;
+  const relShadow = evalRes?.relShadowDrop ?? 0;
+  const lapVar = evalRes?.laplacianVar ?? 0;
+
+  // 1. Reject dark shadow-only voids or blue/black irrigation water basins
+  if (meanLum < 32 || (bDomRatio > 0.55 && meanExg < -0.03)) {
+    return { keep: false, adjustedScore: 0, reason: 'water_or_dark_void', evalRes };
+  }
+
+  // 2. Reject bare concrete/metal roofs, paved asphalt, or flat bright bare sand patches
+  if (
+    trueGreenRatio < 0.08 &&
+    meanExg < 0.025 &&
+    ((meanSat < 0.12 && meanLum > 135) || (meanLum > 158 && lapVar < 18)) &&
+    relShadow < 0.18
+  ) {
+    return { keep: false, adjustedScore: 0, reason: 'achromatic_roof_or_sand', evalRes };
+  }
+
+  // 3. Reject dead-flat uniform green crop interior blobs only when texture + shadow relief are near zero
+  if (meanExg > 0.12 && lapVar < 8.0 && relShadow < 0.12 && aiScore < 0.78) {
+    return { keep: false, adjustedScore: 0, reason: 'flat_uniform_crop', evalRes };
+  }
+
+  // Compute gentle physical crown plausibility (tolerates dry/olive foliage + textured canopies)
+  const vegScore = Math.max(0, Math.min(1, (meanExg + 0.02) / 0.18));
+  const texScore = Math.max(0, Math.min(1, lapVar / 45.0));
+  const shScore = Math.max(0, Math.min(1, relShadow / 0.35));
+  const physicalScore = Math.max(0.32, Math.min(0.96, 0.35 + 0.30 * vegScore + 0.20 * texScore + 0.15 * shScore));
+
+  const adjustedScore = Number(
+    Math.max(0.15, Math.min(0.98, 0.80 * aiScore + 0.20 * physicalScore)).toFixed(3)
+  );
+
+  return { keep: true, adjustedScore, reason: 'ok', evalRes };
 }

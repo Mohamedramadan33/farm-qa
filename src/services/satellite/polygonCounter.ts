@@ -44,7 +44,7 @@ export function countTreesInPolygon(params: {
   const primaryBoxes = inwardBufferM < -0.5 ? boxes : boundaryBoxes;
 
   const delta = DETECTION_CONFIG.confIntervalDelta;
-  const minCenterDistPx = Math.max(5, Math.round(2.0 / Math.max(mpp, 0.12)));
+  const minCenterDistPx = Math.max(4, Math.round(1.6 / Math.max(mpp, 0.1)));
 
   const countBand = (minScore: number): number => {
     if (allThresholdCandidates.length === 0) return primaryBoxes.length;

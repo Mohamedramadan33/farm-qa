@@ -1,4 +1,5 @@
 import {
+  pointInRingPx,
   polygonBounds,
   polygonCentroid,
 } from '../../lib/geometry';
@@ -22,6 +23,99 @@ export function worldPxToLonLat(wx: number, wy: number, z: number): [number, num
   const latRad = Math.atan(Math.sinh(Math.PI * (1.0 - (2.0 * wy) / n)));
   const lat = (latRad * 180.0) / Math.PI;
   return [Number(lon.toFixed(7)), Number(lat.toFixed(7))];
+}
+
+function segmentsIntersect2D(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  cx: number,
+  cy: number,
+  dx: number,
+  dy: number
+): boolean {
+  const ccw = (p1x: number, p1y: number, p2x: number, p2y: number, p3x: number, p3y: number) =>
+    (p3y - p1y) * (p2x - p1x) > (p2y - p1y) * (p3x - p1x);
+  return (
+    ccw(ax, ay, cx, cy, dx, dy) !== ccw(bx, by, cx, cy, dx, dy) &&
+    ccw(ax, ay, bx, by, cx, cy) !== ccw(ax, ay, bx, by, dx, dy)
+  );
+}
+
+/**
+ * Checks whether an XYZ 256x256 tile at zoom `z` intersects (or lies within `padPx` of)
+ * a geographic polygon ring, preventing unnecessary downloads on diagonal/irregular parcels.
+ */
+export function tileIntersectsPolygon(
+  tx: number,
+  ty: number,
+  z: number,
+  poly: PointLonLat[],
+  padPx = 0
+): boolean {
+  if (!poly || poly.length < 3) return true;
+  const ringPx = poly.map(([lon, lat]) => lonLatToWorldPx(lon, lat, z));
+
+  let pMinX = Infinity;
+  let pMinY = Infinity;
+  let pMaxX = -Infinity;
+  let pMaxY = -Infinity;
+  for (const [px, py] of ringPx) {
+    if (px < pMinX) pMinX = px;
+    if (py < pMinY) pMinY = py;
+    if (px > pMaxX) pMaxX = px;
+    if (py > pMaxY) pMaxY = py;
+  }
+
+  const rMinX = tx * 256 - padPx;
+  const rMinY = ty * 256 - padPx;
+  const rMaxX = (tx + 1) * 256 + padPx;
+  const rMaxY = (ty + 1) * 256 + padPx;
+
+  if (pMaxX < rMinX || pMinX > rMaxX || pMaxY < rMinY || pMinY > rMaxY) {
+    return false;
+  }
+
+  // 1. Any polygon vertex inside padded tile bounds
+  for (const [px, py] of ringPx) {
+    if (px >= rMinX && px <= rMaxX && py >= rMinY && py <= rMaxY) {
+      return true;
+    }
+  }
+
+  // 2. Tile corners or center inside polygon
+  const tilePts: Array<[number, number]> = [
+    [(rMinX + rMaxX) / 2, (rMinY + rMaxY) / 2],
+    [rMinX, rMinY],
+    [rMaxX, rMinY],
+    [rMaxX, rMaxY],
+    [rMinX, rMaxY],
+  ];
+  for (const [qx, qy] of tilePts) {
+    if (pointInRingPx(qx, qy, ringPx)) {
+      return true;
+    }
+  }
+
+  // 3. Any polygon edge crosses any of the 4 tile edges
+  const tileEdges: Array<[number, number, number, number]> = [
+    [rMinX, rMinY, rMaxX, rMinY],
+    [rMaxX, rMinY, rMaxX, rMaxY],
+    [rMaxX, rMaxY, rMinX, rMaxY],
+    [rMinX, rMaxY, rMinX, rMinY],
+  ];
+  for (let i = 0; i < ringPx.length; i++) {
+    const [ax, ay] = ringPx[i];
+    const [bx, by] = ringPx[(i + 1) % ringPx.length];
+    for (const [cx, cy, dx, dy] of tileEdges) {
+      if (segmentsIntersect2D(ax, ay, bx, by, cx, cy, dx, dy)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -174,7 +268,7 @@ async function fetchTilesPooled(
     stage: 'tiles',
     loaded: 0,
     total: coords.length,
-    message: `Fetching ${coords.length} tiles (Z${z})...`,
+    message: `Fetching ${coords.length} polygon tiles (Z${z})...`,
   });
 
   async function worker() {
@@ -228,6 +322,7 @@ export interface FetchedMosaic {
   mpp: number;
   worldOriginX: number;
   worldOriginY: number;
+  tilesSkipped?: number;
 }
 
 export async function fetchProviderMosaic(
@@ -237,12 +332,16 @@ export async function fetchProviderMosaic(
   provider: BasemapProvider,
   strictOnly: boolean,
   options?: {
+    preferUltraZoom?: boolean;
+    highRes?: boolean;
+    highAccuracy?: boolean;
     signal?: AbortSignal;
     onProgress?: (p: SatelliteProgress) => void;
   }
 ): Promise<FetchedMosaic | null> {
   const signal = options?.signal;
   const onProgress = options?.onProgress;
+  const isHighRes = Boolean(options?.highRes ?? options?.highAccuracy);
   throwIfAborted(signal);
 
   const [minx, miny, maxx, maxy] = polygonBounds(calibratedPoly);
@@ -253,7 +352,8 @@ export async function fetchProviderMosaic(
   const bMaxx = maxx + dx;
   const bMaxy = maxy + dy;
 
-  const startZoom = 19;
+  const canTryZ20 = provider === 'google' && (options?.preferUltraZoom ?? true);
+  const startZoom = canTryZ20 ? 20 : 19;
   const providerLabel = provider === 'google' ? 'Google Satellite' : 'Esri World Imagery';
 
   let bestCandidate: (FetchedMosaic & { loadedRatio: number }) | null = null;
@@ -269,16 +369,24 @@ export async function fetchProviderMosaic(
 
     const tilesX = tx1 - tx0 + 1;
     const tilesY = ty1 - ty0 + 1;
-    const tilesCount = tilesX * tilesY;
-    const maxAllowed = z === 19 ? 256 : 121;
-    if (tilesCount > maxAllowed || tilesCount <= 0) continue;
+    const rectTilesCount = tilesX * tilesY;
+    const maxAllowed =
+      z === 20 ? (isHighRes ? 225 : 100) : z === 19 ? 256 : 121;
+    if (rectTilesCount <= 0 || rectTilesCount > maxAllowed * 2) continue;
 
     const coords: Array<[number, number]> = [];
     for (let ty = ty0; ty <= ty1; ty++) {
       for (let tx = tx0; tx <= tx1; tx++) {
-        coords.push([tx, ty]);
+        if (
+          calibratedPoly.length < 3 ||
+          tileIntersectsPolygon(tx, ty, z, calibratedPoly, 36)
+        ) {
+          coords.push([tx, ty]);
+        }
       }
     }
+    const tilesSkipped = Math.max(0, rectTilesCount - coords.length);
+    if (coords.length === 0 || coords.length > maxAllowed) continue;
 
     const loaded = await fetchTilesPooled(coords, z, provider, strictOnly, 8, signal, onProgress);
     const validTiles = loaded.filter((item) => item.img !== null);
@@ -336,6 +444,7 @@ export async function fetchProviderMosaic(
       mpp,
       worldOriginX,
       worldOriginY,
+      tilesSkipped,
       loadedRatio,
     };
 

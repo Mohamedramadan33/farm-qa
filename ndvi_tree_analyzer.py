@@ -57,7 +57,9 @@ def _load_shared_detection_config() -> Dict[str, Any]:
 _CFG = _load_shared_detection_config()
 AI_MODEL_CONF_THRESH = float(_CFG.get("aiModelConfThresh", 0.55))
 SAHI_TILE_SIZE = int(_CFG.get("sahiTileSize", 512))
-SAHI_OVERLAP = float(_CFG.get("sahiOverlap", 0.20))
+SAHI_OVERLAP = float(_CFG.get("sahiOverlap", 0.30))
+HIGH_RES_TILE_SIZE = int(_CFG.get("highResTileSize", 288))
+HIGH_RES_OVERLAP = float(_CFG.get("highResOverlap", 0.40))
 NMS_IOU_THRESH = float(_CFG.get("nmsIouThresh", 0.40))
 CLASS_AWARE_NMS = bool(_CFG.get("classAwareNms", True))
 CROSS_CLASS_SUPPRESSION_IOU = float(_CFG.get("crossClassSuppressionIou", 0.85))
@@ -884,6 +886,7 @@ def detect_and_classify_trees(
     slice_size: int = SAHI_TILE_SIZE,
     inward_buffer_m: float = 0.0,
     show_compact_ids: bool = False,
+    high_res: bool = False,
 ) -> Dict[str, Any]:
     """
     Two-Stage Structural Tree Crown Detection Pipeline:
@@ -967,11 +970,13 @@ def detect_and_classify_trees(
         min_x, max_x = 0, width_px - 1
         min_y, max_y = 0, height_px - 1
 
+    effective_slice_size = HIGH_RES_TILE_SIZE if high_res else int(slice_size)
+    effective_overlap = HIGH_RES_OVERLAP if high_res else float(tile_overlap)
     sahi_slices = _generate_sahi_slices(
         min_x, min_y, max_x, max_y, width_px, height_px,
-        slice_size=slice_size, overlap=tile_overlap,
+        slice_size=effective_slice_size, overlap=effective_overlap,
     )
-    min_sep_px = max(6.0, 2.0 * px_per_m)
+    min_sep_px = max(4.0, (1.3 if high_res else 2.0) * px_per_m)
 
     # Pass RAW unmasked RGB tiles to YOLO (matches training domain); mask strictly post-inference
     raw_rgb_u8 = arr.astype(np.uint8)
@@ -991,14 +996,23 @@ def detect_and_classify_trees(
     if active_yolo_path and np.any(target_mask):
         yolo_model, skip_reason = _get_validated_tree_yolo(active_yolo_path)
         if yolo_model is not None:
+            min_active_tile_ratio = 0.03 if high_res else 0.05
             try:
                 for sx1, sy1, sx2, sy2 in sahi_slices:
                     tile_mask = target_mask[sy1:sy2, sx1:sx2]
-                    if tile_mask.size == 0 or float(np.mean(tile_mask)) < 0.05:
+                    if tile_mask.size == 0 or float(np.mean(tile_mask)) < min_active_tile_ratio:
                         continue
                     crop_arr = raw_rgb_u8[sy1:sy2, sx1:sx2]
+                    ch, cw = crop_arr.shape[:2]
+                    if ch < effective_slice_size or cw < effective_slice_size:
+                        # Zero-stretch padding prevents crop scale distortion on small parcels / edge slices
+                        padded_tile = np.full((effective_slice_size, effective_slice_size, 3), (15, 23, 42), dtype=np.uint8)
+                        padded_tile[:ch, :cw] = crop_arr
+                        yolo_input = padded_tile
+                    else:
+                        yolo_input = crop_arr
                     yolo_res = yolo_model.predict(
-                        source=crop_arr,
+                        source=yolo_input,
                         conf=AI_MODEL_CONF_THRESH,
                         iou=NMS_IOU_THRESH,
                         verbose=False,
@@ -1183,10 +1197,14 @@ def detect_and_classify_trees(
         "annotated_image": annotated_img,
         "pseudo_ndvi_heatmap_image": pseudo_ndvi_heatmap,
         "engine_used": (
-            f"YOLOv8 SAHI {slice_size}px ({os.path.basename(active_yolo_path)}, Conf>={AI_MODEL_CONF_THRESH:.2f})"
+            f"YOLOv8 {'High-Res ' if high_res else ''}SAHI {effective_slice_size}px ({os.path.basename(active_yolo_path)}, Conf>={AI_MODEL_CONF_THRESH:.2f})"
             if used_yolo
             else "4-Gate Canopy Watershed Fallback (ExG+CropSheet+EDT+Shadow)"
         ),
+        "high_res": high_res,
+        "sahi_tile_size": effective_slice_size,
+        "sahi_overlap": effective_overlap,
+        "sahi_tiles_count": len(sahi_slices),
         "yolo_model_loaded": used_yolo,
         "yolo_model_path": active_yolo_path if used_yolo else None,
         "yolo_skipped_reason": yolo_skipped_reason,

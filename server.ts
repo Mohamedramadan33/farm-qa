@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { SEED_LABELS, SEED_SUBMISSIONS } from './src/server/seedSubmissions.ts';
@@ -42,6 +42,8 @@ interface ServerDetectionConfig {
   confIntervalDelta: number;
   sahiTileSize: number;
   sahiOverlap: number;
+  highResTileSize?: number;
+  highResOverlap?: number;
   highAccuracyTileSize?: number;
   highAccuracyOverlap?: number;
   nmsIouThresh: number;
@@ -53,16 +55,18 @@ interface ServerDetectionConfig {
 }
 
 const DEFAULT_DETECTION_CONFIG: ServerDetectionConfig = {
-  version: '1.1.0',
+  version: '1.3.0',
   classes: ['orchard_tree', 'palm_tree', 'windbreak_tree'],
   aiModelConfThresh: 0.55,
   confIntervalDelta: 0.1,
   sahiTileSize: 512,
-  sahiOverlap: 0.25,
-  highAccuracyTileSize: 384,
-  highAccuracyOverlap: 0.3,
+  sahiOverlap: 0.3,
+  highResTileSize: 288,
+  highResOverlap: 0.4,
+  highAccuracyTileSize: 288,
+  highAccuracyOverlap: 0.4,
   nmsIouThresh: 0.4,
-  wbfIouThresh: 0.45,
+  wbfIouThresh: 0.42,
   classAwareNms: true,
   crossClassSuppressionIou: 0.85,
   minCrownDiamM: 1.8,
@@ -230,9 +234,9 @@ function serverBoxIoU(a: ServerDetectionBox, b: ServerDetectionBox): number {
 }
 
 /**
- * Class-Aware Weighted Box Fusion (WBF) for overlapping SAHI tiles.
- * Confidence-weights duplicate seam detections instead of discarding edge boxes,
- * producing tighter crown centers across tile boundaries.
+ * Class-Aware Consensus Weighted Box Fusion (WBF) for overlapping SAHI tiles.
+ * Quadratic confidence-weighting tightens crown centers across tile seams while
+ * rewarding detections corroborated across 2+ overlapping SAHI windows.
  */
 function fuseServerDetectionsWBF(
   boxes: ServerDetectionBox[],
@@ -244,6 +248,7 @@ function fuseServerDetectionsWBF(
   interface Cluster {
     wSum: number;
     maxConf: number;
+    votes: number;
     wxmin: number;
     wymin: number;
     wxmax: number;
@@ -276,11 +281,12 @@ function fuseServerDetectionsWBF(
       }
     }
 
-    const w = Math.max(0.05, b.confidence);
+    const w = Math.max(0.04, b.confidence * b.confidence);
     if (!target) {
       clusters.push({
         wSum: w,
         maxConf: b.confidence,
+        votes: 1,
         wxmin: b.xmin * w,
         wymin: b.ymin * w,
         wxmax: b.xmax * w,
@@ -294,6 +300,7 @@ function fuseServerDetectionsWBF(
         target.label = b.label;
         target.health = b.health;
       }
+      target.votes += 1;
       target.wSum += w;
       target.maxConf = Math.max(target.maxConf, b.confidence);
       target.wxmin += b.xmin * w;
@@ -312,41 +319,53 @@ function fuseServerDetectionsWBF(
     }
   }
 
-  return clusters.slice(0, 1200).map((cl) => ({
-    xmin: Math.round(cl.rep.xmin),
-    ymin: Math.round(cl.rep.ymin),
-    xmax: Math.round(cl.rep.xmax),
-    ymax: Math.round(cl.rep.ymax),
-    label: cl.label,
-    confidence: Number(cl.maxConf.toFixed(3)),
-    health: cl.health,
-  }));
+  return clusters.slice(0, 1200).map((cl) => {
+    const consensusBoost = Math.min(0.08, Math.max(0, cl.votes - 1) * 0.04);
+    const calibratedConf = Math.min(0.98, cl.maxConf + consensusBoost);
+    return {
+      xmin: Math.round(cl.rep.xmin),
+      ymin: Math.round(cl.rep.ymin),
+      xmax: Math.round(cl.rep.xmax),
+      ymax: Math.round(cl.rep.ymax),
+      label: cl.label,
+      confidence: Number(calibratedConf.toFixed(3)),
+      health: cl.health,
+    };
+  });
 }
 
-function buildTreeVisionPrompt(tileW: number, tileH: number, mpp: number): string {
-  const pxPerM = 1 / Math.max(mpp, 0.1);
-  const youngPx = Math.max(6, Math.round(1.8 * pxPerM));
+const TREE_VISION_SYSTEM_INSTRUCTION = [
+  'You are an ultra-precise geospatial computer vision detector trained on Egyptian Nile Delta and desert-reclamation orchards (Zoom 19-20 RGB satellite imagery).',
+  'Your sole objective is exact per-tree localization with near-zero false positives on crops, soil, buildings, or water.',
+  'Always emit separate tight bounding boxes centered on sunlit leafy crowns ONLY (never include long cast shadow tails inside box_2d).',
+  'Return strictly valid JSON matching the schema.',
+].join(' ');
+
+function buildTreeVisionPrompt(tileW: number, tileH: number, mpp: number, isHighRes = false): string {
+  const pxPerM = 1 / Math.max(mpp, 0.08);
+  const youngPx = Math.max(6, Math.round((isHighRes ? 1.2 : 1.6) * pxPerM));
   const maturePx = Math.round(6.0 * pxPerM);
   return [
-    'You are an expert agricultural geospatial computer-vision detector analyzing high-resolution top-down satellite imagery of Egyptian farms (Nile Delta & desert reclamation orchards).',
-    `Image dimensions: ${tileW}x${tileH} px at ~${mpp.toFixed(2)} m/pixel (~${youngPx}-${maturePx} px diameter for typical 1.8m-6.0m tree crowns).`,
+    `Tile size: ${tileW}x${tileH} px at ~${mpp.toFixed(3)} m/px (expect ~${youngPx}-${maturePx} px crown diameter for ${isHighRes ? '1.2m-6.0m' : '1.6m-6.0m'} canopies).`,
+    ...(isHighRes
+      ? [
+          `HIGH-RES SUB-TILE MODE (${tileW}x${tileH} tight crop): Look carefully for small/young saplings (>=1.2m crown) along drip lines, split tightly clustered crowns into individual boxes, and ignore any flat dark #0f172a edge padding borders.`,
+        ]
+      : []),
     '',
-    'TASK: Detect EVERY distinct individual tree or palm crown visible inside the tile.',
+    'INCLUDE (Individual Trees & Palms ONLY):',
+    '1. "orchard_tree": Distinct circular/lobed foliage crowns (citrus, mango, olive, guava, pomegranate, young saplings along drip-irrigation lines), typically showing canopy leaf texture and an adjacent directional cast shadow.',
+    '2. "palm_tree": Star-shaped / spiky rosette date palm crowns and tall palm shadows.',
+    '3. "windbreak_tree": Individual tall linear trees along farm boundaries, fences, or canal edges (emit one box per distinct crown peak along hedgerows rather than one giant box).',
+    '4. Touching canopies: If two orchard crowns touch slightly, split them into TWO separate tight boxes centered on each canopy peak.',
+    '5. Slightly dimmed outer margins provide context only—detect trees visible in the bright interior parcel and along its immediate border.',
     '',
-    'CRITICAL POSITIVE RULES (INCLUDE):',
-    '1. Detect mature orchard trees (citrus, mango, olive, guava, pomegranate) AND young/small orchard saplings (~1.5m-3m) planted in rhythmic grid rows along sandy or tilled drip lines. Look for rounded textured foliage blobs paired with an adjacent dark directional cast shadow.',
-    '2. Detect date palms ("palm_tree"): recognizable by star/rosette frond texture and elongated palm shadows.',
-    '3. Detect boundary hedgerow/windbreak trees ("windbreak_tree"): tall linear casuarina/eucalyptus trees along farm edges, fences, or canals.',
-    '4. When adjacent trees in a row touch slightly, emit SEPARATE tight bounding boxes centered on each individual tree crown rather than merging multiple trees into one large box.',
-    '5. Center [ymin, xmin, ymax, xmax] tightly on the sunlit leafy crown ONLY—exclude the elongated cast shadow tail.',
+    'STRICTLY EXCLUDE (NEVER DETECT):',
+    '- Flat uniform green field crops (berseem/clover, alfalfa, wheat, vegetable beds), grass strips, or plowed furrow stripes.',
+    '- Buildings, concrete/metal roofs, greenhouses, shade nets, water basins, canal water, roads, cars, or standalone dark shadows without a crown.',
+    '- Return detections: [] if no real trees or palms are present.',
     '',
-    'CRITICAL NEGATIVE RULES (STRICTLY IGNORE):',
-    '- DO NOT detect flat uniform green field crops (berseem/clover, alfalfa, wheat, maize/vegetables in dense beds), furrow stripes, weeds, or bare soil.',
-    '- DO NOT detect buildings, sheds, greenhouses, shade nets, water basins, canal water, roads, vehicles, or standalone shadows with no leafy crown.',
-    '- Ignore any thin cyan dashed boundary guide line or slightly dimmed border region outside the parcel.',
-    '- If the tile contains only flat crops, soil, or buildings, return detections: [].',
-    '',
-    'Return ONLY JSON matching the schema with normalized coordinates [ymin, xmin, ymax, xmax] in 0..1000.',
+    'Output normalized coordinates [ymin, xmin, ymax, xmax] in 0..1000.',
   ].join('\n');
 }
 
@@ -487,7 +506,7 @@ async function startServer() {
 
   const detectionLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 45,
+    max: 90,
     standardHeaders: true,
     legacyHeaders: false,
     message: { ok: false, error: 'Too many detection requests; please wait a moment.' },
@@ -864,6 +883,7 @@ async function startServer() {
       tiles,
       polygonRingPx,
       geoTransform,
+      highRes = false,
       highAccuracy = false,
       confThresh,
       minConf,
@@ -882,10 +902,12 @@ async function startServer() {
         zoom?: unknown;
         mpp?: unknown;
       };
+      highRes?: unknown;
       highAccuracy?: unknown;
       confThresh?: unknown;
       minConf?: unknown;
     };
+    const isHighRes = Boolean(highRes || highAccuracy);
 
     if (!Array.isArray(tiles) || tiles.length === 0 || tiles.length > 48) {
       res.status(400).json({ ok: false, error: 'tiles array (1..48 tiles) is required.' });
@@ -946,7 +968,8 @@ async function startServer() {
       Math.min(reqConfThresh, Number(minConf ?? reqConfThresh - detectionConfig.confIntervalDelta) || reqConfThresh)
     );
 
-    const modelName = highAccuracy ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
+    const modelName = 'gemini-4-hydrogen';
+    const thinkingLevel = isHighRes ? ThinkingLevel.HIGH : ThinkingLevel.LOW;
     const ai = new GoogleGenAI({
       apiKey: geminiKey,
       httpOptions: {
@@ -987,10 +1010,10 @@ async function startServer() {
 
     const rawBoxes: ServerDetectionBox[] = [];
     const tileErrors: string[] = [];
-    const concurrency = highAccuracy ? 3 : 4;
+    const concurrency = isHighRes ? 3 : 4;
 
     const runTile = async (tile: (typeof validTiles)[number]): Promise<void> => {
-      const prompt = buildTreeVisionPrompt(tile.width, tile.height, mpp);
+      const prompt = buildTreeVisionPrompt(tile.width, tile.height, mpp, isHighRes);
       const imagePart = {
         inlineData: {
           mimeType: tile.mimeType,
@@ -1000,13 +1023,14 @@ async function startServer() {
       const textPart = { text: prompt };
 
       let lastErr: unknown = null;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const response = await ai.models.generateContent({
             model: modelName,
             contents: { parts: [imagePart, textPart] },
             config: {
-              temperature: 0.1,
+              systemInstruction: TREE_VISION_SYSTEM_INSTRUCTION,
+              thinkingConfig: { thinkingLevel },
               seed: 42,
               responseMimeType: 'application/json',
               responseSchema,
@@ -1040,10 +1064,10 @@ async function startServer() {
             const bh = ymax - ymin;
             if (bw < 3 || bh < 3) continue;
             const aspect = Math.max(bw / bh, bh / bw);
-            if (aspect > 3.2) continue;
+            if (aspect > 2.6) continue;
 
             const diamM = ((bw + bh) / 2) * mpp;
-            if (diamM < 0.7 || diamM > 15.0) continue;
+            if (diamM < 0.8 || diamM > 13.0) continue;
 
             const rawLabel = String(item.label || 'orchard_tree');
             const label: TreeClassName =
@@ -1065,9 +1089,10 @@ async function startServer() {
           return;
         } catch (err) {
           lastErr = err;
-          if (attempt === 0) {
-            await new Promise((r) => setTimeout(r, 600));
-          }
+          const msg = err instanceof Error ? err.message : String(err);
+          const isTransient = /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(msg);
+          if (!isTransient || attempt === 2) break;
+          await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
         }
       }
       tileErrors.push(lastErr instanceof Error ? lastErr.message : String(lastErr));
@@ -1078,7 +1103,10 @@ async function startServer() {
     }
 
     if (tileErrors.length === validTiles.length) {
-      res.status(502).json({
+      const isTransientAll = tileErrors.every((e) =>
+        /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(e)
+      );
+      res.status(isTransientAll ? 503 : 502).json({
         ok: false,
         error: `Gemini Vision inference failed on all tiles: ${tileErrors[0]}`,
       });
@@ -1090,7 +1118,7 @@ async function startServer() {
         ? rawBoxes.filter((b) => pointInRing((b.xmin + b.xmax) / 2, (b.ymin + b.ymax) / 2, ring))
         : rawBoxes;
 
-    const minCenterDistPx = Math.max(5, Math.round(2.0 / Math.max(mpp, 0.12)));
+    const minCenterDistPx = Math.max(3, Math.round((isHighRes ? 1.3 : 1.6) / Math.max(mpp, 0.1)));
     const fused = fuseServerDetectionsWBF(
       polygonFiltered,
       detectionConfig.wbfIouThresh ?? detectionConfig.nmsIouThresh,
@@ -1110,12 +1138,384 @@ async function startServer() {
 
     res.json({
       ok: true,
-      engine: highAccuracy
-        ? 'AI Vision (Gemini 2.5 Pro · Dense WBF)'
-        : 'AI Vision (Gemini 2.5 Flash · Spatial WBF)',
+      engine: isHighRes
+        ? 'AI Vision (Gemini 4 Hydrogen · High-Res SAHI WBF)'
+        : 'AI Vision (Gemini 4 Hydrogen · Spatial WBF)',
       detections,
       partialTileErrors: tileErrors.length,
     });
+  });
+
+  // 5c-2. Multi-Library AI Arbitration Endpoint (Gemini 4 Hydrogen compares all CV/AI/YOLO libraries)
+  app.post('/api/detect-trees/arbitrate', detectionLimiter, requireDetectionAuth, async (req, res) => {
+    const geminiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!geminiKey) {
+      res.status(503).json({
+        ok: false,
+        error: 'GEMINI_API_KEY is not configured on the server.',
+      });
+      return;
+    }
+
+    const body = (req.body || {}) as {
+      farmId?: unknown;
+      species?: unknown;
+      cropType?: unknown;
+      vegPct?: unknown;
+      mpp?: unknown;
+      engineerCount?: unknown;
+      forecast?: unknown;
+      inwardBufferM?: unknown;
+      highResMode?: unknown;
+      provider?: unknown;
+      consensusCount?: unknown;
+      medianCount?: unknown;
+      agreementPct?: unknown;
+      libraries?: Array<{
+        id?: unknown;
+        name?: unknown;
+        libraryBadge?: unknown;
+        category?: unknown;
+        status?: unknown;
+        count?: unknown;
+        interiorCount?: unknown;
+        boundaryCount?: unknown;
+        avgConfidence?: unknown;
+        medianCrownM?: unknown;
+        durationMs?: unknown;
+      }>;
+    };
+
+    const libs = Array.isArray(body.libraries) ? body.libraries : [];
+    const ranLibs = libs.filter((l) => l && l.status === 'ran' && typeof l.id === 'string');
+    if (ranLibs.length < 2) {
+      res.status(400).json({ ok: false, error: 'At least 2 ran libraries are required for arbitration.' });
+      return;
+    }
+
+    const ranIds = ranLibs.map((l) => String(l.id));
+    const ai = new GoogleGenAI({
+      apiKey: geminiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+
+    const arbitrateSchema = {
+      type: Type.OBJECT,
+      properties: {
+        winnerEngineId: {
+          type: Type.STRING,
+          enum: ranIds,
+        },
+        recommendedCount: { type: Type.NUMBER },
+        confidencePct: { type: Type.NUMBER },
+        explanationAr: { type: Type.STRING },
+        cropRiskWarningAr: { type: Type.STRING },
+      },
+      required: ['winnerEngineId', 'recommendedCount', 'confidencePct', 'explanationAr'],
+    };
+
+    const systemInstruction = [
+      'You are a Principal Remote Sensing & Orchard Tree-Counting Arbitrator.',
+      'You receive tree counts from multiple independent computer vision and AI detection libraries on the same satellite farm image:',
+      '(1) gemini_vision: Semantic Vision AI object detector (best at distinguishing tree crowns from flat berseem/wheat/vegetable crop fields and roofs);',
+      '(2) yolov8_onnx: Trained YOLOv8 orchard detector if loaded;',
+      '(3) turf_consensus_ensemble: Geo-DBSCAN spatial fusion across all active engines;',
+      '(4) morphological_watershed: 4-Gate Meijster EDT Watershed;',
+      '(5) multiscale_dog: Multi-Scale Gaussian Pyramid Difference-of-Gaussians blob detector;',
+      '(6) shadow_texture_pair: Cast-Shadow Azimuth & texture pairing.',
+      'Select the single most accurate engine from the ran list (winnerEngineId) and justify in clear concise Arabic why it wins over the other libraries, noting any over-counting by classical engines on dense flat crops or under-counting on small saplings.',
+    ].join(' ');
+
+    const payloadSummary = JSON.stringify(
+      {
+        farmId: String(body.farmId || 'FARM').slice(0, 64),
+        species: body.species ?? '',
+        cropType: body.cropType ?? '',
+        vegPct: body.vegPct ?? null,
+        mpp: body.mpp ?? 0.26,
+        engineerCount: body.engineerCount ?? null,
+        perimeterForecast: body.forecast ?? null,
+        inwardBufferM: body.inwardBufferM ?? -1.5,
+        highResMode: Boolean(body.highResMode),
+        provider: body.provider ?? 'google',
+        consensusCount: body.consensusCount ?? null,
+        medianCount: body.medianCount ?? null,
+        agreementPct: body.agreementPct ?? null,
+        ranLibraries: ranLibs,
+      },
+      null,
+      2
+    );
+
+    try {
+      let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: `Compare these tree-detection library outputs and pick the most accurate winnerEngineId:\n${payloadSummary}`,
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              seed: 42,
+              responseMimeType: 'application/json',
+              responseSchema: arbitrateSchema,
+            },
+          });
+          break;
+        } catch (err) {
+          lastErr = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          const isTransient = /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(msg);
+          if (!isTransient || attempt === 2) throw err;
+          await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+        }
+      }
+      if (!response) throw lastErr || new Error('Empty arbitration response');
+
+      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+        winnerEngineId?: unknown;
+        recommendedCount?: unknown;
+        confidencePct?: unknown;
+        explanationAr?: unknown;
+        cropRiskWarningAr?: unknown;
+      };
+
+      const winnerId = ranIds.includes(String(parsed.winnerEngineId))
+        ? String(parsed.winnerEngineId)
+        : ranIds.includes('turf_consensus_ensemble')
+          ? 'turf_consensus_ensemble'
+          : ranIds[0];
+      const winnerRow = ranLibs.find((l) => String(l.id) === winnerId);
+      const exactCount = Number(winnerRow?.count ?? parsed.recommendedCount ?? 0);
+
+      res.json({
+        ok: true,
+        arbitration: {
+          winnerEngineId: winnerId,
+          recommendedCount: Math.max(0, Math.round(exactCount)),
+          confidencePct: Math.max(25, Math.min(99, Math.round(Number(parsed.confidencePct ?? 85)))),
+          explanationAr: String(parsed.explanationAr || '').trim(),
+          cropRiskWarningAr: parsed.cropRiskWarningAr
+            ? String(parsed.cropRiskWarningAr).trim()
+            : undefined,
+          generatedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient = /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(msg);
+      res.status(isTransient ? 503 : 502).json({
+        ok: false,
+        error: isTransient ? 'Gemini arbitration temporarily busy' : msg,
+      });
+    }
+  });
+
+  // 5c-bis. Smart AI Tree Audit & Agronomic Discrepancy Reasoning (Gemini 4 Hydrogen)
+  app.post('/api/audit-trees', detectionLimiter, requireDetectionAuth, async (req, res) => {
+    const geminiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!geminiKey) {
+      res.status(503).json({
+        ok: false,
+        error: 'GEMINI_API_KEY is not configured on the server.',
+      });
+      return;
+    }
+
+    const body = (req.body || {}) as {
+      farmId?: unknown;
+      farmName?: unknown;
+      region?: unknown;
+      species?: unknown;
+      cropType?: unknown;
+      treeDetails?: unknown;
+      areaEntered?: unknown;
+      areaGps?: unknown;
+      perimeterM?: unknown;
+      engineerCount?: unknown;
+      aiCount?: unknown;
+      aiLow?: unknown;
+      aiHigh?: unknown;
+      forecast?: unknown;
+      boundarySpacingM?: unknown;
+      vegPct?: unknown;
+      imageryDate?: unknown;
+      imgAge?: unknown;
+      verdict?: unknown;
+      gpsWarnings?: unknown;
+      provider?: unknown;
+      zoomUsed?: unknown;
+      inwardBufferM?: unknown;
+      classBreakdown?: unknown;
+      healthBreakdown?: unknown;
+      spatialMetrics?: unknown;
+    };
+
+    const farmId = String(body.farmId || '').trim().slice(0, 64);
+    if (!farmId) {
+      res.status(400).json({ ok: false, error: 'farmId is required.' });
+      return;
+    }
+
+    const ai = new GoogleGenAI({
+      apiKey: geminiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+
+    const auditSchema = {
+      type: Type.OBJECT,
+      properties: {
+        alignmentVerdict: {
+          type: Type.STRING,
+          enum: [
+            'aligned',
+            'under_counted_by_ai',
+            'over_counted_by_engineer',
+            'boundary_mismatch',
+            'crop_confusion_risk',
+          ],
+        },
+        confidencePct: { type: Type.NUMBER },
+        discrepancyCauseAr: { type: Type.STRING },
+        canopyQualitySummaryAr: { type: Type.STRING },
+        fieldCheckRecommendationsAr: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+        },
+        suggestedAuditorComment: { type: Type.STRING },
+      },
+      required: [
+        'alignmentVerdict',
+        'confidencePct',
+        'discrepancyCauseAr',
+        'canopyQualitySummaryAr',
+        'fieldCheckRecommendationsAr',
+        'suggestedAuditorComment',
+      ],
+    };
+
+    const systemInstruction = [
+      'You are an expert Egyptian PGS agricultural remote-sensing & orchard QA auditor.',
+      'Analyze structured farm telemetry, tree crown counts, canopy spatial spacing, and Kobo engineer field counts.',
+      'Never invent measurements not present in the payload. Explain discrepancies clearly in Arabic, accounting for:',
+      '(a) young saplings (<1.5m) invisible at Z19-Z20, (b) inward boundary buffer excluding perimeter windbreaks,',
+      '(c) flat crop understory (berseem/alfalfa/vegetables) causing high vegPct without trees,',
+      '(d) merged double-crowns flagged in oversizedCrownIds, and (e) GPS area/alignment mismatches.',
+    ].join(' ');
+
+    const payloadSummary = JSON.stringify(
+      {
+        farmId,
+        farmName: body.farmName,
+        region: body.region,
+        species: body.species,
+        cropType: body.cropType,
+        treeDetails: body.treeDetails,
+        areaEnteredFeddan: body.areaEntered,
+        areaGpsFeddan: body.areaGps,
+        perimeterM: body.perimeterM,
+        engineerCount: body.engineerCount,
+        aiCount: body.aiCount,
+        aiRange: [body.aiLow, body.aiHigh],
+        perimeterForecast: body.forecast,
+        boundarySpacingM: body.boundarySpacingM,
+        vegPct: body.vegPct,
+        imageryDate: body.imageryDate,
+        imgAgeYears: body.imgAge,
+        ruleVerdict: body.verdict,
+        gpsWarnings: body.gpsWarnings,
+        provider: body.provider,
+        zoomUsed: body.zoomUsed,
+        inwardBufferM: body.inwardBufferM,
+        classBreakdown: body.classBreakdown,
+        healthBreakdown: body.healthBreakdown,
+        spatialMetrics: body.spatialMetrics,
+      },
+      null,
+      2
+    );
+
+    try {
+      let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: `Evaluate this Kobo Farm QA & satellite tree audit record and output structured JSON diagnostics:\n${payloadSummary}`,
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              seed: 42,
+              responseMimeType: 'application/json',
+              responseSchema: auditSchema,
+            },
+          });
+          break;
+        } catch (err) {
+          lastErr = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          const isTransient = /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(msg);
+          if (!isTransient || attempt === 2) throw err;
+          await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+        }
+      }
+      if (!response) throw lastErr || new Error('Empty response');
+
+      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+        alignmentVerdict?: string;
+        confidencePct?: number;
+        discrepancyCauseAr?: string;
+        canopyQualitySummaryAr?: string;
+        fieldCheckRecommendationsAr?: string[];
+        suggestedAuditorComment?: string;
+      };
+
+      const validVerdicts = [
+        'aligned',
+        'under_counted_by_ai',
+        'over_counted_by_engineer',
+        'boundary_mismatch',
+        'crop_confusion_risk',
+      ];
+      const alignmentVerdict = validVerdicts.includes(String(parsed.alignmentVerdict))
+        ? parsed.alignmentVerdict
+        : 'aligned';
+
+      res.json({
+        ok: true,
+        report: {
+          alignmentVerdict,
+          confidencePct: Math.max(10, Math.min(99, Math.round(Number(parsed.confidencePct ?? 80)))),
+          discrepancyCauseAr: String(parsed.discrepancyCauseAr || '').trim(),
+          canopyQualitySummaryAr: String(parsed.canopyQualitySummaryAr || '').trim(),
+          fieldCheckRecommendationsAr: Array.isArray(parsed.fieldCheckRecommendationsAr)
+            ? parsed.fieldCheckRecommendationsAr.map((s) => String(s)).slice(0, 5)
+            : [],
+          suggestedAuditorComment: String(parsed.suggestedAuditorComment || '').trim(),
+          generatedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient = /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(msg);
+      res.status(isTransient ? 503 : 502).json({
+        ok: false,
+        error: isTransient
+          ? 'خادم الذكاء الاصطناعي (Gemini) يشهد ضغطاً مؤقتاً الآن؛ يمكنك الاعتماد على التحليل المكاني الفوري أعلاه أو إعادة المحاولة بعد ثوانٍ.'
+          : `Smart audit reasoning failed: ${msg}`,
+      });
+    }
   });
 
   // 5d. FastAPI Batch YOLO Delegation (/api/satellite/detect-batch)
